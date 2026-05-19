@@ -1,0 +1,12 @@
+langgraph>=0.2
+requests>=2.31
+psycopg2-binary>=2.9
+pymongo>=4.7
+redis>=5.0
+pydantic>=2
+python-dotenv>=1.0
+click>=8.0
+
+[dev]
+pytest>=8
+ruff>=0.4

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uhc-api-agent"
+version = "1.0.0"
+description = "Standalone LangGraph agent — URL in, JSON out, with persistent auth storage in Postgres / Mongo / Redis"
+requires-python = ">=3.11"
+dependencies = [
+    # Orchestration
+    "langgraph>=0.2",
+    # HTTP
+    "requests>=2.31",
+    # Existing DBs (shared with uhc-sop-ingestion)
+    "psycopg2-binary>=2.9",
+    "pymongo>=4.7",
+    "redis>=5.0",
+    # Utilities
+    "pydantic>=2",
+    "python-dotenv>=1.0",
+    "click>=8.0",
+]
+
+[project.scripts]
+api-agent = "uhc_api_agent.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

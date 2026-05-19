@@ -1,0 +1,2 @@
+[console_scripts]
+sop-ingest = uhc_sop_ingestion.cli:main

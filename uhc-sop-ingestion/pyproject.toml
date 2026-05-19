@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uhc-sop-ingestion"
+version = "1.0.0"
+description = "LangGraph multi-agent SOP ingestion pipeline — URL in, full context graph out"
+requires-python = ">=3.11"
+dependencies = [
+    # Orchestration
+    "langgraph>=0.2",
+    "langchain>=0.3",
+    "langchain-openai>=0.2",
+    "langchain-anthropic>=0.3",
+    # Document parsing
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "python-docx>=1.0",
+    "openpyxl>=3.1",
+    "pypdf>=4.0",
+    "requests>=2.31",
+    # Databases
+    "psycopg2-binary>=2.9",
+    "neo4j>=5.20",
+    "redis>=5.0",
+    "pymongo>=4.7",
+    # Utilities
+    "pydantic>=2",
+    "python-dotenv>=1.0",
+    "click>=8.0",
+    "tenacity>=8.0",
+]
+
+[project.scripts]
+sop-ingest = "uhc_sop_ingestion.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

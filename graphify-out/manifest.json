@@ -1,0 +1,162 @@
+{
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/manage.py": {
+    "mtime": 1779020869.5891795,
+    "hash": "33ad7c1a3f23c9c542eba67c3b621482"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/config.py": {
+    "mtime": 1779021361.7051966,
+    "hash": "f7bc604b362c0c656a759d84e299bd33"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/graph.py": {
+    "mtime": 1779021361.7057834,
+    "hash": "7c2cb78cd92273c9aecdba363e8f3043"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/__init__.py": {
+    "mtime": 1779021361.7062054,
+    "hash": "9429fe4abdc988d30efbd82286f7bad6"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/cli.py": {
+    "mtime": 1779021361.7176766,
+    "hash": "d7276acb3392a39b7abf47f7349a5e73"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/pipeline.py": {
+    "mtime": 1779021361.7181067,
+    "hash": "1cfae06611c412ab75ee7ef5127ee6ea"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/state.py": {
+    "mtime": 1779021361.7187028,
+    "hash": "b954e4368f59dc5a6197d2d0ca7716ed"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a02_fetch.py": {
+    "mtime": 1779021361.707,
+    "hash": "97be0cc5471d19fe285f3c4d26d72818"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a01_intake.py": {
+    "mtime": 1779021361.707852,
+    "hash": "e2274abc270c6bfa0516d86b3b3698aa"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a09_validate.py": {
+    "mtime": 1779021361.7086322,
+    "hash": "429acf31b67f42e79b833f39b381bf1d"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a11_write_postgres.py": {
+    "mtime": 1779021361.7092836,
+    "hash": "7af170ad47bd8681be57f3d2ed47f961"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a08_context.py": {
+    "mtime": 1779021361.7100239,
+    "hash": "8c2043f20d1d1076ea51d2db68ddbfd8"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a07_enrich.py": {
+    "mtime": 1779021361.7107918,
+    "hash": "20ec4fbb72820de496535573550177b3"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a14_links.py": {
+    "mtime": 1779021361.7114344,
+    "hash": "a8e18a97be32c5ef9d55b15cffcab7de"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a15_control.py": {
+    "mtime": 1779021361.7120597,
+    "hash": "2de1cbf26ed2b1bda586e834ada5702a"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a10_write_neo4j.py": {
+    "mtime": 1779021361.7127838,
+    "hash": "8f4ec140f2d8e53838738c7aab20f78e"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/__init__.py": {
+    "mtime": 1779021361.7134075,
+    "hash": "6350a63d0a03584511a7d96647735868"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a12_write_mongo.py": {
+    "mtime": 1779021361.7140026,
+    "hash": "e056b6379fe033401722f6979cf93713"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a04_parse_docx.py": {
+    "mtime": 1779021361.7145584,
+    "hash": "30c54ff6273e8d89c0cebbc482ccf7ab"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a03_parse_html.py": {
+    "mtime": 1779021361.7151904,
+    "hash": "74f75e13b1dabf32503e9fb9c57ee8b2"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a05_parse_xlsx.py": {
+    "mtime": 1779021361.7157273,
+    "hash": "28e2b66e4c88155db553842d07f50ba7"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a13_write_redis.py": {
+    "mtime": 1779021361.7162986,
+    "hash": "84eac801a9ee434cb9ca33a8a5bc5a3b"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a06_parse_pdf.py": {
+    "mtime": 1779021361.7169342,
+    "hash": "a2341f0a61d6c0cf4c8b4bbb07622b36"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_backend/__init__.py": {
+    "mtime": 1779020873.8688917,
+    "hash": "56383d77cfa9e76bc51ae6973bf48f03"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_backend/celery.py": {
+    "mtime": 1779020902.380425,
+    "hash": "83ea2192a1c9adf313d3068809eb0108"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_backend/settings.py": {
+    "mtime": 1779021373.3456028,
+    "hash": "7ecc056913b50654d7bac1560f823ba7"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_backend/urls.py": {
+    "mtime": 1779020907.5839105,
+    "hash": "85b73f6b6c0e39bf739be47225fb1199"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_backend/wsgi.py": {
+    "mtime": 1779020912.0776877,
+    "hash": "c3637290abf7ff6d996585f1fbd37446"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_ingestion/tasks.py": {
+    "mtime": 1779021379.8802364,
+    "hash": "4625b5dd356d64e64f602e9fd9ec3f25"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_ingestion/models.py": {
+    "mtime": 1779020934.8729775,
+    "hash": "b666f8a625ad6d603734de64db0402fe"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_ingestion/serializers.py": {
+    "mtime": 1779020944.2885957,
+    "hash": "ddfa73aa2e661633c148cc21ad8ced92"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_ingestion/__init__.py": {
+    "mtime": 1779020874.5797334,
+    "hash": "d41d8cd98f00b204e9800998ecf8427e"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_ingestion/apps.py": {
+    "mtime": 1779020918.0992446,
+    "hash": "3d3c1e6f24bfc5511f600bfe985d1984"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_ingestion/admin.py": {
+    "mtime": 1779021013.0036132,
+    "hash": "35bac3744b6d67daff289ab7fc852d72"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_ingestion/urls.py": {
+    "mtime": 1779020997.1176684,
+    "hash": "e29dbd095c34a0668059ed3f2ed08cf2"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_ingestion/views.py": {
+    "mtime": 1779021384.6058679,
+    "hash": "94461505fa510395d8973bc9f675295b"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_ingestion/migrations/__init__.py": {
+    "mtime": 1779020874.8973825,
+    "hash": "d41d8cd98f00b204e9800998ecf8427e"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/sop_ingestion/migrations/0001_initial.py": {
+    "mtime": 1779021026.2064025,
+    "hash": "2b26799204cb70028c45745ca2a60c5a"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/requirements.txt": {
+    "mtime": 1779021367.534747,
+    "hash": "a8bdff7c756f44d625b046b2b065b5d0"
+  },
+  "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/new.txt": {
+    "mtime": 1779021316.1713994,
+    "hash": "0be06fe2f1d9c340ca40b18a7ffab76c"
+  }
+}

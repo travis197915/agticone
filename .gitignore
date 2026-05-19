@@ -1,0 +1,4 @@
+# graphify-out/*
+.env
+new.txt
+*.html
