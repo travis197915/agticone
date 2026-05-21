@@ -2,3 +2,5 @@
 .env
 new.txt
 *.html
+*.pyc
+__pycache__/
