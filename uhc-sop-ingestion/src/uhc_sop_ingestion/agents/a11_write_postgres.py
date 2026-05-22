@@ -285,8 +285,8 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
         INSERT INTO sop_ingestion_auditstep
             (sop_id, step_number, question, intro_text, is_terminal,
              terminal_action, is_sub_procedure, sub_procedure_name,
-             neo4j_node_id)
-        VALUES (%s, 0, %s, %s, false, '', false, '', '')
+             neo4j_node_id, narrative_context)
+        VALUES (%s, 0, %s, %s, false, '', false, '', '', '')
         ON CONFLICT (sop_id, step_number) DO UPDATE
           SET question = EXCLUDED.question, intro_text = EXCLUDED.intro_text
         RETURNING id;
