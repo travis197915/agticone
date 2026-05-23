@@ -20,6 +20,7 @@ from typing import Any
 from django.db import transaction
 from rest_framework import serializers as drf_serializers
 
+from .bindings_sync import extract_bindings_from_properties
 from .models import (
     Shape,
     ShapeConnection,
@@ -192,6 +193,11 @@ class WorkflowGraphWriter:
             cid = shape_data.get("client_id")
             if cid:
                 self._shape_index[f"cid:{cid}"] = shape.id
+
+            # Project the JSON-blob sop_rules / tool_calls on this shape
+            # into the agent_tools binding tables. Safe when agent_tools
+            # is missing (no-op).
+            extract_bindings_from_properties(shape)
 
         stale = [s_id for s_id in existing if s_id not in keep]
         if stale:

@@ -1,0 +1,30 @@
+{
+  "coverage_details": [
+    {
+      "cpt_code": "99213",
+      "covered": "Yes",
+      "authorization": "No",
+      "desc_name": "OFFICE OUTPT EST 20-29 MIN",
+      "service_type": "OUTPT",
+      "asam_level": null,
+      "diagnosis": null,
+      "effective_date": "2025-01-01",
+      "term_date": null,
+      "lob": "UHC M&R",
+      "market": "ALL"
+    },
+    {
+      "cpt_code": "99214",
+      "covered": "Yes",
+      "authorization": "No",
+      "desc_name": "OFFICE OUTPT EST 30-39 MIN",
+      "service_type": "OUTPT",
+      "asam_level": null,
+      "diagnosis": null,
+      "effective_date": "2025-01-01",
+      "term_date": null,
+      "lob": "UHC M&R",
+      "market": "ALL"
+    }
+  ]
+}

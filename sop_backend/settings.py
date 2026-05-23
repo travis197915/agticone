@@ -20,6 +20,13 @@ ENV_FILE = BASE_DIR / ".env"
 if ENV_FILE.exists():
     load_dotenv(ENV_FILE, override=False)   # OS env always takes precedence
 
+# Load agent_tools/.env.tools after the main .env so tool-level URLs are
+# available before any tool module reads os.getenv at import time. The main
+# .env values still win because override=False.
+_TOOLS_ENV_FILE = BASE_DIR / "agent_tools" / ".env.tools"
+if _TOOLS_ENV_FILE.exists():
+    load_dotenv(_TOOLS_ENV_FILE, override=False)
+
 # ── Core ──────────────────────────────────────────────────────────────────────
 SECRET_KEY    = os.environ.get("DJANGO_SECRET_KEY", "django-insecure-v2-dev-only")
 DEBUG         = os.environ.get("DJANGO_DEBUG", "true").lower() in {"1", "true", "yes"}
@@ -36,6 +43,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "sop_ingestion",
     "builder",
+    "agent_tools",
 ]
 
 MIDDLEWARE = [
@@ -83,6 +91,16 @@ DATABASES = {
         "PASSWORD": os.environ.get("PG_PASSWORD", ""),
         "HOST":     os.environ.get("PG_HOST",     "localhost"),
         "PORT":     os.environ.get("PG_PORT",     "5432"),
+        # Include the dedicated agent_tools schema on the connection's
+        # search_path. Django's introspection (used by `migrate`, test
+        # database flush, and `inspectdb`) only walks the search_path,
+        # so without this it would miss agent_tools.tool /
+        # node_rule_binding / node_tool_binding and refuse to TRUNCATE
+        # sop_ingestion_auditsop (which has an FK target inside the
+        # agent_tools schema).
+        "OPTIONS": {
+            "options": "-c search_path=public,agent_tools",
+        },
     }
 }
 

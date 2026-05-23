@@ -185,6 +185,18 @@ class _NestedShapeSerializer(serializers.ModelSerializer):
             "style", "properties", "order",
         ]
 
+    def to_representation(self, obj):
+        # Augment ``properties`` with sop_rules + tool_calls sourced from
+        # the agent_tools binding tables, so the SPA always reads the
+        # same envelope regardless of which side wrote them last.
+        data = super().to_representation(obj)
+        try:
+            from .bindings_sync import hydrate_properties_with_bindings
+            data["properties"] = hydrate_properties_with_bindings(obj)
+        except Exception:
+            pass
+        return data
+
 
 class _NestedWorkbenchSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(required=False)

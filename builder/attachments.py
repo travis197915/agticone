@@ -91,6 +91,47 @@ def _make_auth_payload(agent: dict) -> dict:
     return {"type": "none"}
 
 
+def _mirror_to_tool_registry(agent: dict) -> None:
+    """Upsert one ``Tool`` (kind='api_agent') for the registered endpoint.
+
+    Best-effort: if ``agent_tools`` is not installed yet (e.g. during very
+    early migrations) we silently skip. The runtime agent stays usable via
+    its endpoint_id either way.
+    """
+    try:
+        from agent_tools.models import Tool
+    except Exception:
+        return
+    name = (agent.get("name") or "").strip()
+    endpoint_id = (agent.get("endpoint_id") or "").strip()
+    slug_source = name or endpoint_id or agent.get("url") or ""
+    if not slug_source:
+        return
+    # Slug-safe identifier — keep it stable so re-registers don't double.
+    slug = "agent_" + (
+        endpoint_id
+        or "".join(c if c.isalnum() else "_" for c in slug_source.lower())
+    )
+    slug = slug[:128]
+    defaults = {
+        "display_name": name or slug,
+        "description": agent.get("description", "") or "",
+        "kind": "api_agent",
+        "invoke_url": agent.get("url", "") or "",
+        "args_schema": {},
+        "metadata": {
+            "method": (agent.get("method") or "GET").upper(),
+            "auth_type": agent.get("auth_type") or "none",
+        },
+        "endpoint_id": endpoint_id,
+        "is_active": True,
+    }
+    try:
+        Tool.objects.update_or_create(name=slug, defaults=defaults)
+    except Exception as exc:
+        log.warning("agent_tools: failed to mirror runtime agent %s: %s", slug, exc)
+
+
 def register_runtime_agents(workflow: Workflow,
                             agents: list[dict]) -> list[dict]:
     """Save each agent as an endpoint in api_agent_endpoints.
@@ -114,6 +155,7 @@ def register_runtime_agents(workflow: Workflow,
             clean = {k: v for k, v in a.items() if k != "auth_token"}
             clean["endpoint_id"] = ""
             out.append(clean)
+            _mirror_to_tool_registry(clean)
         return out
 
     try:
@@ -125,6 +167,7 @@ def register_runtime_agents(workflow: Workflow,
             clean = {k: v for k, v in a.items() if k != "auth_token"}
             clean["endpoint_id"] = ""
             out.append(clean)
+            _mirror_to_tool_registry(clean)
         return out
 
     out: list[dict] = []
@@ -144,6 +187,7 @@ def register_runtime_agents(workflow: Workflow,
             clean["endpoint_id"] = ""
             clean["register_error"] = str(exc)
         out.append(clean)
+        _mirror_to_tool_registry(clean)
     return out
 
 

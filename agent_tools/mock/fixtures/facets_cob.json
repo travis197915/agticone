@@ -1,0 +1,13 @@
+{
+  "Data": {
+    "COB": {
+      "OtherInsurance": [
+        {
+          "PayerName": "MOCK PAYER A",
+          "PolicyId": "PL-001",
+          "PriorPaid": 25.0
+        }
+      ]
+    }
+  }
+}

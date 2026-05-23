@@ -1,0 +1,12 @@
+{
+  "Data": {
+    "MemberEligibility": {
+      "MEME_CK": "MEMEKEY-001",
+      "MEME_FIRST_NAME": "JANE",
+      "MEME_LAST_NAME": "DOE",
+      "MEPE_EFF_DT": "2025-01-01T00:00:00",
+      "MEPE_TERM_DT": "2025-12-31T00:00:00",
+      "MEPE_STATUS": "ACTIVE"
+    }
+  }
+}

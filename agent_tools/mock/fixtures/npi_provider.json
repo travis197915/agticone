@@ -1,0 +1,30 @@
+{
+  "results": [
+    {
+      "number": "1234567890",
+      "basic": {
+        "first_name": "JANE",
+        "last_name": "DOE",
+        "credential": "MD",
+        "sole_proprietor": "NO",
+        "gender": "F",
+        "status": "A",
+        "enumeration_date": "2005-04-01"
+      },
+      "taxonomies": [
+        {"code": "207RC0000X", "desc": "Cardiovascular Disease", "primary": true, "state": "MA"}
+      ],
+      "addresses": [
+        {
+          "address_purpose": "LOCATION",
+          "address_1": "1 BOYLSTON ST",
+          "city": "BOSTON",
+          "state": "MA",
+          "postal_code": "02118",
+          "country_code": "US"
+        }
+      ]
+    }
+  ],
+  "result_count": 1
+}

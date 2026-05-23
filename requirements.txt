@@ -6,6 +6,12 @@ redis>=5.0
 python-dotenv>=1.0
 gunicorn>=21.2
 
+# agent_tools (DB-backed tool registry + LangGraph runtime + mocks)
+requests>=2.31
+pydantic>=2.0
+langchain-core>=0.3
+langgraph>=0.2
+
 # SOP ingestion pipeline (local editable install)
 # Run: pip install -e ./uhc-sop-ingestion
 -e ./uhc-sop-ingestion

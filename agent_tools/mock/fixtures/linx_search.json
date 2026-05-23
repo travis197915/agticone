@@ -1,0 +1,15 @@
+{
+  "results": [
+    {
+      "claimNumber": "BH-25-000001",
+      "subscriberId": "SUB-12345",
+      "memberFirstName": "JANE",
+      "memberLastName": "DOE",
+      "serviceFromDate": "01/01/2025",
+      "serviceToDate": "01/01/2025",
+      "providerNpi": "1234567890",
+      "totalCharges": 250.0,
+      "totalPaid": 100.0
+    }
+  ]
+}

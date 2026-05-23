@@ -616,16 +616,45 @@ class WorkflowViewSet(viewsets.ModelViewSet):
 
         sop_rules = rules_buffer
 
-        agents = (wf.metadata or {}).get("runtime_agents") or []
-        tool_calls = [{
-            "key":         f"agent:{a.get('endpoint_id', '') or a.get('name', '')}",
-            "endpoint_id": a.get("endpoint_id", ""),
-            "name":        a.get("name", ""),
-            "method":      a.get("method", "GET"),
-            "url":         a.get("url", ""),
-            "description": a.get("description", ""),
-            "auth_type":   a.get("auth_type", "none"),
-        } for a in agents if a.get("endpoint_id") or a.get("name")]
+        # ── tool_calls — now sourced from the agent_tools.Tool table so
+        #    every LangChain tool AND every registered runtime agent shows
+        #    up in the rule-attach modal / left palette / config panel
+        #    under a single ``tool_kind`` discriminator.
+        tool_calls: list[dict] = []
+        try:
+            from agent_tools.models import Tool as _Tool
+            for t in _Tool.objects.filter(is_active=True).order_by("display_name"):
+                tool_calls.append({
+                    "key":           f"tool:{t.name}",
+                    "tool_id":       str(t.id),
+                    "name":          t.name,
+                    "display_name":  t.display_name,
+                    "description":   t.description,
+                    "tool_kind":     t.kind,
+                    "kind":          t.kind,
+                    "invoke_url":    t.invoke_url,
+                    "args_schema":   t.args_schema or {},
+                    "endpoint_id":   t.endpoint_id,
+                    "method":        (t.metadata or {}).get("method", "GET" if t.kind == "api_agent" else "POST"),
+                    "url":           t.invoke_url,
+                    "auth_type":     (t.metadata or {}).get("auth_type", "none"),
+                })
+        except Exception:
+            # During very early bootstrap (before agent_tools is migrated)
+            # fall back to the legacy metadata-only shape.
+            agents = (wf.metadata or {}).get("runtime_agents") or []
+            tool_calls = [{
+                "key":         f"agent:{a.get('endpoint_id', '') or a.get('name', '')}",
+                "tool_kind":   "api_agent",
+                "endpoint_id": a.get("endpoint_id", ""),
+                "name":        a.get("name", ""),
+                "display_name": a.get("name", ""),
+                "method":      a.get("method", "GET"),
+                "url":         a.get("url", ""),
+                "description": a.get("description", ""),
+                "auth_type":   a.get("auth_type", "none"),
+                "args_schema": {},
+            } for a in agents if a.get("endpoint_id") or a.get("name")]
 
         return Response({
             "sops":       sop_summaries,
@@ -735,3 +764,18 @@ class ShapeViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         from .serializers import _NestedShapeSerializer
         return _NestedShapeSerializer
+
+    def _sync_bindings(self, instance):
+        try:
+            from .bindings_sync import extract_bindings_from_properties
+            extract_bindings_from_properties(instance)
+        except Exception:
+            pass
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        self._sync_bindings(instance)
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        self._sync_bindings(instance)

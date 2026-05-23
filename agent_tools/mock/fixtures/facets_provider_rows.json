@@ -1,0 +1,22 @@
+{
+  "Data": {
+    "ResultSets": [
+      {
+        "Rows": [
+          {
+            "PRPR_ID": "FAC000022500",
+            "PRPR_NAME": "DR JANE DOE",
+            "PRPR_NPI": "1234567890",
+            "PRPR_CITY": "BOSTON",
+            "PRPR_STATE": "MA",
+            "PRPR_ZIP": "02118",
+            "PRPR_ENTITY": "P",
+            "MCTN_ID": "123456789"
+          }
+        ],
+        "RowCount": 1
+      }
+    ],
+    "TotalRowCount": 1
+  }
+}

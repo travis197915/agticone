@@ -1,0 +1,9 @@
+{
+  "providerId": "FAC000022500",
+  "providerName": "DR JANE DOE",
+  "providerType": "BH",
+  "programmes": [
+    {"programDetailedId": "276728", "programName": "BH OUTPATIENT"},
+    {"programDetailedId": "276729", "programName": "BH PARTIAL HOSPITALIZATION"}
+  ]
+}

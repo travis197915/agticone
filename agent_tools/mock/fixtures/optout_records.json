@@ -1,0 +1,14 @@
+{
+  "records": [
+    {
+      "First Name": "JANE",
+      "Last Name": "DOE",
+      "NPI": "1234567890",
+      "State Code": "MA",
+      "Specialty": "Cardiology",
+      "Optout Effective Date": "01/01/2024",
+      "Optout End Date": "12/31/2027",
+      "Last updated": "08/01/2024"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "rows": [
+    {
+      "code": "E11.9",
+      "type1": "Type1",
+      "type2": "Type2",
+      "type3": "N/A",
+      "coverageRecommend": "Cover Services",
+      "description": "Type 2 diabetes mellitus without complications"
+    },
+    {
+      "code": "F33.2",
+      "type1": "Type1",
+      "type2": "N/A",
+      "type3": "N/A",
+      "coverageRecommend": "Cover Services",
+      "description": "Major depressive disorder, recurrent severe without psychotic features"
+    }
+  ]
+}
