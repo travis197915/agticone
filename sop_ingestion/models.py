@@ -589,3 +589,73 @@ class AuditGraphEdge(models.Model):
 
     def __str__(self) -> str:
         return f"{self.source.node_key} -[{self.rel_type}]-> {self.target.node_key}"
+
+
+class SopExclusion(models.Model):
+    """User-marked exclusion attached to a SOP.
+
+    Distinct from LLM-derived exclusions (``AuditPrecondition.llm_rules[*]
+    .is_exception``): this row lets an auditor explicitly say "ignore this
+    rule / step / section when evaluating this SOP".
+
+    ``target_kind`` + ``target_key`` together identify the excluded thing
+    using the same stable keys the builder ``/attachable/`` endpoint emits:
+
+    ============  ===========================================================
+    target_kind   target_key
+    ============  ===========================================================
+    rule          rule_key (e.g. ``step:22:4:0`` or ``pre:22:88:1``)
+    step          ``step:<sop_id>:<step_number>``  — fans out to every
+                  decision row in that step
+    section       ``pre:<sop_id>:<precondition_id>`` — fans out to every
+                  ``llm_rule`` in that pre-condition section
+    sop           ``sop:<sop_id>`` — the whole SOP is excluded
+    graph_node    raw ``AuditGraphNode.node_key`` (e.g. ``step_4_d0``,
+                  ``pre_3_r5``) — used for graph-native picks
+    ============  ===========================================================
+
+    (sop, target_kind, target_key) is unique so toggling on/off is a stable
+    upsert/delete.
+    """
+
+    TARGET_KINDS = [
+        ("rule",       "Rule"),
+        ("step",       "Step"),
+        ("section",    "Pre-condition section"),
+        ("sop",        "Whole SOP"),
+        ("graph_node", "Graph node"),
+        ("html_block", "Raw HTML block"),
+    ]
+
+    sop          = models.ForeignKey(AuditSop, on_delete=models.CASCADE,
+                                     related_name="user_exclusions")
+    target_kind  = models.CharField(max_length=16, choices=TARGET_KINDS, default="rule")
+    target_key   = models.CharField(max_length=255, db_index=True)
+    label        = models.CharField(max_length=255, blank=True, default="",
+                       help_text="Human-readable label rendered in the SPA")
+    reason       = models.TextField(blank=True, default="",
+                       help_text="Free-form note from the auditor")
+    snippet_text = models.TextField(blank=True, default="",
+                       help_text="Captured source text for the excluded thing")
+    metadata     = models.JSONField(default=dict, blank=True,
+                       help_text="Free-form bag (section_label, graph_node_key …)")
+    created_by_id    = models.CharField(max_length=64, blank=True, default="")
+    created_by_email = models.EmailField(blank=True, default="")
+    created_at   = models.DateTimeField(auto_now_add=True)
+    updated_at   = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "SOP Exclusion"
+        ordering     = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["sop", "target_kind", "target_key"],
+                name="uniq_sop_exclusion_target",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["sop", "target_kind"]),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover - debug aid
+        return f"{self.target_kind}:{self.target_key} (sop={self.sop_id})"

@@ -9,6 +9,7 @@ Exposes:
 """
 from __future__ import annotations
 
+import html as _html
 import re
 import unicodedata
 from copy import deepcopy
@@ -28,6 +29,32 @@ from .models import (
     Workbench,
     Workflow,
 )
+
+
+def _text_to_basic_html(text: str) -> str:
+    """Render plain SOP text into safe minimal HTML for the SPA's reference panel.
+
+    Escapes HTML, converts paragraph breaks (blank line) to <p>, and bullet
+    lines starting with "•", "-" or "*" into <ul><li> blocks. No external
+    sanitiser dependency; output is intentionally tag-restricted.
+    """
+    if not text:
+        return ""
+    paragraphs = re.split(r"\n{2,}", text.strip())
+    out: list[str] = []
+    for p in paragraphs:
+        lines = [ln.strip() for ln in p.splitlines() if ln.strip()]
+        is_bullet = lines and all(re.match(r"^[\u2022\u2023\-*]\s*", ln) for ln in lines)
+        if is_bullet:
+            items = [
+                f"<li>{_html.escape(re.sub(r'^[\u2022\u2023\\-*]\\s*', '', ln))}</li>"
+                for ln in lines
+            ]
+            out.append("<ul>" + "".join(items) + "</ul>")
+        else:
+            joined = " ".join(lines)
+            out.append(f"<p>{_html.escape(joined)}</p>")
+    return "".join(out)
 from .serializers import (
     DashboardWidgetSerializer,
     NavItemSerializer,
@@ -187,20 +214,31 @@ class WorkflowViewSet(viewsets.ModelViewSet):
     def attachable(self, _request, pk=None):
         """Enumerate everything a node on this workflow's canvas can attach to.
 
-        Returns two lists keyed by stable string keys the SPA can store
+        Returns four lists keyed by stable string keys the SPA can store
         verbatim on ``Shape.properties``:
 
         * ``sop_rules`` — one entry per individual rule row in any completed
           SOP linked to this workflow.  Sources both pre-condition rules
-          (``llm_rules``) and decision-tree rows.  Each rule carries a
-          ``references`` array listing keys of *other* rules that pick is
-          dependent on — typically the destination of a ``goto_step`` /
-          "Skip to <step>".  The SPA uses this to cascade-select dependent
-          rules when the user picks a rule with a downstream step.
-        * ``tool_calls`` — one entry per registered runtime API agent
-          (from ``Workflow.metadata.runtime_agents``).
+          (``llm_rules``) and decision-tree rows.  Each rule carries:
+            - ``references``   — keys of rules a goto/skip-to depends on,
+            - ``excluded_by``  — keys of *exclusions* that override this rule
+                                 (computed from the agentic graph's
+                                 ``OVERRIDES`` edges),
+            - ``graph_node_key`` — corresponding node in the knowledge graph,
+            - ``html_reference`` — source URL + section anchor + raw text
+                                   the SPA can render as the original
+                                   document context.
+        * ``exclusions`` — dedicated list of exclusion / exception rules
+          (``rule_kind="exclusion"`` or ``is_exception=true`` or
+          ``OVERRIDES`` edges sourced from the rule). Each exclusion exposes
+          the list of ``overrides_rule_keys`` it neutralises, so the SPA
+          can show "these rules are excluded" when an exclusion is picked.
+        * ``sops`` — narrative summary per SOP.
+        * ``tool_calls`` — registered runtime API agents.
         """
-        from sop_ingestion.models import AuditSop  # local to avoid cycles
+        from sop_ingestion.models import (  # local to avoid cycles
+            AuditSop, AuditGraphNode, AuditGraphEdge, SopExclusion,
+        )
         wf: Workflow = self.get_object()
 
         sop_rules: list[dict] = []
@@ -208,18 +246,52 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         sops_qs = AuditSop.objects.filter(job__workflow=wf).prefetch_related(
             "preconditions", "steps__decisions",
         ).order_by("id")
+        # doc_format per SOP — drives whether the SPA shows an HTML iframe
+        # (when the source is reachable) or a plain text panel (DOCX/PDF
+        # uploads, where the snippet is the only viewable form).
+        sop_meta_by_id: dict[int, dict] = {}
+
+        # ── 1. Pull every OVERRIDES edge into a map keyed by source graph
+        #       node key so we can derive (rule → excluded_by exclusions).
+        sop_ids = list(sops_qs.values_list("id", flat=True))
+        override_edges = (
+            AuditGraphEdge.objects
+            .filter(sop_id__in=sop_ids, rel_type="OVERRIDES")
+            .select_related("source", "target")
+        )
+        # exclusion node_key  → list[target node_keys]
+        overrides_by_src: dict[tuple[int, str], list[str]] = {}
+        # target node_key    → list[exclusion node_keys]
+        excluded_by_tgt:   dict[tuple[int, str], list[str]] = {}
+        for e in override_edges:
+            src_key = (e.sop_id, e.source.node_key)
+            tgt_key = (e.sop_id, e.target.node_key)
+            overrides_by_src.setdefault(src_key, []).append(e.target.node_key)
+            excluded_by_tgt.setdefault(tgt_key, []).append(e.source.node_key)
+
+        # ── 2. Iterate SOPs and emit rules + exclusions. Maintain two maps
+        #       so we can resolve graph node_key ↔ flat rule key once both
+        #       passes are done.
+        rule_key_by_graph: dict[tuple[int, str], str] = {}
+        rules_buffer: list[dict] = []      # filled with graph_node_key set
+        exclusions: list[dict] = []
 
         for sop in sops_qs:
             sop_title = sop.title or f"SOP #{sop.id}"
+            sop_url   = sop.url or ""
+            doc_format = sop.doc_format or "HTML"
+            sop_meta_by_id[sop.id] = {
+                "title": sop_title, "url": sop_url, "doc_format": doc_format,
+            }
             sop_summaries.append({
-                "sop_id":    sop.id,
-                "title":     sop_title,
-                "narrative": sop.narrative_context or sop.llm_summary or "",
+                "sop_id":     sop.id,
+                "title":      sop_title,
+                "narrative":  sop.narrative_context or sop.llm_summary or "",
+                "source_url": sop_url,
+                "doc_format": doc_format,
             })
 
-            # Two-pass: pre-index step → list of decision-row keys so we can
-            # resolve goto_step references into the keys of all sibling rows
-            # in the target step.
+            # Pre-index step → decision-row keys (used by goto_step refs)
             step_to_keys: dict[int, list[str]] = {}
             for step in sop.steps.all().order_by("step_number"):
                 step_to_keys[step.step_number] = [
@@ -227,31 +299,91 @@ class WorkflowViewSet(viewsets.ModelViewSet):
                     for d in step.decisions.all().order_by("row_index")
                 ]
 
+            # Index this SOP's PRE_RULE/PRE_SECTION graph nodes by display_order
+            # so we can attach graph node_keys to AuditPrecondition.llm_rules.
+            pre_rule_nodes = {}   # (display_order_1based, rule_idx_1based) → node_key
+            for n in AuditGraphNode.objects.filter(
+                sop_id=sop.id, node_type="PRE_RULE",
+            ):
+                m = re.match(r"^pre_(\d+)_r(\d+)$", n.node_key or "")
+                if m:
+                    pre_rule_nodes[(int(m.group(1)), int(m.group(2)))] = n.node_key
+
+            # Pre-condition rules
             for pc in sop.preconditions.all().order_by("display_order", "id"):
                 rules = pc.llm_rules or []
                 for idx, r in enumerate(rules):
                     cond   = (r.get("condition") or "").strip()
                     action = (r.get("action") or "").strip()
                     dtype  = (r.get("decision_type") or "").strip()
-                    sop_rules.append({
-                        "key":           f"pre:{sop.id}:{pc.id}:{idx}",
-                        "sop_id":        sop.id,
-                        "sop_title":     sop_title,
-                        "source":        "precondition",
-                        "section_id":    pc.id,
+                    rule_kind = (r.get("rule_kind") or "").strip().lower()
+                    is_excl = (
+                        bool(r.get("is_exception"))
+                        or rule_kind in {"exclusion", "exception"}
+                        or (pc.category or "").upper() == "EXCLUSION"
+                    )
+
+                    rule_key  = f"pre:{sop.id}:{pc.id}:{idx}"
+                    graph_key = pre_rule_nodes.get(
+                        (pc.display_order + 1, idx + 1), ""
+                    )
+                    if graph_key:
+                        rule_key_by_graph[(sop.id, graph_key)] = rule_key
+
+                    html_ref = {
+                        "source_url":   sop_url,
+                        "doc_format":   doc_format,
+                        "anchor":       graph_key or f"pre_{pc.display_order + 1}",
                         "section_label": pc.label or pc.category,
+                        "snippet_text": pc.content_text or "",
+                        "snippet_html": _text_to_basic_html(pc.content_text or ""),
+                    }
+
+                    entry = {
+                        "key":             rule_key,
+                        "sop_id":          sop.id,
+                        "sop_title":       sop_title,
+                        "source":          "precondition",
+                        "section_id":      pc.id,
+                        "section_label":   pc.label or pc.category,
                         "section_category": pc.category,
                         "section_narrative": pc.content_text or "",
-                        "condition":     cond,
-                        "action":        action,
-                        "decision_type": dtype,
-                        "is_exception":  bool(r.get("is_exception")),
-                        "codes":         [],
-                        "is_blocking":   pc.is_blocking,
-                        "references":    [],
-                        "goto_step":     None,
-                    })
+                        "condition":       cond,
+                        "action":          action,
+                        "decision_type":   dtype,
+                        "is_exception":    is_excl,
+                        "is_exclusion":    is_excl,
+                        "rule_kind":       rule_kind or ("exclusion" if is_excl else "rule"),
+                        "codes":           [],
+                        "is_blocking":     pc.is_blocking,
+                        "references":     [],
+                        "goto_step":       None,
+                        "graph_node_key":  graph_key,
+                        "excluded_by":     [],   # filled in second pass
+                        "html_reference":  html_ref,
+                    }
+                    rules_buffer.append(entry)
 
+                    if is_excl:
+                        # Exclusions also get their own dedicated entry — the
+                        # SPA shows these as a separate selector group.
+                        exclusions.append({
+                            "key":             rule_key,
+                            "sop_id":          sop.id,
+                            "sop_title":       sop_title,
+                            "section_label":   pc.label or pc.category,
+                            "category":        pc.category,
+                            "label":           cond or action[:120] or pc.label,
+                            "condition":       cond,
+                            "action":          action,
+                            "decision_type":   dtype,
+                            "rule_kind":       entry["rule_kind"],
+                            "graph_node_key":  graph_key,
+                            "overrides_rule_keys": [],   # filled in second pass
+                            "html_reference":  html_ref,
+                        })
+
+            # Decision rules
             for step in sop.steps.all().order_by("step_number"):
                 section_label = (
                     f"Step {step.step_number}"
@@ -268,24 +400,221 @@ class WorkflowViewSet(viewsets.ModelViewSet):
                     references: list[str] = []
                     if d.goto_step is not None and d.goto_step in step_to_keys:
                         references = step_to_keys[d.goto_step]
-                    sop_rules.append({
-                        "key":           f"step:{sop.id}:{step.step_number}:{d.row_index}",
-                        "sop_id":        sop.id,
-                        "sop_title":     sop_title,
-                        "source":        "decision",
-                        "section_id":    step.step_number,
+
+                    rule_key  = f"step:{sop.id}:{step.step_number}:{d.row_index}"
+                    graph_key = f"step_{step.step_number}_d{d.row_index}"
+                    rule_key_by_graph[(sop.id, graph_key)] = rule_key
+
+                    html_ref = {
+                        "source_url":    sop_url,
+                        "doc_format":    doc_format,
+                        "anchor":        graph_key,
                         "section_label": section_label,
+                        "snippet_text":  (step.intro_text or "")
+                            + ("\n\n" if (step.intro_text and (d.action_text or "")) else "")
+                            + (d.action_text or d.action_summary or ""),
+                        "snippet_html":  _text_to_basic_html(
+                            (step.intro_text or "")
+                            + "\n\n" + (d.action_text or d.action_summary or "")
+                        ),
+                    }
+
+                    rules_buffer.append({
+                        "key":             rule_key,
+                        "sop_id":          sop.id,
+                        "sop_title":       sop_title,
+                        "source":          "decision",
+                        "section_id":      step.step_number,
+                        "section_label":   section_label,
                         "section_category": "DECISION",
                         "section_narrative": step.narrative_context or step.intro_text or "",
-                        "condition":     " AND ".join(cond_parts),
-                        "action":        d.action_text or d.action_summary or "",
-                        "decision_type": d.decision_type or "",
-                        "is_exception":  False,
-                        "codes":         codes,
-                        "is_blocking":   d.is_final,
-                        "references":    references,
-                        "goto_step":     d.goto_step,
+                        "condition":       " AND ".join(cond_parts),
+                        "action":          d.action_text or d.action_summary or "",
+                        "decision_type":   d.decision_type or "",
+                        "is_exception":    False,
+                        "is_exclusion":    False,
+                        "rule_kind":       "decision",
+                        "codes":           codes,
+                        "is_blocking":     d.is_final,
+                        "references":      references,
+                        "goto_step":       d.goto_step,
+                        "graph_node_key":  graph_key,
+                        "excluded_by":     [],
+                        "html_reference":  html_ref,
                     })
+
+        # ── 3. Second pass: now that every rule has a graph_node_key, resolve
+        #       OVERRIDES edges in both directions.
+        # Build a step-level fan-out: an exclusion that overrides "step_N"
+        # implicitly excludes EVERY decision row inside step N.
+        step_to_rule_keys: dict[tuple[int, str], list[str]] = {}
+        for (sop_id, gkey), rkey in rule_key_by_graph.items():
+            m = re.match(r"^step_(\d+)$", gkey or "")
+            # ignore — handled below from the rules themselves
+        for r in rules_buffer:
+            if r["source"] == "decision":
+                gk = f"step_{r['section_id']}"
+                step_to_rule_keys.setdefault((r["sop_id"], gk), []).append(r["key"])
+
+        def _resolve_targets(sop_id: int, target_node_keys: list[str]) -> list[str]:
+            out: list[str] = []
+            for tk in target_node_keys:
+                # Direct decision/precondition target
+                rk = rule_key_by_graph.get((sop_id, tk))
+                if rk:
+                    out.append(rk)
+                    continue
+                # STEP-level override → fan out to every decision row in step
+                fan = step_to_rule_keys.get((sop_id, tk), [])
+                out.extend(fan)
+            return list(dict.fromkeys(out))  # dedupe, preserve order
+
+        # Fill excluded_by on every rule
+        for r in rules_buffer:
+            gk = r.get("graph_node_key")
+            if not gk:
+                continue
+            excl_node_keys = excluded_by_tgt.get((r["sop_id"], gk), [])
+            # Also include exclusions that target the parent STEP, if this
+            # rule is a decision row.
+            if r["source"] == "decision":
+                step_gk = f"step_{r['section_id']}"
+                excl_node_keys = excl_node_keys + excluded_by_tgt.get(
+                    (r["sop_id"], step_gk), []
+                )
+            if not excl_node_keys:
+                continue
+            r["excluded_by"] = [
+                rule_key_by_graph[(r["sop_id"], nk)]
+                for nk in dict.fromkeys(excl_node_keys)
+                if (r["sop_id"], nk) in rule_key_by_graph
+            ]
+
+        # Fill overrides_rule_keys on every exclusion
+        for ex in exclusions:
+            gk = ex.get("graph_node_key")
+            if not gk:
+                continue
+            target_node_keys = overrides_by_src.get((ex["sop_id"], gk), [])
+            ex["overrides_rule_keys"] = _resolve_targets(
+                ex["sop_id"], target_node_keys
+            )
+
+        # ── 4. Merge USER-curated SopExclusion rows ─────────────────────────
+        # These are exclusions an auditor picked in the UI (not LLM-derived).
+        # We surface them in the same `exclusions[]` list (source="user") and
+        # also propagate them onto each affected rule's `excluded_by`.
+        user_rules_by_key = {r["key"]: r for r in rules_buffer}
+        # rule_key by graph_node_key for graph_node-kind exclusions
+        rule_keys_by_step: dict[tuple[int, int], list[str]] = {}
+        for r in rules_buffer:
+            if r["source"] == "decision":
+                rule_keys_by_step.setdefault(
+                    (r["sop_id"], r["section_id"]), []
+                ).append(r["key"])
+        # rule_keys by precondition section id for "section" kind
+        rule_keys_by_section: dict[tuple[int, int], list[str]] = {}
+        for r in rules_buffer:
+            if r["source"] == "precondition":
+                rule_keys_by_section.setdefault(
+                    (r["sop_id"], r["section_id"]), []
+                ).append(r["key"])
+
+        def _user_exclusion_targets(ex: SopExclusion) -> list[str]:
+            """Resolve a SopExclusion to the list of rule_keys it affects."""
+            kind = ex.target_kind
+            key  = ex.target_key or ""
+            if kind == "rule":
+                return [key] if key in user_rules_by_key else []
+            if kind == "step":
+                m = re.match(r"^step:(\d+):(\d+)$", key)
+                if not m:
+                    return []
+                return rule_keys_by_step.get(
+                    (int(m.group(1)), int(m.group(2))), []
+                )
+            if kind == "section":
+                m = re.match(r"^pre:(\d+):(\d+)$", key)
+                if not m:
+                    return []
+                return rule_keys_by_section.get(
+                    (int(m.group(1)), int(m.group(2))), []
+                )
+            if kind == "sop":
+                m = re.match(r"^sop:(\d+)$", key)
+                if not m:
+                    return []
+                sid = int(m.group(1))
+                return [r["key"] for r in rules_buffer if r["sop_id"] == sid]
+            if kind == "graph_node":
+                rk = rule_key_by_graph.get((ex.sop_id, key))
+                if rk:
+                    return [rk]
+                # graph step node → fan-out to its decision rows
+                mm = re.match(r"^step_(\d+)$", key)
+                if mm:
+                    return rule_keys_by_step.get(
+                        (ex.sop_id, int(mm.group(1))), []
+                    )
+                return []
+            return []
+
+        user_excl_qs = (
+            SopExclusion.objects
+            .filter(sop_id__in=sop_ids)
+            .order_by("-updated_at")
+        )
+        for u in user_excl_qs:
+            meta = sop_meta_by_id.get(u.sop_id, {})
+            stable_key = f"user-excl:{u.id}"
+            affected = _user_exclusion_targets(u)
+            # html_block snippets ARE pre-rendered HTML (the extractor
+            # captures the original DOM fragment); everything else stores
+            # plaintext that we render into basic HTML here.
+            md = u.metadata or {}
+            snippet = u.snippet_text or ""
+            snippet_html = (
+                snippet
+                if u.target_kind == "html_block" or md.get("snippet_is_html")
+                else _text_to_basic_html(snippet)
+            )
+            html_ref = {
+                "source_url":    meta.get("url", ""),
+                "doc_format":    meta.get("doc_format", "HTML"),
+                "anchor":        u.target_key,
+                "section_label": md.get("section_label", u.label or u.target_key),
+                "snippet_text":  snippet,
+                "snippet_html":  snippet_html,
+            }
+            exclusions.append({
+                "key":            stable_key,
+                "id":             u.id,
+                "sop_id":         u.sop_id,
+                "sop_title":      meta.get("title", f"SOP #{u.sop_id}"),
+                "source":         "user",
+                "target_kind":    u.target_kind,
+                "target_key":     u.target_key,
+                "section_label":  html_ref["section_label"],
+                "category":       (u.metadata or {}).get("category", "USER"),
+                "label":          u.label or u.target_key,
+                "reason":         u.reason or "",
+                "condition":      u.label or u.target_key,
+                "action":         "(excluded by auditor)",
+                "decision_type":  "EXCLUSION",
+                "rule_kind":      "exclusion",
+                "graph_node_key": (u.metadata or {}).get("graph_node_key", ""),
+                "overrides_rule_keys": affected,
+                "created_by":     u.created_by_email or u.created_by_id or "",
+                "created_at":     u.created_at.isoformat() if u.created_at else None,
+                "html_reference": html_ref,
+            })
+            # Propagate to affected rules' excluded_by
+            for rk in affected:
+                row = user_rules_by_key.get(rk)
+                if row is not None and stable_key not in row["excluded_by"]:
+                    row["excluded_by"].append(stable_key)
+
+        sop_rules = rules_buffer
 
         agents = (wf.metadata or {}).get("runtime_agents") or []
         tool_calls = [{
@@ -301,6 +630,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         return Response({
             "sops":       sop_summaries,
             "sop_rules":  sop_rules,
+            "exclusions": exclusions,
             "tool_calls": tool_calls,
         })
 

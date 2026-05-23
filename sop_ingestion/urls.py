@@ -2,6 +2,11 @@ from django.urls import path
 from .views import (HealthView, JobListCreateView, JobDetailView, SyncRunView,
                     JobGraphView, JobSectionsView, JobContextualizeView,
                     ViewerJobListView, ViewerJobDetailView, ViewerDocDetailView)
+from .exclusion_views import (SopExclusionListCreateView,
+                              SopExclusionDetailView,
+                              SopExclusionToggleView,
+                              SopHtmlBlocksView,
+                              SopSourceHtmlView)
 
 app_name = "sop_ingestion"
 
@@ -14,6 +19,23 @@ urlpatterns = [
     path("<uuid:job_id>/graph/",    JobGraphView.as_view(),    name="job-graph"),
     path("<uuid:job_id>/sections/",      JobSectionsView.as_view(),      name="job-sections"),
     path("<uuid:job_id>/contextualize/", JobContextualizeView.as_view(), name="job-contextualize"),
+
+    # User-curated exclusions (per-SOP, no LLM)
+    path("sops/<int:sop_id>/exclusions/",
+         SopExclusionListCreateView.as_view(),
+         name="sop-exclusions-list-create"),
+    path("sops/<int:sop_id>/exclusions/toggle/",
+         SopExclusionToggleView.as_view(),
+         name="sop-exclusions-toggle"),
+    path("sops/<int:sop_id>/exclusions/<int:exclusion_id>/",
+         SopExclusionDetailView.as_view(),
+         name="sop-exclusions-detail"),
+    path("sops/<int:sop_id>/html-blocks/",
+         SopHtmlBlocksView.as_view(),
+         name="sop-html-blocks"),
+    path("sops/<int:sop_id>/source-html/",
+         SopSourceHtmlView.as_view(),
+         name="sop-source-html"),
 
     # HTML Viewer
     path("viewer/",                                      ViewerJobListView.as_view(),   name="viewer-jobs"),
