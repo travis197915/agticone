@@ -1,2 +1,0 @@
-[console_scripts]
-api-agent = uhc_api_agent.cli:main

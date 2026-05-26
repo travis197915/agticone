@@ -1,4 +1,28 @@
-# graphify-out/*
+# ── Secrets / environment ────────────────────────────────────────────────
 .env
+.env.*
+!.env.example
+
+# ── Python bytecode & caches ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ── Editable installs / build artefacts ──────────────────────────────────
+build/
+dist/
+*.egg
+
+# ── Virtual environments ─────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── IDE / OS junk ────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+
+# ── Local scratch ────────────────────────────────────────────────────────
 new.txt
-*.html
