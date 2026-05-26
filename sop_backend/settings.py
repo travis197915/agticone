@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     "sop_ingestion",
     "builder",
     "agent_tools",
+    "execution_app",
 ]
 
 MIDDLEWARE = [
