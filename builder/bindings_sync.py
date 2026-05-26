@@ -171,17 +171,30 @@ def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
         rule_rows = []
 
     if rule_rows:
-        props["sop_rules"] = [{
-            "id":              str(row.id),
-            "key":             row.rule_key,
-            "sop_id":          row.sop_id,
-            "condition":       row.condition,
-            "action":          row.action,
-            "references":      row.references_json or [],
-            "excluded_by":     row.excluded_by_json or [],
-            "html_reference":  row.html_reference_json or {},
-            "ordering":        row.ordering,
-        } for row in rule_rows]
+        # Build a lookup of the raw JSONB rules by key so we can preserve
+        # fields not stored in NodeRuleBinding (sop_title, source,
+        # section_label, section_narrative, decision_type, codes, etc.).
+        raw_by_key: dict[str, dict] = {}
+        for raw in props.get("sop_rules") or []:
+            if isinstance(raw, dict) and raw.get("key"):
+                raw_by_key[raw["key"]] = raw
+
+        props["sop_rules"] = []
+        for row in rule_rows:
+            entry = dict(raw_by_key.get(row.rule_key) or {})
+            # Authoritative fields from the binding row always win.
+            entry.update({
+                "id":             str(row.id),
+                "key":            row.rule_key,
+                "sop_id":         row.sop_id,
+                "condition":      row.condition,
+                "action":         row.action,
+                "references":     row.references_json or [],
+                "excluded_by":    row.excluded_by_json or [],
+                "html_reference": row.html_reference_json or {},
+                "ordering":       row.ordering,
+            })
+            props["sop_rules"].append(entry)
 
     try:
         tool_rows = list(
