@@ -1,0 +1,1592 @@
+openapi: 3.0.3
+info:
+  title: UHC Agentic Claims-Audit Backend
+  description: |
+    REST API for the Wipro UHC agentic claims-audit platform.
+
+    Top-level groups:
+      * `/api/builder/`     — workflow CRUD, server-driven palette + chrome, atomic canvas save, per-node attachments.
+      * `/api/ingest/`      — SOP ingestion jobs, knowledge-graph + section data, narrative backfill, HTML viewer.
+      * `/api/agent-tools/` — DB-backed LangChain tool registry + per-tool invoke surface (see AGENT_TOOLS.md).
+      * `/api/execute/`     — Per-Shape execution engine: upload an Excel of claim ids and get a per-claim adjudication.
+
+    Most endpoints require a `Bearer` JWT minted by the Node `claims-corebackend` (HS256, shared `JWT_SECRET`). Endpoints that allow anonymous access are flagged below.
+  version: "1.1.0"
+  contact:
+    name: UHC Agentic Backend team
+
+servers:
+  - url: http://localhost:8000
+    description: Local dev
+  - url: https://uhc-backend.example.com
+    description: Production placeholder
+
+tags:
+  - name: builder-catalog
+    description: Server-driven palette (read-only)
+  - name: builder-chrome
+    description: Sidebar nav + dashboard widgets
+  - name: builder-workflows
+    description: Workflow CRUD + lifecycle + graph save + attachments
+  - name: builder-inspector
+    description: Flat workbench / shape CRUD
+  - name: ingest-jobs
+    description: Ingestion job CRUD + polling
+  - name: ingest-sop
+    description: SOP graph + sections data
+  - name: ingest-narrative
+    description: Re-run narrative agents on existing SOPs
+  - name: ingest-viewer
+    description: Server-rendered HTML viewer (debug)
+  - name: execute
+    description: Per-Shape execution engine — batch claim adjudication.
+
+security:
+  - bearerAuth: []
+
+paths:
+  # ── BUILDER · CATALOG ────────────────────────────────────────────────────
+  /api/builder/catalog/categories/:
+    get:
+      tags: [builder-catalog]
+      summary: List palette categories with embedded shapes
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ShapeCategory" }
+  /api/builder/catalog/shapes/:
+    get:
+      tags: [builder-catalog]
+      summary: Flat list of palette items
+      parameters:
+        - name: category
+          in: query
+          schema: { type: string }
+          required: false
+          description: Filter by category slug
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ShapeDefinition" }
+  /api/builder/catalog/shapes/{slug}/:
+    get:
+      tags: [builder-catalog]
+      summary: One palette item by slug
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ShapeDefinition" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── BUILDER · CHROME ────────────────────────────────────────────────────
+  /api/builder/ui/navigation/:
+    get:
+      tags: [builder-chrome]
+      summary: Sidebar entries (filtered by user role)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/NavItem" }
+  /api/builder/ui/dashboard/:
+    get:
+      tags: [builder-chrome]
+      summary: Dashboard tiles
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DashboardWidget" }
+
+  # ── BUILDER · WORKFLOWS ────────────────────────────────────────────────
+  /api/builder/workflows/:
+    get:
+      tags: [builder-workflows]
+      summary: List workflows
+      parameters:
+        - name: is_active
+          in: query
+          required: false
+          schema: { type: string, enum: ["true", "false"] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Workflow" }
+    post:
+      tags: [builder-workflows]
+      summary: Create workflow (optionally attach SOPs + runtime agents)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WorkflowCreate" }
+            example:
+              name: OBH Facets Timely Filing
+              description: Audit OBH claims for timely filing
+              is_active: true
+              metadata: {}
+              sop_urls:
+                - http://localhost:9191/obh_facets_timely_filing.html
+              runtime_agents:
+                - name: Eligibility check
+                  url: https://api.example.com/eligibility
+                  method: POST
+                  auth_type: bearer
+                  auth_token: sk-xyz-secret
+                  description: Verify member coverage
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workflow" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+
+  /api/builder/workflows/{id}/:
+    parameters:
+      - $ref: "#/components/parameters/WorkflowId"
+    get:
+      tags: [builder-workflows]
+      summary: Workflow detail
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workflow" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [builder-workflows]
+      summary: Partial update
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WorkflowPatch" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workflow" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [builder-workflows]
+      summary: Cascade delete
+      responses:
+        "204": { description: No Content }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/builder/workflows/{id}/graph/:
+    parameters:
+      - $ref: "#/components/parameters/WorkflowId"
+    get:
+      tags: [builder-workflows]
+      summary: Full nested canvas state
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkflowGraph" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [builder-workflows]
+      summary: Atomic bulk save of the canvas
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WorkflowGraph" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkflowGraph" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+
+  /api/builder/workflows/{id}/attach/:
+    parameters:
+      - $ref: "#/components/parameters/WorkflowId"
+    post:
+      tags: [builder-workflows]
+      summary: Attach more SOPs / runtime agents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sop_urls:
+                  type: array
+                  items: { type: string, format: uri }
+                runtime_agents:
+                  type: array
+                  items: { $ref: "#/components/schemas/RuntimeAgentCreate" }
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workflow: { $ref: "#/components/schemas/Workflow" }
+                  dispatched:
+                    type: object
+                    properties:
+                      sops:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            job_id:   { type: string, format: uuid, nullable: true }
+                            seed_url: { type: string }
+                            status:   { type: string }
+                      agents:
+                        type: array
+                        items: { $ref: "#/components/schemas/RuntimeAgent" }
+
+  /api/builder/workflows/{id}/attachable/:
+    parameters:
+      - $ref: "#/components/parameters/WorkflowId"
+    get:
+      tags: [builder-workflows]
+      summary: Rules + tools available for per-node attachment
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Attachable" }
+
+  /api/builder/workflows/{id}/duplicate/:
+    parameters:
+      - $ref: "#/components/parameters/WorkflowId"
+    post:
+      tags: [builder-workflows]
+      summary: Clone a workflow (deep copy)
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, description: "Override the clone's name" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workflow" }
+
+  /api/builder/workflows/{id}/activate/:
+    parameters:
+      - $ref: "#/components/parameters/WorkflowId"
+    post:
+      tags: [builder-workflows]
+      summary: Mark active
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workflow" }
+
+  /api/builder/workflows/{id}/deactivate/:
+    parameters:
+      - $ref: "#/components/parameters/WorkflowId"
+    post:
+      tags: [builder-workflows]
+      summary: Mark inactive
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workflow" }
+
+  # ── BUILDER · INSPECTOR CRUD ────────────────────────────────────────────
+  /api/builder/workbenches/:
+    get:
+      tags: [builder-inspector]
+      summary: List workbenches
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Workbench" }
+    post:
+      tags: [builder-inspector]
+      summary: Create a workbench
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Workbench" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workbench" }
+
+  /api/builder/workbenches/{id}/:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [builder-inspector]
+      summary: Workbench detail
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workbench" }
+    patch:
+      tags: [builder-inspector]
+      summary: Update workbench
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Workbench" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workbench" }
+    delete:
+      tags: [builder-inspector]
+      summary: Delete workbench
+      responses:
+        "204": { description: No Content }
+
+  /api/builder/shapes/:
+    get:
+      tags: [builder-inspector]
+      summary: List shapes
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Shape" }
+    post:
+      tags: [builder-inspector]
+      summary: Create a shape (must include definition_slug)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Shape" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Shape" }
+
+  /api/builder/shapes/{id}/:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [builder-inspector]
+      summary: Shape detail
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Shape" }
+    patch:
+      tags: [builder-inspector]
+      summary: Update shape
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Shape" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Shape" }
+    delete:
+      tags: [builder-inspector]
+      summary: Delete shape
+      responses:
+        "204": { description: No Content }
+
+  # ── INGEST · JOBS ───────────────────────────────────────────────────────
+  /api/ingest/health/:
+    get:
+      tags: [ingest-jobs]
+      security: []
+      summary: Health check (no auth)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  /api/ingest/:
+    get:
+      tags: [ingest-jobs]
+      summary: List ingestion jobs
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [QUEUED, RUNNING, COMPLETED, FAILED, PARTIAL] }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 20 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:   { type: integer }
+                  page:    { type: integer }
+                  results:
+                    type: array
+                    items: { $ref: "#/components/schemas/IngestionJob" }
+    post:
+      tags: [ingest-jobs]
+      summary: Start an async ingestion job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StartJob" }
+            example:
+              seed_url: https://example.com/sop.html
+              max_depth: 4
+              max_docs: 200
+              llm_provider: anthropic
+              llm_model: claude-sonnet-4-5-20250929
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestionJob" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+
+  /api/ingest/{job_id}/:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [ingest-jobs]
+      summary: Poll job status
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestionJob" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [ingest-jobs]
+      summary: Delete a completed job
+      responses:
+        "204": { description: No Content }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Job is currently running
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorDetail" }
+
+  /api/ingest/run-sync/:
+    post:
+      tags: [ingest-jobs]
+      security: []
+      summary: Run pipeline in-process (DEBUG only, no auth)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StartJob" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestionJob" }
+        "403":
+          description: Forbidden — DEBUG=false
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorDetail" }
+        "500":
+          description: Pipeline error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string, format: uuid }
+                  status: { type: string, example: FAILED }
+                  error:  { type: string }
+
+  # ── INGEST · SOP DATA ───────────────────────────────────────────────────
+  /api/ingest/{job_id}/graph/:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [ingest-sop]
+      security: []
+      summary: Knowledge graph as JSON (no auth)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SopGraph" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/ingest/{job_id}/sections/:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [ingest-sop]
+      security: []
+      summary: Structured sections + rules + narrative (no auth)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SopSections" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── INGEST · NARRATIVE BACKFILL ─────────────────────────────────────────
+  /api/ingest/{job_id}/contextualize/:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+      - name: sync
+        in: query
+        required: false
+        schema: { type: string, enum: ["true", "false"] }
+        description: Run inline (blocks ~60s) instead of dispatching a Celery task
+    post:
+      tags: [ingest-narrative]
+      security: []
+      summary: Re-run narrative agents on the SOPs in a job
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sync: { type: boolean }
+      responses:
+        "200":
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:  { type: string, format: uuid }
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        sop_id: { type: integer }
+                        sop_overview_updated: { type: boolean }
+                        steps_updated: { type: integer }
+        "202":
+          description: Celery task dispatched
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:         { type: string, format: uuid }
+                  celery_task_id: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── INGEST · HTML VIEWER (debug) ────────────────────────────────────────
+  /api/ingest/viewer/:
+    get:
+      tags: [ingest-viewer]
+      security: []
+      summary: Server-rendered job list
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [ALL, COMPLETED, RUNNING, FAILED, QUEUED] }
+      responses:
+        "200":
+          description: HTML
+          content:
+            text/html: {}
+
+  /api/ingest/viewer/{job_id}/:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [ingest-viewer]
+      security: []
+      summary: Server-rendered job detail
+      responses:
+        "200":
+          description: HTML
+          content:
+            text/html: {}
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/ingest/viewer/{job_id}/doc/{doc_id}/:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+      - name: doc_id
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      tags: [ingest-viewer]
+      security: []
+      summary: Server-rendered SOP document
+      responses:
+        "200":
+          description: HTML
+          content:
+            text/html: {}
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── EXECUTION ENGINE ────────────────────────────────────────────────────
+  /api/execute/workflows/{workflow_id}/run-batch/:
+    post:
+      tags: [execute]
+      summary: Run a batch of claims through the per-Shape execution engine
+      description: |
+        Multipart upload of an `.xlsx` with one column of claim ids. For each row
+        the engine fetches the claim via `linx_claim_search`, walks the workflow's
+        Shapes in canvas order, and runs one LLM call per attached rule. Halts a
+        claim immediately on any matched rule with `decision_type` in `DENY/STOP`.
+        Synchronous; the response is the full per-claim audit trail.
+      parameters:
+        - name: workflow_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The `.xlsx` to process.
+                claim_id_column:
+                  type: string
+                  description: Header of the claim-id column (case-insensitive). Defaults to `claim_id`; also recognises `subscriber_id`, `claimid`, etc.
+                sheet_name:
+                  type: string
+                  description: Sheet to read. Defaults to the first sheet.
+      responses:
+        "200":
+          description: Batch completed (or completed with per-claim failures)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchExecutionResult" }
+        "400":
+          description: Missing/invalid file, claim-id column not found, or workflow has no rule bindings.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/execute/batches/{batch_id}/:
+    get:
+      tags: [execute]
+      summary: Fetch a prior batch execution + per-claim summaries
+      parameters:
+        - name: batch_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchExecutionDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/execute/runs/{run_id}/:
+    get:
+      tags: [execute]
+      summary: One claim's full execution audit trail
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RuleExecutionRunDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+# ─────────────────────────────────────────────────────────────────────────────
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: HS256 JWT issued by the Node `claims-corebackend`.
+
+  parameters:
+    WorkflowId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorDetail" }
+    ValidationError:
+      description: Validation error
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties:
+              type: array
+              items: { type: string }
+            example:
+              seed_url: ["Enter a valid URL."]
+
+  schemas:
+    # ── shared ──────────────────────────────────────────────────────────
+    ErrorDetail:
+      type: object
+      properties:
+        detail: { type: string }
+
+    # ── builder catalog + chrome ────────────────────────────────────────
+    ShapeCategory:
+      type: object
+      properties:
+        id:          { type: string, format: uuid }
+        slug:        { type: string }
+        label:       { type: string }
+        description: { type: string }
+        order:       { type: integer }
+        is_active:   { type: boolean }
+        shapes:
+          type: array
+          items: { $ref: "#/components/schemas/ShapeDefinition" }
+
+    ShapeDefinition:
+      type: object
+      properties:
+        id:              { type: string, format: uuid }
+        slug:            { type: string }
+        label:           { type: string }
+        description:     { type: string }
+        kind:            { type: string, example: rectangle }
+        svg_path:        { type: string }
+        viewbox:         { type: string, example: "0 0 100 100" }
+        default_label:   { type: string }
+        default_width:   { type: number }
+        default_height:  { type: number }
+        default_style:
+          type: object
+          additionalProperties: true
+        ports:
+          type: array
+          items:
+            type: object
+            properties:
+              id:   { type: string }
+              x:    { type: number }
+              y:    { type: number }
+              side: { type: string, enum: [top, right, bottom, left] }
+              kind: { type: string, enum: [source, target, both] }
+        property_schema:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        category_slug: { type: string }
+        order:         { type: integer }
+        is_active:     { type: boolean }
+
+    NavItem:
+      type: object
+      properties:
+        id:       { type: string, format: uuid }
+        slug:     { type: string }
+        label:    { type: string }
+        icon:     { type: string, example: GitBranch }
+        href:     { type: string }
+        section:  { type: string }
+        min_role: { type: string, enum: [MEMBER, ADMIN] }
+        order:    { type: integer }
+
+    DashboardWidget:
+      type: object
+      properties:
+        id:          { type: string, format: uuid }
+        slug:        { type: string }
+        label:       { type: string }
+        icon:        { type: string }
+        kind:        { type: string, enum: [stat, chart, list, card] }
+        value:       { type: string }
+        query:       { type: string }
+        color_class: { type: string }
+        order:       { type: integer }
+
+    # ── builder workflow ────────────────────────────────────────────────
+    RuntimeAgentCreate:
+      type: object
+      required: [name, url]
+      properties:
+        name:        { type: string, maxLength: 120 }
+        url:         { type: string, format: uri, maxLength: 2048 }
+        method:      { type: string, enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS], default: GET }
+        auth_type:   { type: string, enum: [none, bearer, api_key, basic], default: none }
+        auth_token:  { type: string, maxLength: 2048, description: "Plaintext credential; stripped after registration." }
+        description: { type: string, maxLength: 500 }
+
+    RuntimeAgent:
+      type: object
+      properties:
+        name:        { type: string }
+        url:         { type: string }
+        method:      { type: string }
+        auth_type:   { type: string }
+        description: { type: string }
+        endpoint_id: { type: string }
+
+    SopAttached:
+      type: object
+      properties:
+        job_id:         { type: string, format: uuid }
+        seed_url:       { type: string }
+        status:         { type: string, enum: [QUEUED, RUNNING, COMPLETED, FAILED, PARTIAL] }
+        docs_processed: { type: integer }
+        docs_failed:    { type: integer }
+        created_at:     { type: string, format: date-time }
+        completed_at:   { type: string, format: date-time, nullable: true }
+        audit_sop_id:   { type: integer, nullable: true }
+
+    WorkflowCreate:
+      type: object
+      required: [name]
+      properties:
+        name:        { type: string }
+        description: { type: string }
+        is_active:   { type: boolean, default: true }
+        metadata:
+          type: object
+          additionalProperties: true
+        sop_urls:
+          type: array
+          items: { type: string, format: uri }
+        runtime_agents:
+          type: array
+          items: { $ref: "#/components/schemas/RuntimeAgentCreate" }
+
+    WorkflowPatch:
+      type: object
+      properties:
+        name:        { type: string }
+        description: { type: string }
+        is_active:   { type: boolean }
+        metadata:
+          type: object
+          additionalProperties: true
+
+    Workflow:
+      type: object
+      properties:
+        id:            { type: string, format: uuid }
+        name:          { type: string }
+        slug:          { type: string }
+        description:   { type: string }
+        is_active:     { type: boolean }
+        metadata:
+          type: object
+          additionalProperties: true
+        owner_id:      { type: string }
+        owner_email:   { type: string, format: email }
+        created_at:    { type: string, format: date-time }
+        updated_at:    { type: string, format: date-time }
+        sops:
+          type: array
+          items: { $ref: "#/components/schemas/SopAttached" }
+        attached_agents:
+          type: array
+          items: { $ref: "#/components/schemas/RuntimeAgent" }
+
+    Shape:
+      type: object
+      properties:
+        id:               { type: string, format: uuid }
+        client_id:        { type: string, description: "Write-only temp id" }
+        definition_slug:  { type: string }
+        label:            { type: string }
+        description:      { type: string }
+        position_x:       { type: number }
+        position_y:       { type: number }
+        width:            { type: number }
+        height:           { type: number }
+        style:
+          type: object
+          additionalProperties: true
+        properties:
+          type: object
+          additionalProperties: true
+          description: "Includes sop_rules[] and tool_calls[]"
+        order:            { type: integer }
+
+    Workbench:
+      type: object
+      properties:
+        id:          { type: string, format: uuid }
+        client_id:   { type: string }
+        name:        { type: string }
+        description: { type: string }
+        node_key:    { type: string }
+        kind:        { type: string }
+        config:
+          type: object
+          additionalProperties: true
+        order:       { type: integer }
+        position_x:  { type: number }
+        position_y:  { type: number }
+        width:       { type: number }
+        height:      { type: number }
+        style:
+          type: object
+          additionalProperties: true
+        shapes:
+          type: array
+          items: { $ref: "#/components/schemas/Shape" }
+
+    WorkArea:
+      type: object
+      properties:
+        id:           { type: string, format: uuid }
+        client_id:    { type: string }
+        name:         { type: string }
+        description:  { type: string }
+        order:        { type: integer }
+        color:        { type: string }
+        position_x:   { type: number }
+        position_y:   { type: number }
+        width:        { type: number }
+        height:       { type: number }
+        metadata:
+          type: object
+          additionalProperties: true
+        workbenches:
+          type: array
+          items: { $ref: "#/components/schemas/Workbench" }
+
+    Connection:
+      type: object
+      properties:
+        id:               { type: string, format: uuid }
+        source_shape:     { type: string, format: uuid }
+        target_shape:     { type: string, format: uuid }
+        source_client_id: { type: string }
+        target_client_id: { type: string }
+        source_port:      { type: string }
+        target_port:      { type: string }
+        label:            { type: string }
+        condition_label:  { type: string }
+        waypoints:
+          type: array
+          items:
+            type: object
+            properties:
+              x: { type: number }
+              y: { type: number }
+        style:
+          type: object
+          additionalProperties: true
+
+    WorkflowGraph:
+      type: object
+      properties:
+        id:           { type: string, format: uuid }
+        name:         { type: string }
+        slug:         { type: string }
+        description:  { type: string }
+        is_active:    { type: boolean }
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:   { type: string, format: date-time }
+        updated_at:   { type: string, format: date-time }
+        work_areas:
+          type: array
+          items: { $ref: "#/components/schemas/WorkArea" }
+        connections:
+          type: array
+          items: { $ref: "#/components/schemas/Connection" }
+        sops:
+          type: array
+          items: { $ref: "#/components/schemas/SopAttached" }
+        attached_agents:
+          type: array
+          items: { $ref: "#/components/schemas/RuntimeAgent" }
+
+    AttachableRule:
+      type: object
+      properties:
+        key:                { type: string, description: "pre:<sop>:<section>:<idx>  OR  step:<sop>:<step#>:<row#>" }
+        sop_id:             { type: integer }
+        sop_title:          { type: string }
+        source:             { type: string, enum: [precondition, decision] }
+        section_id:         { type: integer }
+        section_label:      { type: string }
+        section_category:   { type: string }
+        section_narrative:  { type: string }
+        condition:          { type: string }
+        action:             { type: string }
+        decision_type:      { type: string }
+        is_exception:       { type: boolean }
+        codes:
+          type: array
+          items: { type: string }
+        is_blocking:        { type: boolean }
+        references:
+          type: array
+          items: { type: string }
+        goto_step:          { type: integer, nullable: true }
+
+    AttachableToolCall:
+      type: object
+      properties:
+        key:         { type: string, description: "agent:<endpoint_id|name>" }
+        endpoint_id: { type: string }
+        name:        { type: string }
+        method:      { type: string }
+        url:         { type: string }
+        description: { type: string }
+        auth_type:   { type: string }
+
+    Attachable:
+      type: object
+      properties:
+        sops:
+          type: array
+          items:
+            type: object
+            properties:
+              sop_id:    { type: integer }
+              title:     { type: string }
+              narrative: { type: string }
+        sop_rules:
+          type: array
+          items: { $ref: "#/components/schemas/AttachableRule" }
+        tool_calls:
+          type: array
+          items: { $ref: "#/components/schemas/AttachableToolCall" }
+
+    # ── ingest ──────────────────────────────────────────────────────────
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        checks:
+          type: object
+          properties:
+            uhc_sop_ingestion: { type: string }
+            celery:            { type: string }
+        env_file_found: { type: boolean }
+        jobs_total:     { type: integer }
+        jobs_running:   { type: integer }
+
+    StartJob:
+      type: object
+      required: [seed_url]
+      properties:
+        seed_url:     { type: string, format: uri }
+        max_depth:    { type: integer, minimum: 1, maximum: 8, default: 4 }
+        max_docs:     { type: integer, minimum: 1, maximum: 500, default: 200 }
+        llm_provider: { type: string, enum: [openai, anthropic], default: anthropic }
+        llm_model:    { type: string, default: claude-sonnet-4-5-20250929 }
+
+    IngestedDocument:
+      type: object
+      properties:
+        url:           { type: string }
+        doc_format:    { type: string, enum: [HTML, DOCX, XLSX, PDF] }
+        depth:         { type: integer }
+        status:        { type: string }
+        neo4j_sop_id:  { type: string }
+        steps_count:   { type: integer }
+        rules_count:   { type: integer }
+        codes_count:   { type: integer }
+        links_found:   { type: integer }
+        created_at:    { type: string, format: date-time }
+
+    IngestionJob:
+      type: object
+      properties:
+        job_id:           { type: string, format: uuid }
+        seed_url:         { type: string }
+        status:           { type: string, enum: [QUEUED, RUNNING, COMPLETED, FAILED, PARTIAL] }
+        docs_queued:      { type: integer }
+        docs_processed:   { type: integer }
+        docs_failed:      { type: integer }
+        max_depth:        { type: integer }
+        max_docs:         { type: integer }
+        llm_provider:     { type: string }
+        llm_model:        { type: string }
+        celery_task_id:   { type: string }
+        created_at:       { type: string, format: date-time }
+        started_at:       { type: string, format: date-time, nullable: true }
+        completed_at:     { type: string, format: date-time, nullable: true }
+        duration_seconds: { type: number, nullable: true }
+        summary:
+          type: object
+          additionalProperties: true
+          nullable: true
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              agent: { type: string }
+              msg:   { type: string }
+        documents:
+          type: array
+          items: { $ref: "#/components/schemas/IngestedDocument" }
+
+    SopGraph:
+      type: object
+      properties:
+        sop_id:   { type: integer, nullable: true }
+        seed_url: { type: string }
+        status:   { type: string }
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              id:           { type: string }
+              label:        { type: string }
+              type:
+                type: string
+                enum: [DOCUMENT, META, PRE_SECTION, PRE_RULE, STEP, DECISION, ANNOTATION, GROUP_LIMIT, CODE, DATE_COND, REFERENCE]
+              details:
+                type: object
+                additionalProperties: true
+              ref_table:     { type: string }
+              ref_id:        { type: integer, nullable: true }
+              display_order: { type: integer }
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              id:     { type: string }
+              source: { type: string }
+              target: { type: string }
+              rel:
+                type: string
+                enum: [HAS_META, HAS_PRE_SECTION, HAS_RULE, HAS_STEP, HAS_DECISION, HAS_ANNOTATION, HAS_GROUP_LIMIT, HAS_CODE_REF, HAS_DATE_COND, REFERENCES, GOTO]
+              label:  { type: string }
+              details:
+                type: object
+                additionalProperties: true
+
+    Precondition:
+      type: object
+      properties:
+        id:           { type: integer }
+        order:        { type: integer }
+        category:     { type: string, enum: [PLATFORM, AUDIENCE, LOB, ELIGIBILITY, COVERAGE, GENERAL] }
+        label:        { type: string }
+        content_text: { type: string }
+        is_blocking:  { type: boolean }
+        rules:
+          type: array
+          items:
+            type: object
+            properties:
+              condition:     { type: string }
+              action:        { type: string }
+              decision_type: { type: string }
+              is_exception:  { type: boolean }
+
+    DecisionRow:
+      type: object
+      properties:
+        row_index:      { type: integer }
+        condition_if:   { type: string }
+        condition_and:  { type: string }
+        action_text:    { type: string }
+        action_summary: { type: string }
+        decision_type:
+          type: string
+          enum: [DENY, ALLOW, BYPASS, PEND, REFER, SYSTEM, STOP, WAIVE, CONDITIONAL]
+        goto_step:      { type: integer, nullable: true }
+        is_final:       { type: boolean }
+        eob_codes:      { type: array, items: { type: string } }
+        ex_codes:       { type: array, items: { type: string } }
+        denial_codes:   { type: array, items: { type: string } }
+        system_actions: { type: array, items: { type: string } }
+        all_codes:      { type: array, items: { type: string } }
+
+    Step:
+      type: object
+      properties:
+        step_number:      { type: integer }
+        question:         { type: string }
+        intro_text:       { type: string }
+        narrative:        { type: string }
+        is_terminal:      { type: boolean }
+        terminal_action:  { type: string }
+        is_sub_procedure: { type: boolean }
+        sub_procedure:    { type: string }
+        decisions:
+          type: array
+          items: { $ref: "#/components/schemas/DecisionRow" }
+
+    Code:
+      type: object
+      properties:
+        value:       { type: string }
+        type:        { type: string, enum: [EOB, EX, DENIAL, SYSTEM_ACT, POS, REVENUE, BILL_TYPE, MODIFIER, FREQUENCY, CPT, UNKNOWN] }
+        description: { type: string }
+        context:     { type: string }
+        source_step: { type: integer, nullable: true }
+
+    GroupLimit:
+      type: object
+      properties:
+        group_name:   { type: string }
+        inn_days:     { type: integer, nullable: true }
+        oon_days:     { type: integer, nullable: true }
+        limit_days:   { type: integer, nullable: true }
+        limit_months: { type: integer, nullable: true }
+        limit_years:  { type: integer, nullable: true }
+        basis:        { type: string, enum: [DOS, PAID_DATE, EOB_DATE] }
+        network_type: { type: string, enum: [INN, OON, BOTH] }
+        exceptions:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        special_notes:
+          type: array
+          items: { type: string }
+
+    Annotation:
+      type: object
+      properties:
+        type:            { type: string, enum: [NOTE, ALERT, EXCEPTION, TIP, WARNING, HIGHLIGHT] }
+        content_text:    { type: string }
+        is_claim_impact: { type: boolean }
+        step_number:     { type: integer, nullable: true }
+
+    Reference:
+      type: object
+      properties:
+        ref_text:    { type: string }
+        ref_url:     { type: string }
+        ref_type:    { type: string }
+        is_resolved: { type: boolean }
+        step_number: { type: integer, nullable: true }
+
+    SopSections:
+      type: object
+      properties:
+        sop_id:        { type: integer, nullable: true }
+        seed_url:      { type: string }
+        status:        { type: string }
+        title:         { type: string }
+        purpose:       { type: string }
+        summary:       { type: string }
+        narrative:     { type: string }
+        platform:      { type: string }
+        lob:           { type: array, items: { type: string } }
+        preconditions:
+          type: array
+          items: { $ref: "#/components/schemas/Precondition" }
+        steps:
+          type: array
+          items: { $ref: "#/components/schemas/Step" }
+        codes:
+          type: array
+          items: { $ref: "#/components/schemas/Code" }
+        group_limits:
+          type: array
+          items: { $ref: "#/components/schemas/GroupLimit" }
+        annotations:
+          type: array
+          items: { $ref: "#/components/schemas/Annotation" }
+        references:
+          type: array
+          items: { $ref: "#/components/schemas/Reference" }
+
+    # ── execution engine ────────────────────────────────────────────────
+    RuleEvaluationItem:
+      type: object
+      description: One rule evaluated for a claim during the run.
+      properties:
+        rule_key:          { type: string, example: "step:42:3:2" }
+        source:            { type: string, enum: [precondition, decision] }
+        shape_id:          { type: string }
+        shape_label:       { type: string }
+        matched:           { type: boolean }
+        decision_type:
+          type: string
+          enum: [DENY, ALLOW, BYPASS, PEND, REFER, SYSTEM, STOP, WAIVE, CONDITIONAL]
+        confidence:        { type: number, format: float, example: 0.92 }
+        reasoning:         { type: string }
+        codes:
+          type: array
+          items: { type: string }
+        tool_results_used:
+          type: array
+          items: { type: string }
+          description: Tool binding ids whose result was offered to this rule's prompt.
+
+    ToolInvocationItem:
+      type: object
+      description: One tool call made during a run (FETCH, PARSE, or EVALUATE phase).
+      properties:
+        tool:        { type: string, example: linx_claim_search }
+        phase:       { type: string, enum: [FETCH, PARSE, EVALUATE] }
+        ok:          { type: boolean }
+        ms:          { type: integer }
+        error:       { type: string }
+
+    StageItem:
+      type: object
+      description: Per-node telemetry emitted by the 6-node LangGraph.
+      properties:
+        node:    { type: string, example: execute_shapes }
+        status:  { type: string, enum: [OK, FAIL, SKIP] }
+        ms:      { type: integer }
+        msg:     { type: string }
+
+    RuleExecutionRunResult:
+      type: object
+      description: Per-claim result returned inside a batch response.
+      properties:
+        run_id:                 { type: string, format: uuid }
+        claim_id:               { type: string }
+        status:
+          type: string
+          enum: [RUNNING, COMPLETED, FAILED, TERMINATED_EARLY, FETCH_FAILED]
+        final_decision_type:
+          type: string
+          enum: [DENY, ALLOW, BYPASS, PEND, REFER, SYSTEM, STOP, WAIVE, CONDITIONAL, ""]
+        applied_codes:
+          type: array
+          items: { type: string }
+        narrative:              { type: string }
+        terminated_at_shape_id: { type: string, description: "Empty unless status=TERMINATED_EARLY." }
+        evaluations:
+          type: array
+          items: { $ref: "#/components/schemas/RuleEvaluationItem" }
+        tool_invocations:
+          type: array
+          items: { $ref: "#/components/schemas/ToolInvocationItem" }
+        stages:
+          type: array
+          items: { $ref: "#/components/schemas/StageItem" }
+        error_message:          { type: string }
+
+    BatchExecutionResult:
+      type: object
+      description: Response from POST /api/execute/workflows/{id}/run-batch/.
+      properties:
+        batch_id:     { type: string, format: uuid }
+        status:
+          type: string
+          enum: [RUNNING, COMPLETED, PARTIAL, FAILED]
+        total_claims: { type: integer }
+        completed:    { type: integer }
+        failed:       { type: integer }
+        duration_ms:  { type: integer }
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/RuleExecutionRunResult" }
+        error_message: { type: string }
+
+    BatchRunSummary:
+      type: object
+      description: Per-claim summary embedded in a BatchExecutionDetail.
+      properties:
+        id:                  { type: string, format: uuid }
+        claim_id:            { type: string }
+        status:
+          type: string
+          enum: [RUNNING, COMPLETED, FAILED, TERMINATED_EARLY, FETCH_FAILED]
+        final_decision_type: { type: string }
+        applied_codes:
+          type: array
+          items: { type: string }
+        error_message:       { type: string }
+
+    BatchExecutionDetail:
+      type: object
+      description: Response from GET /api/execute/batches/{batch_id}/.
+      properties:
+        id:                  { type: string, format: uuid }
+        workflow:            { type: string, format: uuid }
+        source_filename:     { type: string }
+        claim_id_column:     { type: string }
+        total_claims:        { type: integer }
+        completed:           { type: integer }
+        failed:              { type: integer }
+        started_at:          { type: string, format: date-time }
+        finished_at:         { type: string, format: date-time, nullable: true }
+        status:
+          type: string
+          enum: [RUNNING, COMPLETED, PARTIAL, FAILED]
+        error_message:       { type: string }
+        runs:
+          type: array
+          items: { $ref: "#/components/schemas/BatchRunSummary" }
+
+    RuleEvaluationRow:
+      type: object
+      description: Persisted RuleEvaluation row (as returned from GET /runs/{id}/).
+      properties:
+        id:                { type: integer }
+        order_index:       { type: integer }
+        rule_key:          { type: string }
+        rule_source:       { type: string, enum: [PRECONDITION, DECISION] }
+        condition:         { type: string }
+        action:            { type: string }
+        matched:           { type: boolean }
+        confidence:        { type: number, format: float }
+        reasoning:         { type: string }
+        decision_type:     { type: string }
+        codes:
+          type: array
+          items: { type: string }
+        tool_results_used:
+          type: array
+          items: { type: string }
+        llm_provider:      { type: string }
+        llm_ms:            { type: integer }
+
+    ToolInvocationRow:
+      type: object
+      description: Persisted ToolInvocationRecord row.
+      properties:
+        id:           { type: integer }
+        tool_name:    { type: string }
+        phase:        { type: string, enum: [FETCH, PARSE, EVALUATE] }
+        args:
+          type: object
+          additionalProperties: true
+        ok:           { type: boolean }
+        result:
+          type: object
+          additionalProperties: true
+        error:        { type: string }
+        duration_ms:  { type: integer }
+        called_at:    { type: string, format: date-time }
+
+    RuleExecutionRunDetail:
+      type: object
+      description: Response from GET /api/execute/runs/{run_id}/.
+      properties:
+        id:                  { type: string, format: uuid }
+        batch:               { type: string, format: uuid, nullable: true }
+        workflow:            { type: string, format: uuid }
+        claim_id:            { type: string }
+        claim_payload:
+          type: object
+          additionalProperties: true
+        raw_fetch:
+          type: object
+          additionalProperties: true
+        started_at:          { type: string, format: date-time }
+        finished_at:         { type: string, format: date-time, nullable: true }
+        status:
+          type: string
+          enum: [RUNNING, COMPLETED, FAILED, TERMINATED_EARLY, FETCH_FAILED]
+        final_decision_type: { type: string }
+        applied_codes:
+          type: array
+          items: { type: string }
+        narrative:           { type: string }
+        error_message:       { type: string }
+        evaluations:
+          type: array
+          items: { $ref: "#/components/schemas/RuleEvaluationRow" }
+        tool_invocations:
+          type: array
+          items: { $ref: "#/components/schemas/ToolInvocationRow" }

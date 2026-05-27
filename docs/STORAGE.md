@@ -38,7 +38,7 @@ Django manages the schema; migrations live under `sop_ingestion/migrations/`.
 | `sop_ingestion_ingestionjob`                | One row per ingestion request. Tracks status, totals, LLM provider/model, timing, summary JSON, errors.             |
 | `sop_ingestion_ingesteddocument`            | One row per fetched document inside a job. Captures URL, content-hash, depth, counts of steps/rules/codes.          |
 | `sop_ingestion_pipelinestagelog`            | Every LangGraph stage execution (intake, fetch, parse, enrich, context, validate, graph_synthesis, write_*, …).      |
-| `sop_ingestion_llmcalllog`                  | Every LLM call: agent name, provider, model, prompt/completion tokens, latency_ms, success flag, error_message.     |
+| `sop_ingestion_llmcalllog`                  | Every LLM call from **both** the ingestion pipeline and the execution engine. Sets exactly one of `job` (FK `IngestionJob`) or `execution_run` (FK `execution_rule_run`) — see §1.5. Captures agent name, provider, model, prompt/completion tokens, latency_ms, success flag, error_message. |
 
 ### 1.2 Audit tables (the "relational view" of a SOP)
 
@@ -87,7 +87,53 @@ to its source row in section 1.2 (e.g. `STEP step_3` → `auditstep.id`).
 Currently unset by the agentic writer; populating these is a planned
 enhancement.
 
-### 1.4 Quick traversal recipes (Postgres-side equivalent of Cypher)
+### 1.4 Agent-tools tables (`agent_tools` Postgres schema)
+
+These three tables live in a dedicated Postgres schema named `agent_tools`
+(created by migration `0000_create_schema`). Django's connection
+`search_path` is `public,agent_tools`, so unqualified references resolve
+across schemas.
+
+| Table                                | One row per…                                                                              | Key columns                                                                                                       |
+|--------------------------------------|-------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| `agent_tools.tool`                   | Registered tool (LangChain `StructuredTool` or runtime HTTP agent).                       | `name`, `display_name`, `kind` (`langchain`/`api_agent`), `invoke_url`, `args_schema (jsonb)`, `endpoint_id`, `is_active`. |
+| `agent_tools.node_rule_binding`      | SOP rule attached to one canvas Shape. Replaces an entry of legacy `Shape.properties.sop_rules`. | `shape_id` (FK `builder_shape`), `sop_id` (FK `sop_ingestion_auditsop`), `rule_key`, `condition`, `action`, `references_json`, `excluded_by_json`, `html_reference_json`, **`ordering`** (auditor's chosen sequence). |
+| `agent_tools.node_tool_binding`      | Tool call attached to one canvas Shape. Replaces an entry of legacy `Shape.properties.tool_calls`. | `shape_id` (FK `builder_shape`), `tool_id` (FK `agent_tools.tool`), `args_template (jsonb)`, `rule_binding_id` (nullable FK back to `node_rule_binding`), **`ordering`**. |
+
+`ordering` is the field that carries the auditor's sequencing choice from
+the SPA into runtime: array index in the SPA payload → `ordering` integer
+written by [`builder/bindings_sync.py`](../builder/bindings_sync.py) → read
+back by the execution engine's
+[`rule_loader.py`](../uhc-execution-engine/src/uhc_execution_engine/rule_loader.py).
+
+### 1.5 Execution-engine tables (`public` schema)
+
+Persistence for batch claim adjudication. All tables live in `public`.
+FKs to `agent_tools.*` use `ON DELETE SET NULL` so dropping a binding
+never deletes audit history.
+
+| Table                            | One row per…                                                                  | Key columns                                                                                                       |
+|----------------------------------|-------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| `execution_batch_run`            | Uploaded `.xlsx`.                                                             | `workflow_id` (FK `builder_workflow`), `source_filename`, `claim_id_column`, `total_claims`, `completed`, `failed`, `status` (`RUNNING`/`COMPLETED`/`PARTIAL`/`FAILED`), `started_at`, `finished_at`. |
+| `execution_rule_run`             | Claim. Pre-created in `RUNNING` by `n01_validate`; finalised by `n07`.        | `batch_id` (FK `execution_batch_run`, nullable), `workflow_id`, `claim_id`, `claim_payload (jsonb)`, `raw_fetch (jsonb)`, `status` (`RUNNING`/`COMPLETED`/`FAILED`/`TERMINATED_EARLY`/`FETCH_FAILED`), `final_decision_type`, `applied_codes (jsonb)`, `narrative`. |
+| `execution_rule_evaluation`      | Rule evaluated for a run. Ordered by `(shape canvas order, rule order)`.      | `run_id`, `order_index`, `rule_binding_id` (nullable FK `agent_tools.node_rule_binding`), `rule_key`, `rule_source` (`PRECONDITION`/`DECISION`), `condition`, `action`, `matched`, `confidence`, `reasoning`, `decision_type`, `codes (jsonb)`, `tool_results_used (jsonb)`, `llm_provider`, `llm_ms`. |
+| `execution_tool_invocation`      | Tool call (outer-layer FETCH/PARSE + inner-pipeline EVALUATE).                | `run_id`, `tool_binding_id` (nullable FK `agent_tools.node_tool_binding`), `tool_name`, `phase` (`FETCH`/`PARSE`/`EVALUATE`), `args (jsonb)`, `ok`, `result (jsonb)`, `error`, `duration_ms`, `called_at`. |
+
+`sop_ingestion_llmcalllog.execution_run_id` points back at
+`execution_rule_run.id` for engine-emitted rows. Aggregate token / latency
+queries are straightforward:
+
+```sql
+SELECT llm_provider, llm_model,
+       COUNT(*)                       AS calls,
+       SUM(prompt_tokens + completion_tokens) AS tokens,
+       SUM(duration_ms)              AS total_ms
+FROM   sop_ingestion_llmcalllog
+WHERE  execution_run_id = '<run_id>'
+GROUP  BY llm_provider, llm_model;
+```
+
+### 1.6 Quick traversal recipes (Postgres-side equivalent of Cypher)
 
 ```sql
 -- Parents of a node (one hop, like Neo4j  MATCH (p)-[]->(n {node_key:$k}) )
@@ -246,10 +292,14 @@ exact past artefact without re-fetching.
 | Find a rule by its text / code / category                  | **Postgres** — fast full-text on the audit tables and JSONB columns.      |
 | See the whole knowledge graph, ancestors, paths            | **Postgres graph tables** (`auditgraphnode/edge`) or **Neo4j** (Cypher).  |
 | Render graphs visually / do shortest-path traversal        | **Neo4j**. (Postgres recursive CTEs work too but Neo4j is faster.)        |
+| List rules + tools attached to a Shape (with ordering)     | **Postgres** `agent_tools.node_rule_binding` / `node_tool_binding`.       |
+| See what decision a workflow gave a claim, with reasoning  | **Postgres** `execution_rule_run` + `execution_rule_evaluation`.          |
+| Re-render a prior batch upload in the SPA                  | **Postgres** `execution_batch_run` (parent) + its `runs`.                 |
 | Inspect what each LLM agent produced during a run          | **Redis** under `sop:graph:{job_id}:*` (24-h TTL).                        |
 | Replay an old ingest exactly                                | **MongoDB** — raw bytes + parsed PipelineState are archived.              |
-| Audit every LLM call (provider, model, tokens, cost)       | **Postgres** `sop_ingestion_llmcalllog`.                                  |
-| See per-stage timing and errors                             | **Postgres** `sop_ingestion_pipelinestagelog`.                            |
+| Audit every LLM call (provider, model, tokens, cost)       | **Postgres** `sop_ingestion_llmcalllog` (filter by `job_id` or `execution_run_id`). |
+| See per-stage timing and errors (ingestion)                | **Postgres** `sop_ingestion_pipelinestagelog`.                            |
+| See per-node timing and errors (execution)                 | The `stages` array on the per-claim response, or query `execution_tool_invocation` for tool calls. |
 
 ---
 

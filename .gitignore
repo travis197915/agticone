@@ -27,3 +27,6 @@ env/
 # ── Local scratch ────────────────────────────────────────────────────────
 new.txt
 sop_files/
+*.html
+*.pyc
+__pycache__/

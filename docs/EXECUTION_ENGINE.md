@@ -84,22 +84,23 @@ uhc-execution-engine/
     ├── __init__.py            # exports RuleEnginePipeline, BatchRunner
     ├── config.py              # .env-driven EngineConfig (model + key)
     ├── state.py               # ExecutionState TypedDict (graph state)
-    ├── pipeline.py            # RuleEnginePipeline.run(workflow_id, claim)
+    ├── pipeline.py            # RuleEnginePipeline.run(...); sets execution_run ContextVar
     ├── batch.py               # BatchRunner.run_xlsx(...)
-    ├── graph.py               # 7-node LangGraph wiring
-    ├── llm.py                 # dual-provider _llm_call (Anthropic ↔ OpenAI)
+    ├── graph.py               # 6-node LangGraph wiring
+    ├── llm.py                 # dual-provider llm_call + LLMCallLog persistence
+    │                          #   (Anthropic ↔ OpenAI, ContextVar-stamped)
     ├── rule_loader.py         # NodeRuleBinding/NodeToolBinding → rule dicts
+    │                          #   incl. per-Shape grouping in `shapes`
     ├── tool_runner.py         # invoke a StructuredTool via agent_tools.registry
     ├── claim_fetcher.py       # linx_claim_search + parse helpers
     ├── xlsx_parser.py         # openpyxl: extract the claim-id column
     └── agents/
         ├── __init__.py
         ├── _eval_common.py    # shared per-rule LLM evaluation helper
-        ├── n01_validate.py
+        ├── n01_validate.py    # validate + pre-create RUNNING RuleExecutionRun
         ├── n02_load_bindings.py
         ├── n03_run_tools.py
-        ├── n04_preconditions.py
-        ├── n05_decisions.py
+        ├── n_execute_shapes.py  # per-Shape evaluator (replaces n04+n05)
         ├── n06_aggregate.py
         └── n07_persist_respond.py
 ```
@@ -123,7 +124,9 @@ execution_app/
 ├── serializers.py             # DRF serializers for the GET endpoints
 ├── views.py                   # RunBatchView, BatchDetailView, RunDetailView
 ├── urls.py
-└── migrations/__init__.py     # (migrations NOT yet generated — see §6)
+└── migrations/
+    ├── __init__.py
+    └── 0001_initial.py        # 4 tables + (batch, claim_id) index
 ```
 
 ### 2.3 Modified files
@@ -133,6 +136,8 @@ execution_app/
 | [`sop_backend/settings.py`](../sop_backend/settings.py) | Added `"execution_app"` to `INSTALLED_APPS`. |
 | [`sop_backend/urls.py`](../sop_backend/urls.py) | Mounted `"api/execute/"` → `execution_app.urls`. |
 | [`requirements.txt`](../requirements.txt) | Added `openpyxl>=3.1`, `langchain-anthropic>=0.2`, `langchain-openai>=0.2`, and `-e ./uhc-execution-engine`. |
+| [`sop_ingestion/models.py`](../sop_ingestion/models.py) | `LLMCallLog.job` made nullable; added nullable `execution_run` FK → `execution_app.RuleExecutionRun`. |
+| [`sop_ingestion/migrations/0011_llmcalllog_execution_run.py`](../sop_ingestion/migrations/0011_llmcalllog_execution_run.py) | Hand-written migration applying the two `LLMCallLog` changes above (avoids the broader auto-generated drift on `sop_ingestion`). |
 
 ---
 
@@ -140,20 +145,21 @@ execution_app/
 
 | # | Node | Job |
 |---|------|-----|
-| 1 | `validate_input` | Sanity-check claim + `workflow_id`; mint `run_id` (uuid). |
-| 2 | `load_bindings` | Query `NodeRuleBinding` + `NodeToolBinding` for the workflow. Hydrate each rule against the live SOP graph the same way [`builder/views.py:212-288`](../builder/views.py#L212-L288) does — `condition`/`action` from the binding when overridden, otherwise from the authoritative SOP row. Output now includes a `shapes` list grouping rules + tool bindings by canvas Shape, ordered by `(workbench.order, shape.order)`. |
+| 1 | `validate_input` | Sanity-check claim + `workflow_id`; mint `run_id` (uuid); **pre-create the `RuleExecutionRun` row in status `RUNNING`** so that downstream `LLMCallLog` inserts (which FK to it) have a valid target as soon as the first LLM fires. |
+| 2 | `load_bindings` | Query `NodeRuleBinding` + `NodeToolBinding` for the workflow. Hydrate each rule against the live SOP graph the same way [`builder/views.py:212-288`](../builder/views.py#L212-L288) does — `condition`/`action` from the binding when overridden, otherwise from the authoritative SOP row. Output includes a `shapes` list grouping rules + tool bindings by canvas Shape, ordered by `(workbench.order, shape.order)`. |
 | 3 | `run_tools` | Invoke every `NodeToolBinding` (except the fetch/parse tools already handled in the outer layer) via `agent_tools.registry.get_tool()`. Failures are recorded but never abort. |
 | 4 | `execute_shapes` | Iterate `state["shapes"]` in canvas order. For each Shape, run one LLM call per attached rule (preconditions and decisions together) with that Shape's tool results in context. If any matched rule on the current Shape has `decision_type ∈ {DENY, STOP}` → set `status=TERMINATED_EARLY`, record `terminated_at_shape_id`, and stop iterating. Otherwise continue to the next Shape. |
 | 5 | `aggregate_decision` | One LLM call given the matched-rule list from `rule_results`. Precedence `DENY > STOP > PEND > REFER > BYPASS > WAIVE > CONDITIONAL > SYSTEM > ALLOW`. Dedupes codes; surfaces conflicts in the narrative. Early-halted claims short-circuit straight to a synthetic summary from the offending rule (no LLM call). Falls back to a deterministic precedence pick if the LLM call fails. |
-| 6 | `persist_and_respond` | Inserts `RuleExecutionRun` + `RuleEvaluation` rows + `ToolInvocationRecord` rows; builds the response dict. Each evaluation row now carries `shape_id` + `shape_label` for the audit trail. |
-
-> **Migration note (v1 → v2)**: the old `evaluate_preconditions` + `evaluate_decisions` nodes have been removed from the graph but kept importable from `uhc_execution_engine.agents` for one release so external callers don't break. They will be deleted in a follow-up.
+| 6 | `persist_and_respond` | **Finalize the reserved `RuleExecutionRun` row** via `update_or_create` with the verdict + status, then bulk-insert `RuleEvaluation` + `ToolInvocationRecord` children. Each evaluation row carries `shape_id` + `shape_label` for the audit trail. |
 
 Every LLM call goes through `uhc_execution_engine.llm.llm_call`, an adapted
 copy of the dual-provider/retry helper from
 [`a07_enrich.py:114-210`](../uhc-sop-ingestion/src/uhc_sop_ingestion/agents/a07_enrich.py#L114-L210)
 (Anthropic primary, OpenAI fallback, schema-validated, retried twice on the
-primary provider before crossing over).
+primary provider before crossing over). Each attempt also persists one
+[`sop_ingestion.LLMCallLog`](../sop_ingestion/models.py) row stamped with
+the active `RuleExecutionRun` via a `ContextVar` (`execution_run_context`)
+that `RuleEnginePipeline.run` sets for the whole graph invocation.
 
 ### Tool scoping
 
@@ -187,8 +193,7 @@ RuleExecutionRun (execution_rule_run)
   ├── workflow (FK builder.Workflow PROTECT)
   ├── claim_id, claim_payload (JSON), raw_fetch (JSON)
   ├── final_decision_type, applied_codes (JSON), narrative
-  └── status: RUNNING | COMPLETED | FAILED |
-              TERMINATED_EARLY | TERMINATED_BY_PRECONDITION | FETCH_FAILED
+  └── status: RUNNING | COMPLETED | FAILED | TERMINATED_EARLY | FETCH_FAILED
 
 RuleEvaluation (execution_rule_evaluation)
   ├── run (FK RuleExecutionRun CASCADE)
@@ -206,6 +211,13 @@ ToolInvocationRecord (execution_tool_invocation)
   ├── args (JSON), ok, result (JSON), error
   └── duration_ms, called_at
 ```
+
+Cross-app reference: `sop_ingestion.LLMCallLog` now has a nullable
+`execution_run` FK back to `RuleExecutionRun` (added in
+[`sop_ingestion/migrations/0011_llmcalllog_execution_run.py`](../sop_ingestion/migrations/0011_llmcalllog_execution_run.py)).
+SOP-ingestion rows keep using the existing `job` FK to `IngestionJob`;
+engine rows set `execution_run` and leave `job=NULL`. Exactly one of the
+two FKs is set per row.
 
 ---
 
@@ -288,15 +300,12 @@ invocations).
 ```bash
 conda activate uhc-agentic-backend
 pip install -e ./uhc-execution-engine
+python manage.py migrate          # applies execution_app/0001 + sop_ingestion/0011
 ```
 
-**Migrations are intentionally not yet generated** — pending teammate
-collaboration on related schema changes. When ready:
-
-```bash
-python manage.py makemigrations execution_app
-python manage.py migrate
-```
+`execution_app/0001_initial.py` creates the four engine tables and
+`sop_ingestion/0011_llmcalllog_execution_run.py` adds the cross-app FK
+from `LLMCallLog` back to `RuleExecutionRun`.
 
 ### 6.1 Smoke checks (no DB writes)
 
@@ -311,11 +320,12 @@ names = {t.name for t in iter_tools()}
 print('linx_claim_search:', 'linx_claim_search' in names)
 print('llm_parse_claim_with_ontology:', 'llm_parse_claim_with_ontology' in names)
 "
-python manage.py check execution_app
+python manage.py check
 ```
 
-Expected: 7 inner nodes + `__start__`, both tools present, `check` reports
-no issues.
+Expected: 6 inner nodes + `__start__` (`validate_input`, `load_bindings`,
+`run_tools`, `execute_shapes`, `aggregate_decision`,
+`persist_and_respond`), both tools present, `check` reports no issues.
 
 ### 6.2 End-to-end smoke test (post-migration)
 
@@ -329,12 +339,18 @@ no issues.
    ```
 4. Verify:
    - `results` has one entry per row.
-   - `BatchExecutionRun` row written (`status=COMPLETED`).
+   - `BatchExecutionRun` row written (`status=COMPLETED`, or `PARTIAL`
+     if any claim hit `FETCH_FAILED` / `FAILED`).
    - One `RuleExecutionRun` per claim with `final_decision_type` set.
-   - `RuleEvaluation` rows = sum of preconditions + decisions evaluated
-     across all claims.
+     Claims halted by a DENY/STOP rule mid-workflow show
+     `status=TERMINATED_EARLY` and `terminated_at_shape_id` set.
+   - `RuleEvaluation` rows ordered by `(shape canvas order, rule order)`
+     up to (and including) the halting Shape; Shapes downstream of an
+     early-halted Shape have no evaluation rows for that claim.
    - `ToolInvocationRecord` includes `phase=FETCH` for every claim plus
-     `phase=EVALUATE` for every shape-level tool.
+     `phase=EVALUATE` for every shape-level tool that ran.
+   - `LLMCallLog` rows with `execution_run` set, one per LLM attempt
+     (per-rule eval + the optional aggregate call).
 
 ---
 
@@ -394,25 +410,32 @@ no issues.
   evaluated serially; they're independent LLM calls and could fan out.
   Useful only once shapes routinely carry 4+ rules.
 
-### Done in this iteration
+---
 
-- ~~**Migrations for `execution_app`**~~ — `execution_app/0001_initial.py`
-  generated and applied; the 4 tables now exist in Postgres.
-- ~~**Delete deprecated `n04_preconditions.py` / `n05_decisions.py`**~~ —
-  files removed, exports cleaned out of [`agents/__init__.py`](../uhc-execution-engine/src/uhc_execution_engine/agents/__init__.py),
-  back-compat reads of `precondition_results` / `decision_results` purged
-  from `n06_aggregate.py` and `n07_persist_respond.py`. The legacy
-  `TERMINATED_BY_PRECONDITION` status choice was also dropped from
-  `RuleExecutionRun.STATUS_CHOICES` since it was never emitted.
-- ~~**`LLMCallLog` integration**~~ — `LLMCallLog.job` is now nullable and a
-  new nullable `execution_run` FK points at `execution_app.RuleExecutionRun`
-  ([`sop_ingestion/migrations/0011_llmcalllog_execution_run.py`](../sop_ingestion/migrations/0011_llmcalllog_execution_run.py)).
-  The engine's `llm.py` carries the active `run_id` through a `ContextVar`
-  ([`execution_run_context`](../uhc-execution-engine/src/uhc_execution_engine/llm.py))
-  set by `RuleEnginePipeline.run`, and writes one `LLMCallLog` row per
-  attempt with `execution_run` populated. `n01_validate` now pre-creates a
-  `RUNNING` `RuleExecutionRun` row so the FK target exists before any LLM
-  call fires.
+## Changelog
+
+- **v2 (per-Shape iteration)** — graph reshaped from 7 nodes to 6: the old
+  `evaluate_preconditions` / `evaluate_decisions` pair was replaced by a
+  single `execute_shapes` node that iterates `state["shapes"]` in canvas
+  order and halts on any matched DENY/STOP rule. Response gained
+  `terminated_at_shape_id`; each evaluation row carries `shape_id` +
+  `shape_label`. `rule_loader.py` gained per-Shape grouping (`shapes`
+  list) while keeping its legacy flat outputs.
+- **LLMCallLog wired to the engine** — `sop_ingestion.LLMCallLog.job` is
+  now nullable; a nullable `execution_run` FK points at
+  `execution_app.RuleExecutionRun`. `llm.py` carries the active run via
+  the `execution_run_context` `ContextVar` set by
+  `RuleEnginePipeline.run`, and writes one row per LLM attempt.
+  `n01_validate` pre-creates the `RuleExecutionRun` row (status
+  `RUNNING`) so the FK target exists for early LLM calls; `n07` finalizes
+  it via `update_or_create`.
+- **Migrations applied** — `execution_app/0001_initial.py` (4 tables);
+  `sop_ingestion/0011_llmcalllog_execution_run.py` (LLMCallLog FK +
+  nullable job).
+- **Cleanup** — deleted `n04_preconditions.py` / `n05_decisions.py` and
+  their back-compat reads in `n06_aggregate.py` / `n07_persist_respond.py`;
+  dropped the never-emitted `TERMINATED_BY_PRECONDITION` status choice
+  from `RuleExecutionRun.STATUS_CHOICES`.
 
 ---
 
