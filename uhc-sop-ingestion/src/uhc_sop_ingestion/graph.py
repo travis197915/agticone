@@ -95,7 +95,8 @@ from .agents.a10_write_neo4j import (god_node_writer, pre_section_node_writer,
                                      reference_table_node_writer,
                                      group_rule_step_edge_writer,
                                      sub_procedure_node_writer,
-                                     neo4j_graph_writer)
+                                     neo4j_graph_writer,
+                                     html_dom_writer)
 from .agents.a11_write_postgres import (pg_sop_writer, pg_precondition_writer,
                                         pg_step_writer, pg_group_limit_writer,
                                         pg_code_writer, pg_date_condition_writer,
@@ -289,6 +290,11 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
     ))
 
     # ── Write — Neo4j ─────────────────────────────────────────────────────────
+    # html_dom_writer runs LAST in the stage so the HtmlBlock subgraph
+    # is in place by the time neo4j_graph_writer tries to MERGE the
+    # :DERIVED_FROM cross-edges. (html_dom_writer also backfills the same
+    # cross-edges itself, making the ordering between the two writers safe
+    # either way.)
     g.add_node("write_neo4j", _stage(
         god_node_writer, pre_section_node_writer, step_node_writer,
         rule_node_writer, annotation_node_writer, code_node_writer,
@@ -298,6 +304,7 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
         group_rule_step_edge_writer,
         sub_procedure_node_writer,
         neo4j_graph_writer,  # canonical knowledge-graph in Neo4j
+        html_dom_writer,     # HTML DOM mirror + :DERIVED_FROM cross-edges
         cfg=cfg, stage_name="write_neo4j",
     ))
 

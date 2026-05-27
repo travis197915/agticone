@@ -461,12 +461,17 @@ def html_pre_sections(state: "PipelineState", cfg: "PipelineConfig") -> dict:
                 continue
             seen_names.add(name)
             sid = cells[0].get("id", "")
+            # outerHTML of the content cell — used by html_dom.block_id_for_html
+            # to cross-link this pre-section back to the matching :HtmlBlock
+            # in Neo4j via (:GraphNode)-[:DERIVED_FROM]->(:HtmlBlock).
+            source_html = str(cells[1])
             sections.append({
                 "name": name,
                 "order": order,
                 "section_id": sid,
                 "items": _items_from_td(cells[1]),
                 "annotations": _extract_anns(cells[1]),
+                "source_html": source_html,
             })
             order += 1
 
@@ -497,6 +502,7 @@ def html_pre_sections(state: "PipelineState", cfg: "PipelineConfig") -> dict:
             "section_id": block.get("id", ""),
             "items": _items_from_td(content),
             "annotations": _extract_anns(content),
+            "source_html": str(block),
         })
         order += 1
 
@@ -558,6 +564,10 @@ def html_steps(state: "PipelineState", cfg: "PipelineConfig") -> dict:
         action_td = cells[content_col]
 
         step = _parse_step_cell(num, action_td)
+        # outerHTML of the parent <tr> — used by html_dom.block_id_for_html
+        # to back-link this step's :Step / :Decision GraphNodes to the
+        # corresponding :HtmlBlock via :DERIVED_FROM in Neo4j.
+        step["source_html"] = str(tr)
 
         # Embed any inner group table found in this step
         inner_group = _detect_group_table(action_td)
@@ -629,6 +639,7 @@ def _parse_step_cell(num: int, td) -> dict:
                 "routing_label": "",
                 "referenced_sops": [],
                 "annotations": [],
+                "source_html": str(li),
             })
         elif _NO_PAT.match(low):
             step["branch_no"] = txt
@@ -643,6 +654,7 @@ def _parse_step_cell(num: int, td) -> dict:
                 "routing_label": "",
                 "referenced_sops": [],
                 "annotations": [],
+                "source_html": str(li),
             })
         elif _ITEM_PAT.match(txt):
             # Generic bullet that represents a condition branch (e.g. "All items match: Skip to Step 4")
@@ -656,6 +668,7 @@ def _parse_step_cell(num: int, td) -> dict:
                 "routing_label": "",
                 "referenced_sops": [],
                 "annotations": [],
+                "source_html": str(li),
             })
 
     # Referenced SOP links
@@ -821,6 +834,10 @@ def _parse_table(table, is_3col: bool) -> list[dict]:
             "routing_label": "",
             "referenced_sops": [],
             "annotations": [],
+            # outerHTML of the if/then <tr>, mirrors what html_dom.py emits
+            # so the (:Decision)-[:DERIVED_FROM]->(:HtmlRow) edge can be
+            # materialised by neo4j_graph_writer.
+            "source_html": str(tr),
         })
     return rows
 
