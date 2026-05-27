@@ -64,6 +64,20 @@ class HealthView(APIView):
         except Exception as exc:
             result["checks"]["celery"] = f"error: {exc}"
 
+        try:
+            from .subprocess_manager import (
+                active_subprocess_snapshot,
+                max_subprocesses,
+            )
+            active = active_subprocess_snapshot()
+            result["checks"]["ingestion_subprocesses"] = {
+                "max": max_subprocesses(),
+                "active_count": len(active),
+                "jobs": active,
+            }
+        except Exception as exc:
+            result["checks"]["ingestion_subprocesses"] = f"error: {exc}"
+
         result["env_file_found"] = _ENV_PATH.exists()
         result["jobs_total"]     = IngestionJob.objects.count()
         result["jobs_running"]   = IngestionJob.objects.filter(

@@ -414,10 +414,19 @@ PYTHONPATH=. python manage.py seed_builder_catalog     # populates shapes/nav/wi
 PYTHONPATH=. python manage.py runserver 0.0.0.0:8000
 ```
 
-### 9.4  Celery worker
+### 9.4  Celery master worker
+
+Ingestion uses a **master dispatcher** (`job_queue`): Celery spawns one OS subprocess
+per `job_id`; LangGraph runs in `sop_ingestion.worker.job_runner`, not in the worker.
 
 ```bash
-PYTHONPATH=. celery -A sop_backend worker -l INFO
+PYTHONPATH=. celery -A sop_backend worker -Q job_queue,celery --concurrency=1 -l INFO
+```
+
+Set parallel subprocess cap (default `10`):
+
+```bash
+export MAX_PIPELINE_SUBPROCESSES=10   # or 50 on a large host
 ```
 
 ### 9.5  Frontend

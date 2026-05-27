@@ -29,8 +29,12 @@ PYTHONPATH=. python manage.py seed_builder_catalog  # populate shape palette + n
 # Run Django
 PYTHONPATH=. python manage.py runserver 0.0.0.0:8000
 
-# Run Celery worker (separate terminal — required for SOP ingestion)
-PYTHONPATH=. celery -A sop_backend worker -l INFO
+# Run Celery master worker (separate terminal — required for SOP ingestion)
+# Dispatches job_id to subprocesses; does not run LangGraph in-process.
+PYTHONPATH=. celery -A sop_backend worker -Q job_queue,celery --concurrency=1 -l INFO
+
+# Optional: max parallel ingestion subprocesses (default 10)
+# MAX_PIPELINE_SUBPROCESSES=10
 
 # Tests
 pytest builder/tests_smoke.py -v

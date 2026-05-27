@@ -3,6 +3,8 @@ src/uhc_sop_ingestion/__init__.py
 src/uhc_sop_ingestion/cli.py
 src/uhc_sop_ingestion/config.py
 src/uhc_sop_ingestion/graph.py
+src/uhc_sop_ingestion/graph_builder.py
+src/uhc_sop_ingestion/pg_logger.py
 src/uhc_sop_ingestion/pipeline.py
 src/uhc_sop_ingestion/state.py
 src/uhc_sop_ingestion.egg-info/PKG-INFO
@@ -27,3 +29,5 @@ src/uhc_sop_ingestion/agents/a12_write_mongo.py
 src/uhc_sop_ingestion/agents/a13_write_redis.py
 src/uhc_sop_ingestion/agents/a14_links.py
 src/uhc_sop_ingestion/agents/a15_control.py
+src/uhc_sop_ingestion/agents/a16_graph_synthesis.py
+src/uhc_sop_ingestion/agents/a17_narrative.py

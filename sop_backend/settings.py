@@ -155,6 +155,13 @@ CELERY_RESULT_BACKEND  = REDIS_URL
 CELERY_ACCEPT_CONTENT  = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 
+# Ingestion: thin master on job_queue; LangGraph runs in child OS processes.
+CELERY_TASK_ROUTES = {
+    "sop_ingestion.run_pipeline": {"queue": "job_queue"},
+}
+# Max parallel ingestion subprocesses (master waits for a slot before Popen).
+MAX_PIPELINE_SUBPROCESSES = int(os.environ.get("MAX_PIPELINE_SUBPROCESSES", "10"))
+
 # ── Pipeline defaults (picked up by PipelineConfig.from_env()) ────────────────
 SOP_MAX_DEPTH    = int(os.environ.get("MAX_DEPTH",    "4"))
 SOP_MAX_DOCS     = int(os.environ.get("MAX_DOCS",     "200"))
