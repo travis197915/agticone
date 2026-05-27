@@ -90,7 +90,10 @@ class BatchRunner:
             res = self._run_one(workflow_id=str(workflow_id), claim_id=cid,
                                 batch_id=batch_id, use_parser=use_parser)
             results.append(res)
-            if res["status"] == "COMPLETED" or res["status"] == "TERMINATED_BY_PRECONDITION":
+            # A claim counts as "completed" if the engine reached a verdict
+            # for it — including the early-halt path. FETCH_FAILED, FAILED,
+            # and RUNNING (shouldn't happen post-pipeline) count as failures.
+            if res["status"] in {"COMPLETED", "TERMINATED_EARLY"}:
                 completed += 1
             else:
                 failed += 1

@@ -17,23 +17,28 @@ def _persist(state: ExecutionState) -> None:
     if status == "RUNNING":
         status = "COMPLETED"
 
-    run = RuleExecutionRun.objects.create(
+    # ``n01_validate`` reserved a RUNNING row with this run_id so that
+    # LLMCallLog rows could FK to it during evaluation. Finalize it now.
+    # update_or_create handles the rare case where validate failed before
+    # reserving (e.g. missing workflow_id) and we still want a record.
+    run, _ = RuleExecutionRun.objects.update_or_create(
         id=state["run_id"],
-        batch_id=state.get("batch_id") or None,
-        workflow_id=state["workflow_id"],
-        claim_id=state.get("claim_id") or "",
-        claim_payload=state.get("claim") or {},
-        raw_fetch=state.get("raw_fetch") or {},
-        finished_at=timezone.now(),
-        status=status,
-        final_decision_type=state.get("final_decision_type") or "",
-        applied_codes=state.get("applied_codes") or [],
-        narrative=state.get("narrative") or "",
-        error_message=state.get("error_message") or "",
+        defaults=dict(
+            batch_id=state.get("batch_id") or None,
+            workflow_id=state["workflow_id"],
+            claim_id=state.get("claim_id") or "",
+            claim_payload=state.get("claim") or {},
+            raw_fetch=state.get("raw_fetch") or {},
+            finished_at=timezone.now(),
+            status=status,
+            final_decision_type=state.get("final_decision_type") or "",
+            applied_codes=state.get("applied_codes") or [],
+            narrative=state.get("narrative") or "",
+            error_message=state.get("error_message") or "",
+        ),
     )
 
-    all_evals = list(state.get("precondition_results") or []) + \
-                list(state.get("decision_results") or [])
+    all_evals = list(state.get("rule_results") or [])
     RuleEvaluation.objects.bulk_create([
         RuleEvaluation(
             run=run,
@@ -73,10 +78,12 @@ def _persist(state: ExecutionState) -> None:
 
 def _build_response(state: ExecutionState) -> dict[str, Any]:
     evals_out: list[dict] = []
-    for ev in (state.get("precondition_results") or []) + (state.get("decision_results") or []):
+    for ev in (state.get("rule_results") or []):
         evals_out.append({
             "rule_key": ev["rule_key"],
             "source": ev["source"],
+            "shape_id": ev.get("shape_id", ""),
+            "shape_label": ev.get("shape_label", ""),
             "matched": ev["matched"],
             "decision_type": ev["decision_type"],
             "confidence": ev["confidence"],
@@ -103,6 +110,7 @@ def _build_response(state: ExecutionState) -> dict[str, Any]:
         "final_decision_type": state.get("final_decision_type") or "",
         "applied_codes": list(state.get("applied_codes") or []),
         "narrative": state.get("narrative") or "",
+        "terminated_at_shape_id": state.get("terminated_at_shape_id") or "",
         "evaluations": evals_out,
         "tool_invocations": tools_out,
         "stages": list(state.get("stages") or []),

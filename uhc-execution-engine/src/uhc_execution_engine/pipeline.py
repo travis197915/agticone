@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from .graph import build_graph
+from .llm import execution_run_context
 from .state import ExecutionState
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,9 @@ class RuleEnginePipeline:
             claim_id: str = "",
             batch_id: str | None = None,
             run_id: str | None = None) -> dict[str, Any]:
+        # Mint the run_id up here (instead of inside n01_validate) so we can
+        # stamp it on every LLMCallLog row via the contextvar set below.
+        run_id = run_id or str(uuid.uuid4())
         initial: ExecutionState = {
             "workflow_id": str(workflow_id),
             "claim": claim or {},
@@ -35,15 +40,15 @@ class RuleEnginePipeline:
             "tool_invocations": [],
             "tool_results": {},
             "status": "RUNNING",
+            "run_id": run_id,
         }
-        if run_id:
-            initial["run_id"] = run_id
         try:
-            final_state = self._graph.invoke(initial)
+            with execution_run_context(run_id):
+                final_state = self._graph.invoke(initial)
         except Exception as exc:
             logger.exception("rule_engine: pipeline crashed")
             return {
-                "run_id": run_id or "",
+                "run_id": run_id,
                 "claim_id": initial["claim_id"],
                 "status": "FAILED",
                 "error_message": f"pipeline crashed: {exc}",

@@ -54,7 +54,7 @@ class RuleExecutionRun(_UUIDPK):
         ("RUNNING", "Running"),
         ("COMPLETED", "Completed"),
         ("FAILED", "Failed"),
-        ("TERMINATED_BY_PRECONDITION", "Terminated by precondition"),
+        ("TERMINATED_EARLY", "Terminated early (DENY/STOP rule on a shape)"),
         ("FETCH_FAILED", "Claim fetch failed"),
     ]
 

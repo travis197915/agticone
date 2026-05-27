@@ -14,8 +14,9 @@ class ExecutionState(TypedDict, total=False):
     claim_id: str                                 # the id we keyed off
 
     # load_bindings outputs
-    preconditions: list[dict[str, Any]]           # hydrated rule dicts
-    decisions: list[dict[str, Any]]
+    preconditions: list[dict[str, Any]]           # hydrated rule dicts (kept for back-compat)
+    decisions: list[dict[str, Any]]               # kept for back-compat
+    shapes: list[dict[str, Any]]                  # per-Shape groupings (rules + tools)
     tools_by_rule_key: dict[str, list[dict[str, Any]]]
     tools_by_shape: dict[str, list[dict[str, Any]]]
 
@@ -24,9 +25,9 @@ class ExecutionState(TypedDict, total=False):
     tool_invocations: list[dict[str, Any]]        # ordered log for response/persistence
 
     # Evaluation outputs
-    precondition_results: list[dict[str, Any]]
-    decision_results: list[dict[str, Any]]
-    terminate: bool                               # set when blocking precondition fails
+    rule_results: list[dict[str, Any]]            # one entry per evaluated rule, in
+                                                  # (shape canvas order, rule order)
+    terminated_at_shape_id: str                   # shape that triggered TERMINATED_EARLY
 
     # Aggregation outputs
     final_decision_type: str
@@ -34,7 +35,7 @@ class ExecutionState(TypedDict, total=False):
     narrative: str
 
     # Control / persistence
-    status: str                                   # RUNNING|COMPLETED|FAILED|TERMINATED_BY_PRECONDITION
+    status: str                                   # RUNNING|COMPLETED|FAILED|TERMINATED_EARLY
     error_message: str
     stages: list[dict[str, Any]]                  # per-node telemetry
     response: dict[str, Any]                      # final dict returned to caller

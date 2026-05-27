@@ -2,20 +2,42 @@
 
 Adapted from `uhc_sop_ingestion.agents.a07_enrich._llm_call`. The full
 guardrail chain (schema-validate → retry on primary → cross-provider fallback)
-is kept; we drop the `PipelineLogger` dependency and log directly to the
-`LLMCallLog` Django model so we don't carry the ingestion-pipeline config
-object around.
+is kept; each call attempt is also persisted to ``sop_ingestion.LLMCallLog``
+with ``execution_run`` set to the current ``RuleExecutionRun`` (when one is
+in scope) instead of an ``IngestionJob``.
+
+The current ``execution_run_id`` is carried through a ContextVar set by
+``RuleEnginePipeline.run(...)`` for the duration of one claim, so the deeply
+nested LLM calls don't need it threaded through every signature.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import time
+from contextlib import contextmanager
 from typing import Any
 
 from .config import EngineConfig
 
 logger = logging.getLogger(__name__)
+
+
+# ── Per-claim context (set by RuleEnginePipeline.run) ────────────────────────
+
+_current_execution_run_id: contextvars.ContextVar[str | None] = \
+    contextvars.ContextVar("uhc_execution_engine.current_run_id", default=None)
+
+
+@contextmanager
+def execution_run_context(run_id: str | None):
+    """Stamp every LLMCallLog row written during this block with run_id."""
+    token = _current_execution_run_id.set(run_id)
+    try:
+        yield
+    finally:
+        _current_execution_run_id.reset(token)
 
 
 # ── Provider helpers ─────────────────────────────────────────────────────────
@@ -64,20 +86,42 @@ def _token_usage(resp) -> tuple[int, int]:
 def _log_llm_call(*, agent_name: str, stage: str, provider: str, model: str,
                   prompt_tokens: int, completion_tokens: int,
                   duration_ms: int, success: bool, error: str = "") -> None:
-    """Per-attempt LLM telemetry.
+    """Persist one LLMCallLog row, stamped with the current execution_run_id.
 
-    `sop_ingestion.LLMCallLog` requires an IngestionJob FK, which the rule
-    engine doesn't have — so for now we log to the standard logger only and
-    rely on per-evaluation `llm_provider` / `llm_ms` columns on `RuleEvaluation`
-    for cost reporting. If we later add an engine-level run table FK on
-    LLMCallLog (or a dedicated table), wire it here.
+    Best-effort: telemetry failures never break the pipeline. The console
+    log line is kept so calls are still observable when the DB write fails
+    or no run context is set (e.g. ad-hoc imports during tests).
     """
+    run_id = _current_execution_run_id.get()
     logger.info(
-        "llm_call %s/%s [%s] %s tok=%s+%s ms=%s success=%s%s",
+        "llm_call %s/%s [%s] %s tok=%s+%s ms=%s success=%s run=%s%s",
         provider, model, stage, agent_name,
         prompt_tokens, completion_tokens, duration_ms, success,
+        run_id or "-",
         f" err={error}" if error else "",
     )
+    if not run_id:
+        # No run in scope (e.g. unit tests with llm.py imported standalone).
+        # Skip persistence rather than write an orphan row.
+        return
+    try:
+        from sop_ingestion.models import LLMCallLog
+        LLMCallLog.objects.create(
+            job=None,
+            execution_run_id=run_id,
+            stage=stage,
+            agent_name=agent_name,
+            llm_provider=provider,
+            llm_model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            duration_ms=duration_ms,
+            success=success,
+            error_message=error or "",
+        )
+    except Exception as exc:  # pragma: no cover — telemetry never breaks the run
+        logger.warning("LLMCallLog write failed (run=%s): %s", run_id, exc)
 
 
 def _validate(data: Any, expected_type: type,

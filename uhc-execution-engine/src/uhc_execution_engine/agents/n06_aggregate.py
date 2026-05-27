@@ -1,12 +1,14 @@
-"""n06 — aggregate_decision: one LLM call to fuse matched decisions.
+"""n06 — aggregate_decision: one LLM call to fuse matched rules into a verdict.
 
 Precedence: DENY > STOP > PEND > REFER > BYPASS > WAIVE > ALLOW. The LLM
-gets the matched-decision list and must produce a single final outcome plus
-a deduplicated code list and a narrative explanation. Conflicts (e.g. one
-ALLOW + one DENY both matched) are mentioned in the narrative.
+gets the list of matched rules (from any Shape) and must produce a single
+final outcome plus a deduplicated code list and a narrative explanation.
+Conflicts (e.g. one ALLOW + one DENY both matched) are mentioned in the
+narrative.
 
-If we already terminated on a precondition, this node produces a synthetic
-'precondition failed' summary without burning an LLM call.
+If the per-Shape evaluator already terminated the claim early
+(``TERMINATED_EARLY``), this node produces a synthetic 'halted at shape X'
+summary from the offending rule without burning an LLM call.
 """
 from __future__ import annotations
 
@@ -53,29 +55,36 @@ def aggregate_decision(state: ExecutionState) -> dict:
     if state.get("status") == "FAILED":
         return {}
 
-    if state.get("status") == "TERMINATED_BY_PRECONDITION":
-        blocking = next(
-            (r for r in (state.get("precondition_results") or [])
-             if r["matched"]
-             and r["decision_type"] in {"DENY", "STOP"}),
+    if state.get("status") == "TERMINATED_EARLY":
+        # Halted mid-workflow when a Shape's rule matched with DENY/STOP.
+        # Find the offending rule in rule_results (last matched DENY/STOP).
+        results = list(state.get("rule_results") or [])
+        halted = next(
+            (r for r in reversed(results)
+             if r.get("matched") and r.get("decision_type") in {"DENY", "STOP"}),
             None,
         )
-        narrative = ("Blocked by precondition "
-                     f"{blocking['rule_key']}: {blocking['reasoning']}"
-                     if blocking
-                     else "Blocked by a precondition.")
-        codes = list(blocking.get("codes") or []) if blocking else []
+        shape_id = state.get("terminated_at_shape_id") or ""
+        if halted:
+            shape_label = halted.get("shape_label") or shape_id or "an early shape"
+            narrative = (f"Halted at shape {shape_label} by rule "
+                         f"{halted['rule_key']}: {halted['reasoning']}")
+            codes = list(halted.get("codes") or [])
+            verdict = halted.get("decision_type") or "DENY"
+        else:
+            narrative = "Halted early; no DENY/STOP rule found in trace."
+            codes, verdict = [], "DENY"
         stages.append({"node": "aggregate_decision", "status": "OK",
                        "ms": int((time.time() - t0) * 1000),
-                       "msg": "precondition-block summary"})
+                       "msg": f"early-halt summary (shape={shape_id})"})
         return {
-            "final_decision_type": (blocking.get("decision_type") if blocking else "DENY"),
+            "final_decision_type": verdict,
             "applied_codes": codes,
             "narrative": narrative,
             "stages": stages,
         }
 
-    matched = [r for r in (state.get("decision_results") or []) if r["matched"]]
+    matched = [r for r in (state.get("rule_results") or []) if r["matched"]]
     if not matched:
         stages.append({"node": "aggregate_decision", "status": "OK",
                        "ms": int((time.time() - t0) * 1000),

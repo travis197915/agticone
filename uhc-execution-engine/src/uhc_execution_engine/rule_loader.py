@@ -85,6 +85,18 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
             "tools_by_rule_key": {rule_key: [tool_binding_dict, ...]},
             "tools_by_shape":    {shape_id_str: [tool_binding_dict, ...]},
             "all_tool_bindings": [tool_binding_dict, ...],  # ordered, deduped
+            "shapes": [
+                {
+                    "shape_id":      str,
+                    "shape_label":   str,
+                    "workbench":     {"name": str, "order": int},
+                    "shape_order":   int,
+                    "rules":         [rule_dict, ...],     # preconditions + decisions on this shape
+                    "tool_bindings": [tool_binding_dict, ...],
+                },
+                ...
+            ],  # ordered by (workbench.order, shape.order); only shapes that have
+                # at least one rule binding are included.
         }
     """
     from agent_tools.models import NodeRuleBinding, NodeToolBinding
@@ -124,6 +136,9 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
 
     preconds_out: list[dict[str, Any]] = []
     decisions_out: list[dict[str, Any]] = []
+    # Per-shape grouping. Insertion-ordered dict keyed by shape_id so the
+    # final list preserves the SQL ordering (workbench.order, shape.order).
+    shapes_by_id: dict[str, dict[str, Any]] = {}
     for rb in rule_bindings:
         kind, parts = _split_key(rb.rule_key)
         sop = sops.get(rb.sop_id)
@@ -162,6 +177,25 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
         else:
             decisions_out.append(rule_dict)
 
+        # Capture per-shape grouping. The first binding we see for a given
+        # shape provides the shape/workbench metadata (cheap, since we
+        # select_related'd them in the queryset).
+        shape_id_str = str(rb.shape_id)
+        shape_group = shapes_by_id.get(shape_id_str)
+        if shape_group is None:
+            shape = rb.shape
+            workbench = shape.workbench
+            shape_group = {
+                "shape_id":      shape_id_str,
+                "shape_label":   shape.label or "",
+                "workbench":     {"name": workbench.name or "", "order": workbench.order},
+                "shape_order":   shape.order,
+                "rules":         [],
+                "tool_bindings": [],
+            }
+            shapes_by_id[shape_id_str] = shape_group
+        shape_group["rules"].append(rule_dict)
+
     # Tool binding dicts + scoping lookups
     def _tool_dict(tb) -> dict[str, Any]:
         return {
@@ -186,6 +220,10 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
             rk = rb_id_to_key.get(td["rule_binding_id"])
             if rk:
                 tools_by_rule_key.setdefault(rk, []).append(td)
+        # Attach to the per-shape grouping when that shape carries rules.
+        shape_group = shapes_by_id.get(td["shape_id"])
+        if shape_group is not None:
+            shape_group["tool_bindings"].append(td)
 
     return {
         "preconditions": preconds_out,
@@ -193,4 +231,5 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
         "tools_by_rule_key": tools_by_rule_key,
         "tools_by_shape": tools_by_shape,
         "all_tool_bindings": all_tool_bindings,
+        "shapes": list(shapes_by_id.values()),
     }

@@ -24,7 +24,11 @@ def load_bindings(state: ExecutionState) -> dict:
 
     pre = loaded["preconditions"]
     dec = loaded["decisions"]
-    if not pre and not dec:
+    shapes = loaded["shapes"]
+    # The v2 evaluator iterates `shapes`. A workflow is "rule-less" only
+    # when every shape grouping is empty and the legacy flat lists are too.
+    has_any_rule = any(s.get("rules") for s in shapes) or bool(pre) or bool(dec)
+    if not has_any_rule:
         stages.append({"node": "load_bindings", "status": "FAIL",
                        "ms": int((time.time() - t0) * 1000),
                        "msg": "workflow has no attached rules"})
@@ -32,13 +36,15 @@ def load_bindings(state: ExecutionState) -> dict:
                 "error_message": "workflow has no attached rules",
                 "stages": stages}
 
+    shapes = loaded["shapes"]
     stages.append({"node": "load_bindings", "status": "OK",
                    "ms": int((time.time() - t0) * 1000),
-                   "msg": f"{len(pre)} pre / {len(dec)} dec / "
+                   "msg": f"{len(shapes)} shapes / {len(pre)} pre / {len(dec)} dec / "
                           f"{len(loaded['all_tool_bindings'])} tools"})
     return {
         "preconditions": pre,
         "decisions": dec,
+        "shapes": shapes,
         "tools_by_rule_key": loaded["tools_by_rule_key"],
         "tools_by_shape": loaded["tools_by_shape"],
         "stages": stages,

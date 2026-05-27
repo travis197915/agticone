@@ -146,10 +146,21 @@ class PipelineStageLog(models.Model):
 
 
 class LLMCallLog(models.Model):
-    """One row per LLM API call made during enrichment (real-time, psycopg2)."""
+    """One row per LLM API call.
+
+    Originally only the SOP-ingestion pipeline wrote here (FK = IngestionJob).
+    The execution engine also writes here now — its rows have ``job=NULL``
+    and reference an ``execution_app.RuleExecutionRun`` via ``execution_run``
+    instead. Exactly one of ``job`` or ``execution_run`` should be set.
+    """
 
     job               = models.ForeignKey(IngestionJob, on_delete=models.CASCADE,
-                                          related_name="llm_calls")
+                                          related_name="llm_calls",
+                                          null=True, blank=True)
+    execution_run     = models.ForeignKey(
+        "execution_app.RuleExecutionRun", on_delete=models.CASCADE,
+        related_name="llm_calls", null=True, blank=True,
+    )
     stage             = models.CharField(max_length=64, default="enrich_stage")
     agent_name        = models.CharField(max_length=128)
     llm_provider      = models.CharField(max_length=32)
