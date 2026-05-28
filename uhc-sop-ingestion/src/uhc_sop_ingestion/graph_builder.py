@@ -29,8 +29,23 @@ from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
 
+from .html_dom import block_id_for_html
+
 if TYPE_CHECKING:
     from .state import PipelineState
+
+
+def _src_bid(*candidates: Any) -> str:
+    """Return the content-hashed HtmlBlock id for the first non-empty source_html.
+
+    Used to plumb DOM-mirror provenance into ``GraphNode.details.source_block_id``
+    so :func:`a10_write_neo4j.neo4j_graph_writer` can emit
+    ``(:GraphNode)-[:DERIVED_FROM]->(:HtmlBlock)`` cross-edges.
+    """
+    for c in candidates:
+        if c and isinstance(c, str):
+            return block_id_for_html(c)
+    return ""
 
 
 # ─── Constants ──────────────────────────────────────────────────────────────
@@ -174,6 +189,7 @@ def build_audit_graph(state: "PipelineState") -> tuple[list[dict], list[dict]]:
                      "section_id": ps.get("section_id", ""),
                      "content": content[:800],
                      "is_exception_block": bool(ps.get("is_exception_block")),
+                     "source_block_id": _src_bid(ps.get("source_html")),
                  })
         add_edge("doc", pkey, "HAS_PRE_SECTION",
                  label=f"order:{i}", details={"order": i})
@@ -222,6 +238,7 @@ def build_audit_graph(state: "PipelineState") -> tuple[list[dict], list[dict]]:
                      "is_sub_procedure": bool(step.get("is_sub_procedure")),
                      "sub_procedure_name": step.get("sub_procedure_name", ""),
                      "terminal_action": step.get("terminal_action", ""),
+                     "source_block_id": _src_bid(step.get("source_html")),
                  })
         add_edge("doc", skey, "HAS_STEP",
                  label=f"order:{num}", details={"order": num})
@@ -272,6 +289,9 @@ def build_audit_graph(state: "PipelineState") -> tuple[list[dict], list[dict]]:
                          "goto_step":    goto,
                          "is_final":     bool(dec.get("is_final")
                                               or dec.get("is_terminal")),
+                         "source_block_id": _src_bid(
+                             dec.get("source_html"), step.get("source_html"),
+                         ),
                      })
             add_edge(skey, dkey, "HAS_DECISION", label=dtype,
                      details={"decision_type": dtype})

@@ -7,6 +7,7 @@ from .exclusion_views import (SopExclusionListCreateView,
                               SopExclusionToggleView,
                               SopHtmlBlocksView,
                               SopSourceHtmlView)
+from .dom_tree_views import SopDomTreeView, SopDomBlockView
 
 app_name = "sop_ingestion"
 
@@ -36,6 +37,16 @@ urlpatterns = [
     path("sops/<int:sop_id>/source-html/",
          SopSourceHtmlView.as_view(),
          name="sop-source-html"),
+
+    # HTML DOM-mirror tree (mirrors the source HTML structure 1:1, served
+    # straight from Neo4j HtmlBlock nodes with :DERIVED_FROM semantic rules
+    # attached. Falls back to live HTML fetch when Neo4j is empty.)
+    path("sops/<int:sop_id>/dom-tree/",
+         SopDomTreeView.as_view(),
+         name="sop-dom-tree"),
+    path("sops/<int:sop_id>/dom-tree/<str:block_id>/",
+         SopDomBlockView.as_view(),
+         name="sop-dom-block"),
 
     # HTML Viewer
     path("viewer/",                                      ViewerJobListView.as_view(),   name="viewer-jobs"),

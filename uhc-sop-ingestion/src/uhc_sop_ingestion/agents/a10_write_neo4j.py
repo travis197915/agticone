@@ -542,6 +542,26 @@ def neo4j_graph_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
                         ],
                     },
                 )
+
+            # Cross-link each semantic GraphNode back to its source HtmlBlock
+            # whenever the parser stashed `details.source_block_id`. The
+            # HtmlBlock subgraph is written by html_dom_writer (the next
+            # agent in the write_neo4j stage); the MATCH below silently
+            # no-ops on missing blocks, so this is safe to run regardless
+            # of ordering.
+            derived = [
+                {"node_key": n["key"],
+                 "block_id": (n.get("details") or {}).get("source_block_id")}
+                for n in nodes
+                if (n.get("details") or {}).get("source_block_id")
+            ]
+            if derived:
+                _run(s, """
+                    UNWIND $rows AS row
+                    MATCH (g:GraphNode  {sop_id:$sop_id, node_key:row.node_key})
+                    MATCH (b:HtmlBlock  {sop_id:$sop_id, block_id:row.block_id})
+                    MERGE (g)-[:DERIVED_FROM]->(b)
+                """, {"sop_id": sop_id, "rows": derived})
     except Exception as e:
         logger.error("neo4j_graph_writer: %s", e)
         return {"errors": [{"agent": "neo4j_graph_writer", "msg": str(e)}]}
@@ -551,3 +571,185 @@ def neo4j_graph_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     return {"neo4j_graph_nodes": len(nodes),
             "neo4j_graph_edges": len(edges),
             "audit_graph_source": source}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# html_dom_writer — mirror the source HTML's DOM tree into Neo4j
+#
+# Companion to neo4j_graph_writer. Builds a `:HtmlBlock`-labelled subgraph
+# whose structure exactly mirrors the source HTML (every <section>, <h2>,
+# <ul>, <li>, <table>, ...) so an auditor can open Neo4j Browser and walk
+# the SOP top-down the same way they'd read the page.
+#
+# Each block is also tagged with a content-specific sub-label
+# (`:HtmlSection`, `:HtmlListItem`, ...) so Cypher patterns stay
+# ergonomic, e.g.
+#     MATCH (li:HtmlListItem)-[:HAS_CHILD*]->(a:HtmlAnchor) ...
+# is enough to find every link inside every bullet.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def html_dom_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
+    """Materialise the source HTML's DOM tree in Neo4j."""
+    sop_id = state.get("neo4j_sop_id", "")
+    if not sop_id:
+        return {}
+
+    from ..html_dom import build_dom_tree
+    try:
+        tree = build_dom_tree(state)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("html_dom_writer: build_dom_tree raised: %s", e)
+        return {"errors": [{"agent": "html_dom_writer", "msg": str(e)}]}
+
+    flat: list[dict] = tree.get("flat") or []
+    if not flat:
+        return {}
+
+    try:
+        drv = _driver(cfg)
+    except Exception as e:
+        logger.warning("html_dom_writer: driver unavailable — %s", e)
+        return {}
+
+    try:
+        with drv.session(database=cfg.neo4j_database) as s:
+            # 1) Wipe stale HtmlBlock subgraph for this SOP (idempotent).
+            _run(s, """
+                MATCH (b:HtmlBlock {sop_id:$sop_id}) DETACH DELETE b
+            """, {"sop_id": sop_id})
+
+            # 2) Insert every block. Group by sub_label so the MERGE statement
+            #    can hard-code the dual label (`:HtmlBlock:HtmlListItem`) —
+            #    dynamic labels are not parameterisable in Cypher.
+            from collections import defaultdict
+            by_label: dict[str, list[dict]] = defaultdict(list)
+            for b in flat:
+                rec = {
+                    "block_id":        b["block_id"],
+                    "parent_block_id": b.get("parent_block_id", "") or "",
+                    "tag":             b.get("tag", ""),
+                    "kind":            b.get("kind", ""),
+                    "depth":           int(b.get("depth", 0) or 0),
+                    "tree_depth":      int(b.get("tree_depth", 0) or 0),
+                    "order":           int(b.get("order", 0) or 0),
+                    "section_id":      b.get("section_id", "") or "",
+                    "label":           (b.get("label") or "")[:255],
+                    "text":            (b.get("text") or "")[:4000],
+                    "html_snippet":    (b.get("html_snippet") or "")[:2000],
+                    "is_root":         bool(b.get("is_root", False)),
+                    "href":            b.get("href", "") or "",
+                    "fragment":        b.get("fragment", "") or "",
+                    "external_url":    b.get("external_url", "") or "",
+                    "target_block_id": b.get("target_block_id", "") or "",
+                    "unresolved":      bool(b.get("unresolved", False)),
+                }
+                by_label[b.get("sub_label", "HtmlBlock")].append(rec)
+
+            for sub_label, rows in by_label.items():
+                _run(s,
+                    f"""
+                    UNWIND $rows AS row
+                    MERGE (b:HtmlBlock:{sub_label} {{sop_id:$sop_id, block_id:row.block_id}})
+                    SET b += row, b.updated_at = datetime()
+                    """,
+                    {"sop_id": sop_id, "rows": rows},
+                )
+
+            # 3) Root mount: (:SopDocument)-[:HAS_HTML_BLOCK]->(:HtmlBlock {is_root})
+            root_ids = [b["block_id"] for b in flat if b.get("is_root")]
+            if root_ids:
+                _run(s, """
+                    MATCH (d:SopDocument {sop_id:$sop_id})
+                    UNWIND $ids AS bid
+                    MATCH (b:HtmlBlock {sop_id:$sop_id, block_id:bid})
+                    MERGE (d)-[r:HAS_HTML_BLOCK]->(b)
+                    SET r.order = b.order
+                """, {"sop_id": sop_id, "ids": root_ids})
+
+            # 4) HAS_CHILD edges (parent -> child, with order)
+            parent_edges = [
+                {"parent": b["parent_block_id"],
+                 "child":  b["block_id"],
+                 "order":  int(b.get("order", 0) or 0)}
+                for b in flat
+                if b.get("parent_block_id")
+            ]
+            if parent_edges:
+                _run(s, """
+                    UNWIND $edges AS e
+                    MATCH (p:HtmlBlock {sop_id:$sop_id, block_id:e.parent})
+                    MATCH (c:HtmlBlock {sop_id:$sop_id, block_id:e.child})
+                    MERGE (p)-[r:HAS_CHILD]->(c)
+                    SET r.order = e.order
+                """, {"sop_id": sop_id, "edges": parent_edges})
+
+            # 5) NEXT_SIBLING edges (helpful for ordered traversal)
+            siblings_by_parent: dict[str, list[dict]] = defaultdict(list)
+            for b in flat:
+                siblings_by_parent[b.get("parent_block_id", "") or "__root__"].append(b)
+            sibling_edges: list[dict] = []
+            for sibs in siblings_by_parent.values():
+                sibs_sorted = sorted(sibs, key=lambda x: int(x.get("order", 0) or 0))
+                for a, b in zip(sibs_sorted, sibs_sorted[1:]):
+                    sibling_edges.append({
+                        "src": a["block_id"], "tgt": b["block_id"],
+                    })
+            if sibling_edges:
+                _run(s, """
+                    UNWIND $edges AS e
+                    MATCH (a:HtmlBlock {sop_id:$sop_id, block_id:e.src})
+                    MATCH (b:HtmlBlock {sop_id:$sop_id, block_id:e.tgt})
+                    MERGE (a)-[:NEXT_SIBLING]->(b)
+                """, {"sop_id": sop_id, "edges": sibling_edges})
+
+            # 6) HREF edges for resolved in-page anchors.
+            anchor_edges = [
+                {"src": b["block_id"],
+                 "tgt": b.get("target_block_id", ""),
+                 "fragment": b.get("fragment", "")}
+                for b in flat
+                if b.get("kind") == "anchor" and b.get("target_block_id")
+            ]
+            if anchor_edges:
+                _run(s, """
+                    UNWIND $edges AS e
+                    MATCH (a:HtmlBlock {sop_id:$sop_id, block_id:e.src})
+                    MATCH (t:HtmlBlock {sop_id:$sop_id, block_id:e.tgt})
+                    MERGE (a)-[r:HREF]->(t)
+                    SET r.fragment = e.fragment
+                """, {"sop_id": sop_id, "edges": anchor_edges})
+
+            # 7) Backfill :DERIVED_FROM edges if the semantic writer already
+            #    ran above this one in the stage but couldn't match because
+            #    HtmlBlock nodes hadn't been written yet. Safe to no-op when
+            #    no GraphNode carries source_block_id.
+            sem_nodes = state.get("audit_graph_nodes") or []
+            derived = [
+                {"node_key": n["key"],
+                 "block_id": (n.get("details") or {}).get("source_block_id")}
+                for n in sem_nodes
+                if (n.get("details") or {}).get("source_block_id")
+            ]
+            if derived:
+                _run(s, """
+                    UNWIND $rows AS row
+                    MATCH (g:GraphNode  {sop_id:$sop_id, node_key:row.node_key})
+                    MATCH (b:HtmlBlock  {sop_id:$sop_id, block_id:row.block_id})
+                    MERGE (g)-[:DERIVED_FROM]->(b)
+                """, {"sop_id": sop_id, "rows": derived})
+    except Exception as e:
+        logger.error("html_dom_writer: %s", e)
+        return {"errors": [{"agent": "html_dom_writer", "msg": str(e)}]}
+
+    logger.info(
+        "html_dom_writer[%s]: wrote %d HtmlBlock nodes (%d roots) for %s",
+        tree.get("source"), len(flat),
+        sum(1 for b in flat if b.get("is_root")),
+        sop_id,
+    )
+    return {
+        "neo4j_html_blocks": len(flat),
+        "neo4j_html_roots":  sum(1 for b in flat if b.get("is_root")),
+        "neo4j_html_source": tree.get("source", ""),
+    }

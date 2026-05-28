@@ -30,3 +30,4 @@ sop_files/
 *.html
 *.pyc
 __pycache__/
+.venv/

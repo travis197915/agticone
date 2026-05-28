@@ -389,8 +389,12 @@ Response headers:
 Content-Type:        text/event-stream
 Cache-Control:       no-store
 X-Accel-Buffering:   no
-Connection:          keep-alive
 ```
+
+`Connection: keep-alive` is managed by the HTTP server (gunicorn / nginx)
+on HTTP/1.1 — the Django view does **not** emit it. It's a hop-by-hop
+header (RFC 7230 §6.1), and wsgiref/runserver `assert`s on hop-by-hop
+headers coming out of the WSGI app, surfacing as a 500.
 
 **Wire grammar** (each event terminates with a blank line):
 
