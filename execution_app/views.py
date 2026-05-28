@@ -12,9 +12,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 import uuid
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -23,6 +23,7 @@ from django.http import StreamingHttpResponse
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import AllowAny
+from rest_framework.renderers import BaseRenderer
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -41,6 +42,205 @@ _SSE_HEARTBEAT_SECONDS = 15
 # the pubsub and returns. `summary` is the happy path, `error` is the
 # task-level crash path.
 _SSE_TERMINAL_KINDS = {"summary", "error"}
+
+
+def _iso_utc(ts: datetime | None) -> str | None:
+    """Return an ISO-8601 UTC timestamp with Z suffix."""
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _format_clock(ts: datetime | None) -> str:
+    """Return the UI-friendly clock string (UTC), e.g. 06:08:09 AM."""
+    if ts is None:
+        return ""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc).strftime("%I:%M:%S %p")
+
+
+def _format_duration(duration_ms: int | None) -> str:
+    """Return human-friendly duration: 12s, 1m 04s."""
+    total_seconds = max(0, int((duration_ms or 0) / 1000))
+    minutes, seconds = divmod(total_seconds, 60)
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _relay_error(
+    message: str,
+    *,
+    status_code: int,
+    details: dict[str, Any] | None = None,
+    source: str = "django",
+) -> Response:
+    payload: dict[str, Any] = {"error": message, "source": source}
+    if details:
+        payload["details"] = details
+    return Response(payload, status=status_code)
+
+
+def _build_node_rollup(run: RuleExecutionRun) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build per-node and outer-tool rollups for one execution run."""
+    # Insertion-ordered dict keyed by shape_id, so the response preserves
+    # the order in which the engine first touched each node (driven by
+    # RuleEvaluation.order_index, which is set in canvas order).
+    nodes: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+    outer_tools: list[dict[str, Any]] = []
+
+    def _node_slot(shape_id: str, shape_label: str) -> dict[str, Any]:
+        slot = nodes.get(shape_id)
+        if slot is None:
+            slot = {
+                "shape_id": shape_id,
+                "shape_label": shape_label,
+                "evaluations": [],
+                "tool_invocations": [],
+                "rules_evaluated": 0,
+                "rules_matched": 0,
+                "matched_decision_types": [],
+                "terminated_here": False,
+            }
+            nodes[shape_id] = slot
+        elif shape_label and not slot["shape_label"]:
+            slot["shape_label"] = shape_label
+        return slot
+
+    # Iterate evaluations in their persisted order. The shape_id on the
+    # binding wins; if the binding was deleted (FK SET_NULL), we still
+    # have a stable key via the captured shape_label or rule_key prefix.
+    for ev in run.evaluations.all().order_by("order_index"):
+        rb = ev.rule_binding  # may be None if the binding was deleted
+        if rb is not None:
+            shape_id = str(rb.shape_id)
+            shape_label = (rb.shape.label or "") if rb.shape else ""
+        else:
+            shape_id = ""
+            shape_label = ""
+        # Fall back to whatever the engine captured at run time. We don't
+        # store ev.shape_id on the model today, so use a synthetic key
+        # built from rule_key when neither source is available.
+        if not shape_id:
+            shape_id = f"orphaned:{ev.rule_key}"
+        slot = _node_slot(shape_id, shape_label)
+        slot["evaluations"].append({
+            "order_index": ev.order_index,
+            "rule_key": ev.rule_key,
+            "rule_source": ev.rule_source,
+            "condition": ev.condition,
+            "action": ev.action,
+            "matched": ev.matched,
+            "confidence": ev.confidence,
+            "reasoning": ev.reasoning,
+            "decision_type": ev.decision_type,
+            "codes": list(ev.codes or []),
+            "llm_provider": ev.llm_provider,
+            "llm_ms": ev.llm_ms,
+        })
+        slot["rules_evaluated"] += 1
+        if ev.matched:
+            slot["rules_matched"] += 1
+            if ev.decision_type and ev.decision_type not in slot["matched_decision_types"]:
+                slot["matched_decision_types"].append(ev.decision_type)
+
+    # Tool invocations: bucket the shape-scoped ones onto their node,
+    # surface the outer FETCH/PARSE calls (no tool_binding) separately.
+    for inv in run.tool_invocations.all().order_by("called_at"):
+        tb = inv.tool_binding
+        payload = {
+            "tool_name": inv.tool_name,
+            "phase": inv.phase,
+            "ok": inv.ok,
+            "duration_ms": inv.duration_ms,
+            "error": inv.error,
+            "called_at": inv.called_at,
+        }
+        if tb is None or inv.phase in ("FETCH", "PARSE"):
+            outer_tools.append(payload)
+            continue
+        shape_id = str(tb.shape_id)
+        shape_label = (tb.shape.label or "") if tb.shape else ""
+        slot = _node_slot(shape_id, shape_label)
+        slot["tool_invocations"].append(payload)
+
+    # Flag the node that triggered an early halt: walk the rollup we
+    # just built and mark the first node whose matched-rule list
+    # contains a DENY/STOP outcome.
+    if run.status == "TERMINATED_EARLY":
+        for slot in nodes.values():
+            if any(e["matched"] and e["decision_type"] in {"DENY", "STOP"}
+                   for e in slot["evaluations"]):
+                slot["terminated_here"] = True
+                break
+
+    return list(nodes.values()), outer_tools
+
+
+def _agent_status(node: dict[str, Any]) -> str:
+    matched = [e for e in node["evaluations"] if e.get("matched")]
+    if node.get("terminated_here") or any(e.get("decision_type") in {"DENY", "STOP"} for e in matched):
+        return "NOT_MET"
+    if matched:
+        return "MET"
+    return "INCONCLUSIVE"
+
+
+def _claim_status(run: RuleExecutionRun, nodes: list[dict[str, Any]]) -> str:
+    if run.status in {"FAILED", "FETCH_FAILED"}:
+        return "DEFECT"
+    if run.status == "TERMINATED_EARLY":
+        return "NOT_MET"
+    if run.status == "RUNNING":
+        return "INCONCLUSIVE"
+    if (run.final_decision_type or "").upper() in {"DENY", "STOP"}:
+        return "NOT_MET"
+    if any(node["rules_matched"] > 0 for node in nodes):
+        return "MET"
+    return "INCONCLUSIVE"
+
+
+def _processing_time_min(run: RuleExecutionRun) -> float | None:
+    if run.finished_at is None:
+        return None
+    return round((run.finished_at - run.started_at).total_seconds() / 60.0, 2)
+
+
+def _serialize_agent(node: dict[str, Any], run: RuleExecutionRun) -> dict[str, Any]:
+    invocations = node["tool_invocations"]
+    begin_ts = invocations[0]["called_at"] if invocations else run.started_at
+    end_ts = invocations[-1]["called_at"] if invocations else (run.finished_at or run.started_at)
+    duration_sec = max(0, int((end_ts - begin_ts).total_seconds()))
+    steps = []
+    for idx, inv in enumerate(invocations, start=1):
+        details = f"Called {inv['tool_name']} for claim {run.claim_id}"
+        if inv.get("error"):
+            details = f"{details}. Error: {inv['error']}"
+        steps.append({
+            "id": f"s{idx}",
+            "name": inv["tool_name"],
+            "status": "completed" if inv["ok"] else "failed",
+            "duration": _format_duration(inv["duration_ms"]),
+            "details": details,
+        })
+    process_summary = []
+    for evaluation in node["evaluations"]:
+        reasoning = (evaluation.get("reasoning") or "").strip()
+        if reasoning:
+            process_summary.append(reasoning)
+    return {
+        "id": node["shape_id"],
+        "agentName": node["shape_label"] or node["shape_id"],
+        "status": _agent_status(node),
+        "beginTime": _format_clock(begin_ts),
+        "endTime": _format_clock(end_ts),
+        "durationSec": duration_sec,
+        "processSummary": process_summary[:10],
+        "steps": steps,
+    }
 
 
 class RunBatchView(APIView):
@@ -134,97 +334,7 @@ class RunNodesView(APIView):
         except RuleExecutionRun.DoesNotExist:
             return Response({"detail": "not found"},
                             status=status.HTTP_404_NOT_FOUND)
-
-        # Insertion-ordered dict keyed by shape_id, so the response preserves
-        # the order in which the engine first touched each node (driven by
-        # RuleEvaluation.order_index, which is set in canvas order).
-        nodes: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-        outer_tools: list[dict[str, Any]] = []
-
-        def _node_slot(shape_id: str, shape_label: str) -> dict[str, Any]:
-            slot = nodes.get(shape_id)
-            if slot is None:
-                slot = {
-                    "shape_id": shape_id,
-                    "shape_label": shape_label,
-                    "evaluations": [],
-                    "tool_invocations": [],
-                    "rules_evaluated": 0,
-                    "rules_matched": 0,
-                    "matched_decision_types": [],
-                    "terminated_here": False,
-                }
-                nodes[shape_id] = slot
-            elif shape_label and not slot["shape_label"]:
-                slot["shape_label"] = shape_label
-            return slot
-
-        # Iterate evaluations in their persisted order. The shape_id on the
-        # binding wins; if the binding was deleted (FK SET_NULL), we still
-        # have a stable key via the captured shape_label or rule_key prefix.
-        for ev in run.evaluations.all().order_by("order_index"):
-            rb = ev.rule_binding  # may be None if the binding was deleted
-            if rb is not None:
-                shape_id = str(rb.shape_id)
-                shape_label = (rb.shape.label or "") if rb.shape else ""
-            else:
-                shape_id = ""
-                shape_label = ""
-            # Fall back to whatever the engine captured at run time. We don't
-            # store ev.shape_id on the model today, so use a synthetic key
-            # built from rule_key when neither source is available.
-            if not shape_id:
-                shape_id = f"orphaned:{ev.rule_key}"
-            slot = _node_slot(shape_id, shape_label)
-            slot["evaluations"].append({
-                "order_index":   ev.order_index,
-                "rule_key":      ev.rule_key,
-                "rule_source":   ev.rule_source,
-                "condition":     ev.condition,
-                "action":        ev.action,
-                "matched":       ev.matched,
-                "confidence":    ev.confidence,
-                "reasoning":     ev.reasoning,
-                "decision_type": ev.decision_type,
-                "codes":         list(ev.codes or []),
-                "llm_provider":  ev.llm_provider,
-                "llm_ms":        ev.llm_ms,
-            })
-            slot["rules_evaluated"] += 1
-            if ev.matched:
-                slot["rules_matched"] += 1
-                if ev.decision_type and ev.decision_type not in slot["matched_decision_types"]:
-                    slot["matched_decision_types"].append(ev.decision_type)
-
-        # Tool invocations: bucket the shape-scoped ones onto their node,
-        # surface the outer FETCH/PARSE calls (no tool_binding) separately.
-        for inv in run.tool_invocations.all().order_by("called_at"):
-            tb = inv.tool_binding
-            payload = {
-                "tool_name":   inv.tool_name,
-                "phase":       inv.phase,
-                "ok":          inv.ok,
-                "duration_ms": inv.duration_ms,
-                "error":       inv.error,
-                "called_at":   inv.called_at,
-            }
-            if tb is None or inv.phase in ("FETCH", "PARSE"):
-                outer_tools.append(payload)
-                continue
-            shape_id = str(tb.shape_id)
-            shape_label = (tb.shape.label or "") if tb.shape else ""
-            slot = _node_slot(shape_id, shape_label)
-            slot["tool_invocations"].append(payload)
-
-        # Flag the node that triggered an early halt: walk the rollup we
-        # just built and mark the first node whose matched-rule list
-        # contains a DENY/STOP outcome.
-        if run.status == "TERMINATED_EARLY":
-            for slot in nodes.values():
-                if any(e["matched"] and e["decision_type"] in {"DENY", "STOP"}
-                       for e in slot["evaluations"]):
-                    slot["terminated_here"] = True
-                    break
+        nodes, outer_tools = _build_node_rollup(run)
 
         return Response({
             "run_id":              str(run.id),
@@ -234,9 +344,102 @@ class RunNodesView(APIView):
             "final_decision_type": run.final_decision_type,
             "applied_codes":       list(run.applied_codes or []),
             "narrative":           run.narrative,
-            "nodes":               list(nodes.values()),
+            "nodes":               nodes,
             "outer_tool_invocations": outer_tools,
         })
+
+
+class ClaimProcessingView(APIView):
+    """GET /api/claims/<claim_id>/processing/ aggregated claim processing snapshot."""
+    permission_classes = [AllowAny]
+
+    def get(self, _request: Request, claim_id: str) -> Response:
+        run_id_param = (_request.query_params.get("run_id") or "").strip()
+        batch_id_param = (_request.query_params.get("batch_id") or "").strip()
+
+        run_uuid: uuid.UUID | None = None
+        batch_uuid: uuid.UUID | None = None
+        if run_id_param:
+            try:
+                run_uuid = uuid.UUID(run_id_param)
+            except ValueError:
+                return _relay_error(
+                    "Malformed run_id query parameter",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    details={"run_id": run_id_param},
+                )
+        if batch_id_param:
+            try:
+                batch_uuid = uuid.UUID(batch_id_param)
+            except ValueError:
+                return _relay_error(
+                    "Malformed batch_id query parameter",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    details={"batch_id": batch_id_param},
+                )
+
+        try:
+            if run_uuid is not None:
+                run = (RuleExecutionRun.objects
+                       .select_related("workflow", "batch")
+                       .prefetch_related(
+                           "evaluations__rule_binding__shape",
+                           "tool_invocations__tool_binding__shape",
+                       )
+                       .get(id=run_uuid))
+            else:
+                queryset = (RuleExecutionRun.objects
+                            .select_related("workflow", "batch")
+                            .prefetch_related(
+                                "evaluations__rule_binding__shape",
+                                "tool_invocations__tool_binding__shape",
+                            )
+                            .filter(claim_id=claim_id))
+                if batch_uuid is not None:
+                    queryset = queryset.filter(batch_id=batch_uuid)
+                run = queryset.order_by("-started_at").first()
+                if run is None:
+                    return _relay_error(
+                        f"No run found for claim {claim_id}",
+                        status_code=status.HTTP_404_NOT_FOUND,
+                    )
+        except RuleExecutionRun.DoesNotExist:
+            return _relay_error(
+                f"No run found for claim {claim_id}",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        except Exception as exc:
+            logger.exception("claim-processing failed claim_id=%s", claim_id)
+            return _relay_error(
+                "Unexpected error while loading claim processing",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                details={"message": str(exc)},
+            )
+
+        nodes, outer_tools = _build_node_rollup(run)
+        payload = {
+            "claimId": run.claim_id,
+            "runId": str(run.id),
+            "batchId": str(run.batch_id) if run.batch_id else None,
+            "workflowId": str(run.workflow_id),
+            "claimStatus": _claim_status(run, nodes),
+            "processingTimeMin": _processing_time_min(run),
+            "startedAt": _iso_utc(run.started_at),
+            "finishedAt": _iso_utc(run.finished_at),
+            "agents": [_serialize_agent(node, run) for node in nodes],
+            "outerToolInvocations": [
+                {
+                    "phase": inv["phase"],
+                    "tool": inv["tool_name"],
+                    "status": "completed" if inv["ok"] else "failed",
+                    "durationMs": inv["duration_ms"],
+                }
+                for inv in outer_tools
+            ],
+            "reviewStatus": None,
+            "feedback": None,
+        }
+        return Response(payload, status=status.HTTP_200_OK)
 
 
 # ── Streaming endpoints ──────────────────────────────────────────────────────
@@ -352,6 +555,26 @@ def _claim_payload_from_run(run: RuleExecutionRun) -> dict:
     }
 
 
+class _EventStreamRenderer(BaseRenderer):
+    """No-op renderer that advertises ``text/event-stream``.
+
+    Exists solely to satisfy DRF's content negotiation for SSE endpoints.
+    ``EventSource`` always sends ``Accept: text/event-stream``; with only
+    ``JSONRenderer`` registered project-wide, the negotiator would 406 the
+    request before our ``get()`` could return a ``StreamingHttpResponse``.
+
+    ``render()`` is never invoked because the view returns a
+    ``StreamingHttpResponse`` directly — DRF only renders ``Response``
+    objects.
+    """
+    media_type = "text/event-stream"
+    format = "txt"
+    charset = "utf-8"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):  # pragma: no cover
+        return data
+
+
 class BatchEventsView(APIView):
     """GET /api/execute/batches/<batch_id>/events/
 
@@ -364,6 +587,7 @@ class BatchEventsView(APIView):
     final publish) or when the client disconnects.
     """
     permission_classes = [AllowAny]
+    renderer_classes = [_EventStreamRenderer]
 
     def get(self, _request: Request, batch_id: str) -> StreamingHttpResponse:
         # Existence check before we commit to streaming. 404 is meaningful
@@ -387,7 +611,10 @@ class BatchEventsView(APIView):
         )
         response["Cache-Control"] = "no-store"
         response["X-Accel-Buffering"] = "no"  # nginx: don't buffer
-        response["Connection"] = "keep-alive"
+        # NOTE: `Connection: keep-alive` is a hop-by-hop header (RFC 7230 §6.1)
+        # — WSGI applications must not emit it; the server manages it. Setting
+        # it here crashes wsgiref/runserver with AssertionError and is a no-op
+        # under gunicorn (which already keeps HTTP/1.1 connections alive).
         return response
 
     def _iter_sse(self, batch: BatchExecutionRun) -> Iterator[bytes]:

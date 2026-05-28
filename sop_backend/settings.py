@@ -145,6 +145,13 @@ _redis_port = os.environ.get("REDIS_PORT",     "6379")
 _redis_auth = f"{_redis_user}:{_redis_pass}@" if _redis_pass else ""
 REDIS_URL   = f"redis://{_redis_auth}{_redis_host}:{_redis_port}/0"
 
+# Export the composed URL back to the process environment so standalone
+# packages that follow the standard `REDIS_URL` convention (notably
+# `uhc_execution_engine.llm._get_redis`, which powers the SSE pub/sub
+# bridge) can build a client without re-reading the individual parts.
+# `setdefault` so an explicit `REDIS_URL` in the env still wins.
+os.environ.setdefault("REDIS_URL", REDIS_URL)
+
 # ── Celery (RabbitMQ) ─────────────────────────────────────────────────────────
 _rmq_user = os.environ.get("RABBITMQ_USER",     "guest")
 _rmq_pass = os.environ.get("RABBITMQ_PASSWORD", "guest")

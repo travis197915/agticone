@@ -18,7 +18,7 @@ Every endpoint exposed by this backend. For schemas in machine-readable form, im
 6. [Ingestion — SOP data (graph + sections)](#6-ingestion--sop-data-graph--sections)
 7. [Ingestion — narrative backfill](#7-ingestion--narrative-backfill)
 8. [Ingestion — HTML viewer](#8-ingestion--html-viewer)
-9. [Execution — batch claim adjudication](#9-execution--batch-claim-adjudication)
+9. [Execution — claim adjudication](#9-execution--claim-adjudication)
 10. [Errors](#10-errors)
 
 ---
@@ -762,11 +762,29 @@ Always 200; routes return 404 if the IDs don't exist.
 
 ---
 
-## 9. Execution — batch claim adjudication
+## 9. Execution — claim adjudication
 
 The execution engine takes an Excel of claim ids + a workflow id and
 produces a per-claim adjudication. Full architecture in
-[EXECUTION_ENGINE.md](EXECUTION_ENGINE.md).
+[EXECUTION_ENGINE.md](EXECUTION_ENGINE.md). A concise reference to just
+the execution surface lives in [EXECUTION_APIS.md](EXECUTION_APIS.md).
+
+All `/api/execute/...` routes and `/api/claims/<claim_id>/processing/`
+are currently `AllowAny` — no JWT required. They'll move behind the
+standard `CorebackendJWTAuthentication` once the SPA wires auth into the
+execution flow.
+
+**Route map**
+
+| Method | Path                                                          | Purpose                              |
+|--------|---------------------------------------------------------------|--------------------------------------|
+| `POST` | `/api/execute/workflows/<workflow_id>/run-batch/`             | Run a batch synchronously.           |
+| `POST` | `/api/execute/workflows/<workflow_id>/run-batch-async/`       | Kick off async batch, get SSE URL.   |
+| `GET`  | `/api/execute/batches/<batch_id>/`                            | Persisted batch + run summaries.     |
+| `GET`  | `/api/execute/batches/<batch_id>/events/`                     | SSE stream of live batch progress.   |
+| `GET`  | `/api/execute/runs/<run_id>/`                                 | Full single-claim audit trail.       |
+| `GET`  | `/api/execute/runs/<run_id>/nodes/`                           | Per-canvas-node rollup for one run.  |
+| `GET`  | `/api/claims/<claim_id>/processing/`                          | SPA-shaped claim-processing snapshot.|
 
 ### `POST /api/execute/workflows/<workflow_id>/run-batch/`
 
@@ -938,8 +956,12 @@ cleanly.
 Content-Type:      text/event-stream
 Cache-Control:     no-store
 X-Accel-Buffering: no
-Connection:        keep-alive
 ```
+
+`Connection: keep-alive` is managed by the HTTP server (gunicorn / nginx)
+on HTTP/1.1, not the app. The Django view does **not** set it — wsgiref
+rejects hop-by-hop headers (RFC 7230 §6.1) with an `AssertionError`,
+which would surface as a 500 on `runserver`.
 
 **Event grammar** — each chunk is one SSE event followed by a blank line.
 The `event:` line names the kind; the `data:` line is the JSON payload.
@@ -1153,6 +1175,110 @@ without re-fetching the whole audit blob.
   evaluations are grouped under a synthetic `shape_id` of the form
   `orphaned:<rule_key>` with an empty `shape_label`. This preserves the
   per-rule history without dropping it.
+
+### `GET /api/claims/<claim_id>/processing/`  *(no auth)*
+
+Aggregated claim-processing snapshot in the SPA's preferred shape. Mounted
+outside `/api/execute/` so it lines up with the SPA contract
+(`/api/claims/:claimId/processing/`) but served by the same `execution_app`
+machinery as `GET /runs/<run_id>/nodes/` above.
+
+Internally it looks up the most recent `RuleExecutionRun` for `claim_id`,
+groups its evaluations + tool invocations by Shape, and re-projects them
+into camelCase / agent-centric keys for the claim-detail view.
+
+**Query params**
+
+| Param      | Required | Notes                                                                                |
+|------------|----------|--------------------------------------------------------------------------------------|
+| `run_id`   | no       | UUID. If provided, looks up that exact run and ignores `claim_id` in the URL.        |
+| `batch_id` | no       | UUID. Narrows the `claim_id` lookup to one batch (latest run within that batch wins).|
+
+**Sample request**
+
+```bash
+curl http://localhost:8000/api/claims/25XH48861400/processing/
+curl 'http://localhost:8000/api/claims/CLM-1/processing/?batch_id=<uuid>'
+curl 'http://localhost:8000/api/claims/_/processing/?run_id=<uuid>'
+```
+
+**Sample response (`200 OK`)**
+
+```json
+{
+  "claimId": "25XH48861400",
+  "runId": "uuid",
+  "batchId": "uuid",
+  "workflowId": "uuid",
+  "claimStatus": "MET",
+  "processingTimeMin": 3.0,
+  "startedAt": "2026-05-27T04:46:12Z",
+  "finishedAt": "2026-05-27T04:49:12Z",
+  "agents": [
+    {
+      "id": "8f2c…",
+      "agentName": "Xmed Diagnosis Coverage",
+      "status": "MET",
+      "beginTime": "04:46:12 AM",
+      "endTime": "04:46:24 AM",
+      "durationSec": 12,
+      "processSummary": [
+        "Coverage requirement matched against configured decision rule."
+      ],
+      "steps": [
+        {
+          "id": "s1",
+          "name": "facets_get_line_details",
+          "status": "completed",
+          "duration": "12s",
+          "details": "Called facets_get_line_details for claim 25XH48861400"
+        }
+      ]
+    }
+  ],
+  "outerToolInvocations": [
+    {
+      "phase": "FETCH",
+      "tool": "linx_claim_search",
+      "status": "completed",
+      "durationMs": 1234
+    }
+  ],
+  "reviewStatus": null,
+  "feedback": null
+}
+```
+
+**Field notes**
+
+- `claimStatus` is derived from the run + per-node verdicts:
+  - `DEFECT` — run is `FAILED` or `FETCH_FAILED`.
+  - `NOT_MET` — run is `TERMINATED_EARLY`, or the final decision is `DENY` / `STOP`.
+  - `INCONCLUSIVE` — run is still `RUNNING`, or no rule matched on any node.
+  - `MET` — at least one node had a matching rule and the run wasn't a denial.
+- Each `agents[]` entry mirrors one Shape on the canvas. `status` is one of `MET`, `NOT_MET`, `INCONCLUSIVE` — derived from the same matched-rule logic as `claimStatus`, scoped to that node.
+- `beginTime` / `endTime` are UTC clock strings (e.g. `04:46:12 AM`) anchored on the node's tool invocations (or the run window when the node had no tool calls). `durationSec` is the gap between them.
+- `processSummary[]` is the first 10 non-empty `reasoning` strings the LLM produced on that node — fed straight into the SPA's accordion.
+- `steps[]` is one entry per `ToolInvocationRecord` on the node (Shape-bound only). `duration` is a humanised string (`12s`, `1m 04s`); `status` is `completed` / `failed` (mirrors `ok`).
+- `outerToolInvocations[]` collects every non-Shape-bound tool call — the outer `FETCH` (`linx_claim_search`) and optional `PARSE`. These also show up in `GET /runs/<run_id>/nodes/`'s `outer_tool_invocations`, but here they're flattened to the SPA's camelCase keys.
+- `reviewStatus` and `feedback` are reserved for a future human-review pipeline; both always return `null` today.
+
+**Error envelope** — every error response on this endpoint is shaped the
+same way (the SPA's relay layer keys off `source: "django"`):
+
+```json
+{
+  "error": "Human-readable message",
+  "details": {},
+  "source": "django"
+}
+```
+
+| Status | When |
+|--------|------|
+| `400` | `run_id` or `batch_id` query param isn't a UUID. `details` echoes the offending value. |
+| `404` | No `RuleExecutionRun` matches the `claim_id` (+ optional `batch_id`) — or the supplied `run_id` doesn't exist. |
+| `500` | Unhandled exception while loading the run. `details.message` carries the exception text. |
 
 ---
 
