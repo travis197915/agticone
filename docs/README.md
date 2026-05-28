@@ -149,7 +149,7 @@ The same file works in Swagger UI, Insomnia, Redoc, and most other API tooling.
 
 * **New contributor?** [ARCHITECTURE.md](ARCHITECTURE.md) → [SETUP.md](SETUP.md) → [API.md](API.md).
 * **Debugging an ingestion?** [PIPELINE.md](PIPELINE.md) → [AGENTS.md](AGENTS.md) (find the failing stage / agent) → the HTML viewer at `/api/ingest/viewer/<job_id>/`.
-* **Debugging an execution run?** [EXECUTION_ENGINE.md](EXECUTION_ENGINE.md) → query `RuleExecutionRun` / `RuleEvaluation` / `LLMCallLog` (`WHERE execution_run_id=...`) for the offending run.
+* **Debugging an execution run?** [EXECUTION_ENGINE.md](EXECUTION_ENGINE.md) → `GET /api/execute/runs/<run_id>/nodes/` for a per-canvas-node rollup, or `RuleExecutionRun` / `RuleEvaluation` / `LLMCallLog` (`WHERE execution_run_id=...`) for the raw rows.
 * **Adding a new endpoint?** [API.md](API.md) → update [openapi.yaml](openapi.yaml).
 * **Adding a new pipeline agent?** [AGENTS.md](AGENTS.md) for the convention; wire into [graph.py](../uhc-sop-ingestion/src/uhc_sop_ingestion/graph.py).
 * **Adding a new workflow shape?** It's data, not code — `INSERT INTO builder_shape_definition` (or extend [catalog_seed.py](../builder/catalog_seed.py) for an idempotent seed).

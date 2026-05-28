@@ -122,7 +122,8 @@ execution_app/
 ├── models.py                  # BatchExecutionRun, RuleExecutionRun,
 │                              # RuleEvaluation, ToolInvocationRecord
 ├── serializers.py             # DRF serializers for the GET endpoints
-├── views.py                   # RunBatchView, BatchDetailView, RunDetailView
+├── views.py                   # RunBatchView, BatchDetailView,
+│                              # RunDetailView, RunNodesView
 ├── urls.py
 └── migrations/
     ├── __init__.py
@@ -293,6 +294,198 @@ re-render a prior run.
 Returns one claim's full audit trail (all evaluations + all tool
 invocations).
 
+### 5.4 `GET /api/execute/runs/<run_id>/nodes/`
+
+Per-canvas-node rollup for one run. Walks the already-persisted
+`RuleEvaluation` + `ToolInvocationRecord` rows and groups them by the
+Shape that owned each binding — one entry per canvas node visited during
+the run, in the order the engine walked them. Derived view; no new
+tables. Useful for the SPA's "how did this claim flow through this
+workflow?" debug panel.
+
+```json
+{
+  "run_id": "uuid",
+  "workflow_id": "uuid",
+  "claim_id": "CLM-12345",
+  "status": "TERMINATED_EARLY",
+  "final_decision_type": "DENY",
+  "applied_codes": ["E51", "346"],
+  "narrative": "Halted at shape Timely filing by rule step:42:3:2 ...",
+  "nodes": [
+    {
+      "shape_id": "8f2c…",
+      "shape_label": "Eligibility",
+      "rules_evaluated": 1,
+      "rules_matched": 1,
+      "matched_decision_types": ["ALLOW"],
+      "terminated_here": false,
+      "evaluations": [ /* RuleEvaluation rows on this node, ordered */ ],
+      "tool_invocations": [ /* EVALUATE-phase tools on this node */ ]
+    },
+    {
+      "shape_id": "9b1a…",
+      "shape_label": "Timely filing",
+      "rules_evaluated": 1,
+      "rules_matched": 1,
+      "matched_decision_types": ["DENY"],
+      "terminated_here": true,
+      "evaluations": [ ... ],
+      "tool_invocations": [ ... ]
+    }
+  ],
+  "outer_tool_invocations": [
+    {"tool_name": "linx_claim_search", "phase": "FETCH",
+     "ok": true, "duration_ms": 142, "error": "",
+     "called_at": "2026-05-27T04:46:12Z"}
+  ]
+}
+```
+
+Notes:
+
+- `nodes[]` is ordered by `RuleEvaluation.order_index` (the canvas order
+  the engine actually walked).
+- `terminated_here` is `true` on the first node whose matched-rule list
+  contains a `DENY` or `STOP` outcome (only meaningful when
+  `status = TERMINATED_EARLY`).
+- `outer_tool_invocations` collects calls that don't belong to any Shape
+  — the outer-layer `FETCH` (`linx_claim_search`) and optional `PARSE`.
+- If a `NodeRuleBinding` has since been deleted, its evaluations are
+  grouped under a synthetic `shape_id` of the form `orphaned:<rule_key>`
+  with an empty `shape_label`, so history isn't lost.
+
+### 5.5 `POST /api/execute/workflows/<workflow_id>/run-batch-async/`
+
+Async sibling of §5.1. Same multipart form (`file`, optional
+`claim_id_column`, optional `sheet_name`). Stashes the uploaded `.xlsx`
+to disk, reserves a `BatchExecutionRun` row in `RUNNING`, dispatches
+the `execution_app.run_batch_async` Celery task, and returns 202
+immediately so the SPA can subscribe to the SSE stream without waiting
+for the batch to finish.
+
+```json
+{
+  "batch_id":   "uuid",
+  "status":     "RUNNING",
+  "stream_url": "/api/execute/batches/<batch_id>/events/"
+}
+```
+
+The synchronous `POST /run-batch/` (§5.1) is unchanged and remains the
+recommended path for Postman / CI / scripts.
+
+### 5.6 `GET /api/execute/batches/<batch_id>/events/`
+
+Server-Sent Events stream. Subscribes to the Redis pub/sub channel
+`batch:<batch_id>` and pipes per-Shape, per-rule, and per-claim events
+to the SPA as they happen. On connect, replays any already-finished
+claims from the DB so a reconnect picks up cleanly without the
+publisher having to retain events.
+
+Response headers:
+
+```
+Content-Type:        text/event-stream
+Cache-Control:       no-store
+X-Accel-Buffering:   no
+Connection:          keep-alive
+```
+
+**Wire grammar** (each event terminates with a blank line):
+
+```
+event: batch_start
+data: {"batch_id":"...","workflow_id":"...","total_claims":50,
+       "claim_id_column":"subscriber_id","source_filename":"...",
+       "status":"RUNNING"}
+
+event: shape_start
+data: {"batch_id":"...","run_id":"...","claim_id":"CLM-1",
+       "shape_id":"8f2c…","shape_label":"Eligibility",
+       "rules_total":1,"ts":1716941472.10}
+
+event: rule_evaluated
+data: {"batch_id":"...","run_id":"...","claim_id":"CLM-1",
+       "shape_id":"8f2c…","shape_label":"Eligibility",
+       "rule_key":"pre:42:5:0","rule_source":"PRECONDITION",
+       "matched":true,"decision_type":"ALLOW","confidence":0.92,
+       "reasoning":"Member eligible on DOS per Linx.",
+       "codes":[],
+       "llm_provider":"anthropic","llm_model":"claude-sonnet-4-5",
+       "llm_ms":1840,"llm_attempts":1,
+       "ts":1716941473.95}
+
+event: claim
+data: {"claim_id":"CLM-1","run_id":"...","status":"COMPLETED",
+       "final_decision_type":"ALLOW","applied_codes":[],
+       "narrative":"...","error_message":""}
+
+event: summary
+data: {"id":"...","status":"COMPLETED","total_claims":50,
+       "completed":50,"failed":0,"duration_ms":312000}
+
+: keepalive    ← SSE comment, sent every 15s when idle to defeat proxies
+```
+
+Terminal events: `summary` (happy path) or `error` (task-level crash).
+After either, the bridge closes the pubsub and ends the response.
+
+**SPA wiring**:
+
+```js
+const es = new EventSource(stream_url);
+es.addEventListener("batch_start",    e => initUI(JSON.parse(e.data)));
+es.addEventListener("shape_start",    e => openShapeGroup(JSON.parse(e.data)));
+es.addEventListener("rule_evaluated", e => appendRule(JSON.parse(e.data)));
+es.addEventListener("claim",          e => finalizeClaim(JSON.parse(e.data)));
+es.addEventListener("summary",        e => { closeUI(JSON.parse(e.data)); es.close(); });
+es.addEventListener("error",          e => { showError(JSON.parse(e.data)); });
+```
+
+**Event grain**: `rule_evaluated` is per *rule*, not per LLM attempt.
+Retries / cross-provider fallback inside `llm_call()` collapse into a
+single event carrying the final verdict — the `llm_attempts` field
+indicates how many physical attempts the helper made. Per-attempt cost
+telemetry still lands in `sop_ingestion.LLMCallLog` (filter by
+`execution_run_id = '<run_id>'`).
+
+**Ordering guarantee**: within one claim's run, events fire in strict
+order: `shape_start`(A) → `rule_evaluated`(A.r1) → ... →
+`shape_start`(B) → ... → `claim`. The `claim` event is published only
+after `n07_persist_respond` commits the `RuleExecutionRun` row, so a
+subscriber can immediately call `GET /runs/<run_id>/` or `.../nodes/`
+on the `run_id` it sees.
+
+**Catch-up on reconnect**:
+
+- `batch_start` is synthesised from the `BatchExecutionRun` row.
+- Already-finished claims are emitted as `claim` events from
+  `RuleExecutionRun.objects.filter(batch_id=..., finished_at__isnull=False)`.
+  Subsequent live `claim` events are deduped by `run_id`.
+- `shape_start` / `rule_evaluated` events are **not** replayed — they're
+  live-only. A reconnect mid-batch sees only verdicts for the claims it
+  missed, not their step-by-step detail. Full per-Shape history is
+  available via `GET /runs/<run_id>/nodes/` after the fact.
+- If the batch was already terminal before the SPA connected, the
+  bridge replays all claims then emits a synthetic `summary` and
+  closes.
+
+**Failure modes**:
+
+- `404` — unknown `batch_id` (delivered as a single `event: error`
+  payload, since SSE responses can't easily 404 mid-stream).
+- `event: error` mid-stream — task crashed, Redis unavailable, or
+  the bridge itself faulted. The SPA should treat this as terminal.
+- Client disconnect — handled gracefully on the server; the Celery
+  task keeps running and the SPA can reconnect.
+
+**Operational note**: the SSE endpoint pins one gunicorn sync worker
+per active stream. For production with >2 concurrent streams,
+recommend running the SSE endpoint with `gunicorn -k gthread
+--threads 64` (or split it onto its own gunicorn process). Not
+blocking for v1.
+
 ---
 
 ## 6. Local setup
@@ -351,6 +544,52 @@ Expected: 6 inner nodes + `__start__` (`validate_input`, `load_bindings`,
      `phase=EVALUATE` for every shape-level tool that ran.
    - `LLMCallLog` rows with `execution_run` set, one per LLM attempt
      (per-rule eval + the optional aggregate call).
+
+### 6.3 Streaming end-to-end smoke test
+
+The async path needs a Celery worker in addition to `runserver`:
+
+```bash
+# Terminal 1
+python manage.py runserver 0.0.0.0:8000
+
+# Terminal 2 — Celery worker that picks up execution_app.run_batch_async
+celery -A sop_backend worker -l INFO --concurrency=2
+
+# Terminal 3 — kickoff
+curl -F file=@claims.xlsx -F claim_id_column=subscriber_id \
+     -X POST http://localhost:8000/api/execute/workflows/<id>/run-batch-async/
+# → {"batch_id":"...", "status":"RUNNING",
+#    "stream_url":"/api/execute/batches/<id>/events/"}
+
+# Terminal 4 — stream
+curl -N http://localhost:8000/api/execute/batches/<batch_id>/events/
+# → event: batch_start
+#   event: shape_start
+#   event: rule_evaluated
+#   ...
+#   event: claim
+#   event: summary
+```
+
+Verify:
+
+- `batch_start` arrives within milliseconds of subscribing.
+- `shape_start` + `rule_evaluated` events stream as each Shape evaluates
+  (use a workflow with ≥2 Shapes and ≥2 rules to see meaningful
+  interleaving).
+- Per-claim `claim` event arrives after the corresponding
+  `rule_evaluated` events.
+- `summary` arrives last and the stream closes.
+- The DB rows are identical to what the synchronous path produces:
+  `BatchExecutionRun` finalised, one `RuleExecutionRun` per claim,
+  full `RuleEvaluation` / `ToolInvocationRecord` / `LLMCallLog`
+  history.
+
+**Reconnect test**: kill the streaming `curl` mid-batch, immediately
+re-open it. Expect the already-finished claims to replay as `claim`
+events on the new connection, then live events resume from wherever
+the Celery task is now.
 
 ---
 

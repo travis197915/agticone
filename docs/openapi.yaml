@@ -785,6 +785,120 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/RuleExecutionRunDetail" }
         "404": { $ref: "#/components/responses/NotFound" }
+  /api/execute/runs/{run_id}/nodes/:
+    get:
+      tags: [execute]
+      summary: Per-canvas-node rollup for one run
+      description: |
+        Walks the persisted `RuleEvaluation` + `ToolInvocationRecord` rows
+        and groups them by the Shape (canvas node) that owned each binding —
+        one entry per node the engine visited, in the order it visited them.
+        Derived view; no new tables.
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunNodesResponse" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/execute/workflows/{workflow_id}/run-batch-async/:
+    post:
+      tags: [execute]
+      summary: Kick off an async batch + return a stream URL
+      description: |
+        Async sibling of `POST /run-batch/`. Stashes the uploaded `.xlsx`,
+        reserves a `BatchExecutionRun` row in `RUNNING`, dispatches the
+        Celery task, and returns 202 immediately. The SPA subscribes to
+        the returned `stream_url` via EventSource to receive per-Shape /
+        per-rule / per-claim events as they happen.
+      parameters:
+        - name: workflow_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The `.xlsx` to process.
+                claim_id_column:
+                  type: string
+                  description: Header of the claim-id column (case-insensitive).
+                sheet_name:
+                  type: string
+                  description: Sheet to read. Defaults to the first sheet.
+      responses:
+        "202":
+          description: Batch accepted; subscribe to `stream_url` for live events.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchAsyncKickoffResponse" }
+        "400":
+          description: Missing/invalid file or upload could not be stashed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorDetail" }
+        "500":
+          description: Server-side stash failure (disk full, permissions, etc.).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorDetail" }
+
+  /api/execute/batches/{batch_id}/events/:
+    get:
+      tags: [execute]
+      summary: Server-Sent Events stream of batch progress
+      description: |
+        Subscribes to the Redis pub/sub channel `batch:<batch_id>` and pipes
+        per-Shape (`shape_start`), per-rule (`rule_evaluated`), and per-claim
+        (`claim`) events to the SPA as they happen. On connect, replays any
+        already-finished claims from the DB so a reconnect picks up cleanly.
+
+        Terminates when a `summary` (happy path) or `error` (task crash)
+        event arrives. Each event is framed in SSE format
+        (`event: <kind>\ndata: <json>\n\n`). The bridge sends a SSE comment
+        `: keepalive` every 15 seconds when the channel is idle, to defeat
+        proxy idle timeouts.
+
+        OpenAPI cannot fully model an SSE stream, so the schema below is
+        an approximation. See [docs/EXECUTION_ENGINE.md §5.6](EXECUTION_ENGINE.md)
+        for the exact wire grammar.
+      parameters:
+        - name: batch_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: |
+            SSE stream. Each chunk is one SSE-framed event whose `event:`
+            line names the event kind. See `BatchEventsStream` for the
+            possible event payloads (one of `batch_start`, `shape_start`,
+            `rule_evaluated`, `claim`, `summary`, `error`).
+          content:
+            text/event-stream:
+              schema: { $ref: "#/components/schemas/BatchEventsStream" }
+        "404":
+          description: |
+            Unknown `batch_id`. Delivered as a single `event: error` SSE
+            payload (status 404), since SSE responses can't easily 404
+            mid-stream.
+          content:
+            text/event-stream:
+              schema: { $ref: "#/components/schemas/BatchEventsStream" }
 
 # ─────────────────────────────────────────────────────────────────────────────
 components:
@@ -1590,3 +1704,196 @@ components:
         tool_invocations:
           type: array
           items: { $ref: "#/components/schemas/ToolInvocationRow" }
+
+    NodeEvaluationItem:
+      type: object
+      description: One rule evaluation inside a node's rollup entry.
+      properties:
+        order_index:   { type: integer }
+        rule_key:      { type: string }
+        rule_source:   { type: string, enum: [PRECONDITION, DECISION] }
+        condition:     { type: string }
+        action:        { type: string }
+        matched:       { type: boolean }
+        confidence:    { type: number, format: float }
+        reasoning:     { type: string }
+        decision_type: { type: string }
+        codes:
+          type: array
+          items: { type: string }
+        llm_provider:  { type: string }
+        llm_ms:        { type: integer }
+
+    NodeToolInvocationItem:
+      type: object
+      description: One tool call attributed to a specific node (EVALUATE phase) or to the outer layer (FETCH/PARSE).
+      properties:
+        tool_name:   { type: string }
+        phase:       { type: string, enum: [FETCH, PARSE, EVALUATE] }
+        ok:          { type: boolean }
+        duration_ms: { type: integer }
+        error:       { type: string }
+        called_at:   { type: string, format: date-time }
+
+    NodeRollup:
+      type: object
+      description: One canvas node visited during the run.
+      properties:
+        shape_id:               { type: string, description: "Real Shape UUID. Falls back to `orphaned:<rule_key>` when the binding has since been deleted." }
+        shape_label:            { type: string }
+        rules_evaluated:        { type: integer }
+        rules_matched:          { type: integer }
+        matched_decision_types:
+          type: array
+          items: { type: string }
+          description: Distinct decision_type values from matched rules on this node.
+        terminated_here:        { type: boolean, description: "True iff this node's matched-rule list contains DENY or STOP and status == TERMINATED_EARLY." }
+        evaluations:
+          type: array
+          items: { $ref: "#/components/schemas/NodeEvaluationItem" }
+        tool_invocations:
+          type: array
+          items: { $ref: "#/components/schemas/NodeToolInvocationItem" }
+
+    RunNodesResponse:
+      type: object
+      description: Response from GET /api/execute/runs/{run_id}/nodes/.
+      properties:
+        run_id:              { type: string, format: uuid }
+        workflow_id:         { type: string, format: uuid }
+        claim_id:            { type: string }
+        status:
+          type: string
+          enum: [RUNNING, COMPLETED, FAILED, TERMINATED_EARLY, FETCH_FAILED]
+        final_decision_type: { type: string }
+        applied_codes:
+          type: array
+          items: { type: string }
+        narrative:           { type: string }
+        nodes:
+          type: array
+          items: { $ref: "#/components/schemas/NodeRollup" }
+          description: One entry per canvas node visited, in the order the engine visited them.
+        outer_tool_invocations:
+          type: array
+          items: { $ref: "#/components/schemas/NodeToolInvocationItem" }
+          description: Tool calls not tied to any Shape — the outer-layer FETCH (linx_claim_search) and optional PARSE.
+
+    BatchAsyncKickoffResponse:
+      type: object
+      description: Response from POST /api/execute/workflows/{id}/run-batch-async/.
+      required: [batch_id, status, stream_url]
+      properties:
+        batch_id:
+          type: string
+          format: uuid
+          description: Stable id for the BatchExecutionRun that was just reserved.
+        status:
+          type: string
+          enum: [RUNNING]
+          description: Always RUNNING — the Celery task may not have started yet, but the row exists.
+        stream_url:
+          type: string
+          description: |
+            Relative path the SPA should open with `new EventSource(stream_url)`
+            to receive live events. Always
+            `/api/execute/batches/<batch_id>/events/`.
+
+    # ── SSE event-stream schemas (informational; the wire format is text/event-stream) ──
+
+    SseBatchStart:
+      type: object
+      properties:
+        batch_id:        { type: string, format: uuid }
+        workflow_id:     { type: string, format: uuid }
+        total_claims:    { type: integer }
+        claim_id_column: { type: string }
+        source_filename: { type: string }
+        status:          { type: string, enum: [RUNNING, COMPLETED, PARTIAL, FAILED] }
+
+    SseShapeStart:
+      type: object
+      properties:
+        batch_id:    { type: string, format: uuid }
+        run_id:      { type: string, format: uuid }
+        claim_id:    { type: string }
+        shape_id:    { type: string }
+        shape_label: { type: string }
+        rules_total: { type: integer }
+        ts:          { type: number, description: "Unix epoch seconds, float." }
+
+    SseRuleEvaluated:
+      type: object
+      properties:
+        batch_id:      { type: string, format: uuid }
+        run_id:        { type: string, format: uuid }
+        claim_id:      { type: string }
+        shape_id:      { type: string }
+        shape_label:   { type: string }
+        rule_key:      { type: string }
+        rule_source:   { type: string, enum: [PRECONDITION, DECISION] }
+        matched:       { type: boolean }
+        decision_type: { type: string }
+        confidence:    { type: number, format: float }
+        reasoning:     { type: string }
+        codes:
+          type: array
+          items: { type: string }
+        llm_provider:  { type: string }
+        llm_model:     { type: string }
+        llm_ms:        { type: integer }
+        llm_attempts:
+          type: integer
+          description: How many physical LLM attempts the helper made for this rule (retries + cross-provider fallback collapse into one event).
+        ts:            { type: number }
+
+    SseClaim:
+      type: object
+      properties:
+        claim_id:            { type: string }
+        run_id:              { type: string, format: uuid }
+        status:
+          type: string
+          enum: [RUNNING, COMPLETED, FAILED, TERMINATED_EARLY, FETCH_FAILED]
+        final_decision_type: { type: string }
+        applied_codes:
+          type: array
+          items: { type: string }
+        narrative:     { type: string }
+        error_message: { type: string }
+
+    SseSummary:
+      type: object
+      properties:
+        id:            { type: string, format: uuid }
+        status:        { type: string, enum: [COMPLETED, PARTIAL, FAILED] }
+        total_claims:  { type: integer }
+        completed:     { type: integer }
+        failed:        { type: integer }
+        duration_ms:   { type: integer }
+        error_message: { type: string }
+
+    SseError:
+      type: object
+      properties:
+        batch_id: { type: string, format: uuid }
+        message:  { type: string }
+
+    BatchEventsStream:
+      description: |
+        Approximation of the SSE event stream. Each chunk in the response
+        is one SSE event of the form
+
+            event: <kind>
+            data: <json>
+
+        followed by a blank line. `<kind>` is one of `batch_start`,
+        `shape_start`, `rule_evaluated`, `claim`, `summary`, or `error`,
+        with the payload shapes referenced below.
+      oneOf:
+        - $ref: "#/components/schemas/SseBatchStart"
+        - $ref: "#/components/schemas/SseShapeStart"
+        - $ref: "#/components/schemas/SseRuleEvaluated"
+        - $ref: "#/components/schemas/SseClaim"
+        - $ref: "#/components/schemas/SseSummary"
+        - $ref: "#/components/schemas/SseError"

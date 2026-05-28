@@ -1,10 +1,22 @@
-"""Outer batch runner: xlsx → per-claim fetch + parse → inner pipeline."""
+"""Outer batch runner: xlsx → per-claim fetch + parse → inner pipeline.
+
+Two entry points:
+
+* :meth:`BatchRunner.run_xlsx` — synchronous; runs the whole batch and
+  returns the aggregated dict.  Used by the existing
+  ``POST /api/execute/workflows/<id>/run-batch/`` view.
+* :meth:`BatchRunner.iter_xlsx` — generator; yields one event dict per
+  claim (plus ``batch_start`` and ``summary`` envelopes).  Used by the
+  Celery task that backs the streaming endpoint, which republishes each
+  event to Redis pub/sub.  ``run_xlsx`` is now implemented as a thin
+  collector around ``iter_xlsx`` so both paths exercise the same code.
+"""
 from __future__ import annotations
 
 import logging
 import time
 import uuid
-from typing import Any
+from typing import Any, Iterator
 
 from django.utils import timezone
 
@@ -42,62 +54,123 @@ class BatchRunner:
     def __init__(self):
         self._pipeline = RuleEnginePipeline()
 
-    def run_xlsx(self, *, workflow_id: str, xlsx_bytes: bytes,
-                 filename: str = "claims.xlsx",
-                 claim_id_column: str | None = None,
-                 sheet_name: str | None = None) -> dict[str, Any]:
+    # ── Streaming entrypoint ────────────────────────────────────────────────
+
+    def iter_xlsx(
+        self, *, workflow_id: str, xlsx_bytes: bytes,
+        filename: str = "claims.xlsx",
+        claim_id_column: str | None = None,
+        sheet_name: str | None = None,
+        batch_id: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield batch_start → claim* → summary events.
+
+        ``batch_id`` may be supplied when the caller (e.g. the kickoff view)
+        has already created the ``BatchExecutionRun`` row — typical for the
+        async path where the SPA needs the id in the 202 response.  When
+        omitted, this method creates the row itself (sync path).
+
+        Yielded shapes::
+
+            {"kind": "batch_start", "batch_id": "...", "total_claims": N,
+             "workflow_id": "...", "claim_id_column": "...",
+             "source_filename": "..."}
+            {"kind": "claim", "result": <per-claim response dict>}
+            ...
+            {"kind": "summary", "batch": {
+                "id": "...", "status": "COMPLETED|PARTIAL|FAILED",
+                "total_claims": N, "completed": X, "failed": Y,
+                "duration_ms": ...}}
+
+        On a fatal pre-run error (xlsx parse failure, no rule bindings)
+        yields a single ``summary`` event with ``status="FAILED"`` and
+        ``error_message`` populated, and returns.
+        """
         from execution_app.models import BatchExecutionRun
 
-        batch_id = str(uuid.uuid4())
+        batch_id = batch_id or str(uuid.uuid4())
         t0 = time.time()
+
+        # ── 1. Parse the workbook ──────────────────────────────────────────
         try:
             claim_ids, resolved_col = extract_claim_ids(
-                xlsx_bytes, claim_id_column=claim_id_column, sheet_name=sheet_name)
+                xlsx_bytes, claim_id_column=claim_id_column,
+                sheet_name=sheet_name)
         except XlsxParseError as exc:
-            return {
-                "batch_id": batch_id, "status": "FAILED",
-                "error_message": str(exc),
-                "total_claims": 0, "completed": 0, "failed": 0, "results": [],
+            yield {
+                "kind": "summary",
+                "batch": {
+                    "id": batch_id, "status": "FAILED",
+                    "total_claims": 0, "completed": 0, "failed": 0,
+                    "duration_ms": int((time.time() - t0) * 1000),
+                    "error_message": str(exc),
+                },
             }
+            return
 
-        # Pre-load bindings once so we can decide whether to run the parser
-        # tool for every claim. (The inner pipeline re-loads in its own node;
-        # that's intentional — we keep the outer-layer concern small.)
+        # ── 2. Load workflow bindings (lets us know if the parser tool
+        #      is bound, so we can run it once per claim in the outer layer).
         try:
             loaded = load_workflow_bindings(workflow_id)
         except Exception as exc:
-            return {
-                "batch_id": batch_id, "status": "FAILED",
-                "error_message": f"load_workflow_bindings: {exc}",
-                "total_claims": len(claim_ids), "completed": 0, "failed": 0,
-                "results": [],
+            yield {
+                "kind": "summary",
+                "batch": {
+                    "id": batch_id, "status": "FAILED",
+                    "total_claims": len(claim_ids), "completed": 0, "failed": 0,
+                    "duration_ms": int((time.time() - t0) * 1000),
+                    "error_message": f"load_workflow_bindings: {exc}",
+                },
             }
+            return
         use_parser = workflow_uses_parser(loaded["all_tool_bindings"])
 
-        batch = BatchExecutionRun.objects.create(
+        # ── 3. Reserve / fetch the BatchExecutionRun row ──────────────────
+        # If the caller pre-created it (async path), update it with the
+        # parsed metadata; otherwise create it now.
+        batch, created = BatchExecutionRun.objects.get_or_create(
             id=batch_id,
-            workflow_id=str(workflow_id),
-            source_filename=filename,
-            claim_id_column=resolved_col,
-            total_claims=len(claim_ids),
-            status="RUNNING",
+            defaults=dict(
+                workflow_id=str(workflow_id),
+                source_filename=filename,
+                claim_id_column=resolved_col,
+                total_claims=len(claim_ids),
+                status="RUNNING",
+            ),
         )
+        if not created:
+            # Pre-created: patch in the values the kickoff view couldn't
+            # know until we actually parsed the workbook.
+            BatchExecutionRun.objects.filter(id=batch_id).update(
+                source_filename=filename,
+                claim_id_column=resolved_col,
+                total_claims=len(claim_ids),
+                status="RUNNING",
+            )
 
-        results: list[dict[str, Any]] = []
+        # ── 4. batch_start envelope ────────────────────────────────────────
+        yield {
+            "kind": "batch_start",
+            "batch_id": batch_id,
+            "workflow_id": str(workflow_id),
+            "total_claims": len(claim_ids),
+            "claim_id_column": resolved_col,
+            "source_filename": filename,
+        }
+
+        # ── 5. Per-claim loop ──────────────────────────────────────────────
         completed = 0
         failed = 0
         for cid in claim_ids:
             res = self._run_one(workflow_id=str(workflow_id), claim_id=cid,
                                 batch_id=batch_id, use_parser=use_parser)
-            results.append(res)
-            # A claim counts as "completed" if the engine reached a verdict
-            # for it — including the early-halt path. FETCH_FAILED, FAILED,
-            # and RUNNING (shouldn't happen post-pipeline) count as failures.
             if res["status"] in {"COMPLETED", "TERMINATED_EARLY"}:
                 completed += 1
             else:
                 failed += 1
+            yield {"kind": "claim", "result": res}
 
+        # ── 6. Finalize the BatchExecutionRun row + emit summary ──────────
         if failed == 0:
             batch_status = "COMPLETED"
         elif completed == 0:
@@ -105,21 +178,77 @@ class BatchRunner:
         else:
             batch_status = "PARTIAL"
 
-        batch.completed = completed
-        batch.failed = failed
-        batch.status = batch_status
-        batch.finished_at = timezone.now()
-        batch.save(update_fields=["completed", "failed", "status", "finished_at"])
+        BatchExecutionRun.objects.filter(id=batch_id).update(
+            completed=completed,
+            failed=failed,
+            status=batch_status,
+            finished_at=timezone.now(),
+        )
+
+        yield {
+            "kind": "summary",
+            "batch": {
+                "id": batch_id,
+                "status": batch_status,
+                "total_claims": len(claim_ids),
+                "completed": completed,
+                "failed": failed,
+                "duration_ms": int((time.time() - t0) * 1000),
+            },
+        }
+
+    # ── Synchronous entrypoint ──────────────────────────────────────────────
+
+    def run_xlsx(self, *, workflow_id: str, xlsx_bytes: bytes,
+                 filename: str = "claims.xlsx",
+                 claim_id_column: str | None = None,
+                 sheet_name: str | None = None,
+                 batch_id: str | None = None) -> dict[str, Any]:
+        """Collect the generator into the legacy aggregate-dict response.
+
+        Same return shape as before. Used by the synchronous
+        ``RunBatchView``.
+        """
+        results: list[dict[str, Any]] = []
+        summary: dict[str, Any] | None = None
+        bid = batch_id  # captured for the fallback summary below
+        for event in self.iter_xlsx(
+            workflow_id=workflow_id, xlsx_bytes=xlsx_bytes,
+            filename=filename, claim_id_column=claim_id_column,
+            sheet_name=sheet_name, batch_id=batch_id,
+        ):
+            kind = event.get("kind")
+            if kind == "batch_start":
+                bid = event["batch_id"]
+            elif kind == "claim":
+                results.append(event["result"])
+            elif kind == "summary":
+                summary = event["batch"]
+
+        if summary is None:
+            # iter_xlsx always yields a summary, even on fatal error,
+            # but guard defensively.
+            return {
+                "batch_id": bid or "",
+                "status": "FAILED",
+                "total_claims": 0, "completed": 0, "failed": 0,
+                "duration_ms": 0,
+                "error_message": "no summary event from iter_xlsx",
+                "results": results,
+            }
 
         return {
-            "batch_id": batch_id,
-            "status": batch_status,
-            "total_claims": len(claim_ids),
-            "completed": completed,
-            "failed": failed,
-            "duration_ms": int((time.time() - t0) * 1000),
+            "batch_id": summary["id"],
+            "status": summary["status"],
+            "total_claims": summary["total_claims"],
+            "completed": summary["completed"],
+            "failed": summary["failed"],
+            "duration_ms": summary["duration_ms"],
+            "error_message": summary.get("error_message", ""),
             "results": results,
         }
+
+    # ── Per-claim worker (unchanged) ────────────────────────────────────────
 
     def _run_one(self, *, workflow_id: str, claim_id: str,
                  batch_id: str, use_parser: bool) -> dict[str, Any]:

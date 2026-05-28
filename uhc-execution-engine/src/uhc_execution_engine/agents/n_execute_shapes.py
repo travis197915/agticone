@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 
 from ..config import get_config
+from ..llm import publish_event
 from ..state import ExecutionState
 from ._eval_common import _tool_context_for_rule, evaluate_one_rule
 
@@ -41,6 +42,8 @@ def execute_shapes(state: ExecutionState) -> dict:
     terminated_at_shape_id = ""
     shapes_evaluated = 0
 
+    claim_id = state.get("claim_id", "")
+
     for shape in shapes:
         shapes_evaluated += 1
         shape_id = shape.get("shape_id", "")
@@ -49,6 +52,15 @@ def execute_shapes(state: ExecutionState) -> dict:
         shape_t0 = time.time()
         matched_count = 0
         halt_after_shape = False
+
+        # SSE side channel: announce the Shape so the SPA can open a
+        # group and render a progress bar. No-op when no batch is in scope.
+        publish_event("shape_start", {
+            "claim_id": claim_id,
+            "shape_id": shape_id,
+            "shape_label": shape_label,
+            "rules_total": len(rules),
+        })
 
         for rule in rules:
             ctx, binding_ids = _tool_context_for_rule(
@@ -75,6 +87,25 @@ def execute_shapes(state: ExecutionState) -> dict:
                 "llm_provider": meta.get("provider", ""),
                 "llm_ms": int(meta.get("ms") or 0),
             })
+
+            # SSE side channel: one event per rule, retries collapsed.
+            publish_event("rule_evaluated", {
+                "claim_id": claim_id,
+                "shape_id": shape_id,
+                "shape_label": shape_label,
+                "rule_key": rule["key"],
+                "rule_source": rule.get("source", "decision"),
+                "matched": matched,
+                "decision_type": rule.get("decision_type", ""),
+                "confidence": float(verdict.get("confidence") or 0.0),
+                "reasoning": str(verdict.get("reasoning") or ""),
+                "codes": list(rule.get("codes") or []),
+                "llm_provider": meta.get("provider", ""),
+                "llm_model": meta.get("model", ""),
+                "llm_ms": int(meta.get("ms") or 0),
+                "llm_attempts": int(meta.get("attempts") or 1),
+            })
+
             order_index += 1
             if matched:
                 matched_count += 1

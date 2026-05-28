@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
 import time
 from contextlib import contextmanager
 from typing import Any
@@ -24,10 +25,24 @@ from .config import EngineConfig
 logger = logging.getLogger(__name__)
 
 
-# ── Per-claim context (set by RuleEnginePipeline.run) ────────────────────────
+# ── Per-claim / per-batch context vars ───────────────────────────────────────
+#
+# ``execution_run_context`` is set by ``RuleEnginePipeline.run(...)`` once per
+# claim so that the deeply nested LLM calls + the per-Shape evaluator can
+# stamp the right ``RuleExecutionRun`` id on telemetry without threading it
+# through every signature.
+#
+# ``batch_context`` is set by the streaming Celery task (``execution_app.tasks
+# .run_batch_async``) for the lifetime of one batch.  When set, the engine
+# publishes ``shape_start`` and ``rule_evaluated`` events to the Redis
+# pub/sub channel ``batch:<batch_id>``.  When unset (single-claim runs,
+# ingestion-pipeline reuse, unit tests) the publish is a no-op.
 
 _current_execution_run_id: contextvars.ContextVar[str | None] = \
     contextvars.ContextVar("uhc_execution_engine.current_run_id", default=None)
+
+_current_batch_id: contextvars.ContextVar[str | None] = \
+    contextvars.ContextVar("uhc_execution_engine.current_batch_id", default=None)
 
 
 @contextmanager
@@ -38,6 +53,69 @@ def execution_run_context(run_id: str | None):
         yield
     finally:
         _current_execution_run_id.reset(token)
+
+
+@contextmanager
+def batch_context(batch_id: str | None):
+    """Route ``publish_event`` calls during this block to ``batch:<batch_id>``."""
+    token = _current_batch_id.set(batch_id)
+    try:
+        yield
+    finally:
+        _current_batch_id.reset(token)
+
+
+# ── SSE side-channel publisher ───────────────────────────────────────────────
+
+_redis_client: Any = None  # lazy module-scope cache
+
+
+def _get_redis():
+    """Return a cached redis.Redis client built from ``REDIS_URL``.
+
+    Imported lazily so unit tests that never publish don't have to install
+    the redis package or set REDIS_URL.
+    """
+    global _redis_client
+    if _redis_client is None:
+        import redis as _r  # noqa: WPS433 — lazy import is intentional
+        url = os.environ.get("REDIS_URL")
+        if not url:
+            raise RuntimeError(
+                "REDIS_URL env var not set; cannot publish SSE events. "
+                "Set REDIS_URL or avoid calling publish_event when there is "
+                "no batch context in scope."
+            )
+        _redis_client = _r.Redis.from_url(url)
+    return _redis_client
+
+
+def publish_event(kind: str, payload: dict[str, Any]) -> None:
+    """Publish one SSE event to ``batch:<batch_id>`` on Redis.
+
+    Short-circuits when no batch is in scope (single-claim runs, ingestion
+    pipeline LLM calls, unit tests).  Best-effort — Redis failures are
+    logged and swallowed.  The DB is the source of truth; the stream is a
+    side channel and must never break the engine.
+
+    ``payload`` is merged into a standard envelope::
+
+        {"kind", "batch_id", "run_id", "ts", **payload}
+    """
+    batch_id = _current_batch_id.get()
+    if not batch_id:
+        return
+    envelope = {
+        "kind": kind,
+        "batch_id": batch_id,
+        "run_id": _current_execution_run_id.get() or "",
+        "ts": time.time(),
+        **payload,
+    }
+    try:
+        _get_redis().publish(f"batch:{batch_id}", json.dumps(envelope, default=str))
+    except Exception as exc:  # pragma: no cover — telemetry must not abort
+        logger.warning("publish_event %s failed: %s", kind, exc)
 
 
 # ── Provider helpers ─────────────────────────────────────────────────────────
@@ -170,10 +248,11 @@ def llm_call(
     elif provider == "openai" and expected_type is list:
         prompt = prompt + '\n\nWrap the array in a JSON object: {"items": [...]}'
 
-    meta: dict[str, Any] = {"provider": "", "model": "", "ms": 0}
+    meta: dict[str, Any] = {"provider": "", "model": "", "ms": 0, "attempts": 0}
 
     def _attempt(make_fn, prov, model, used_prompt, label):
         t0 = time.time()
+        meta["attempts"] += 1
         try:
             llm = make_fn(cfg, max_tokens)
             resp = llm.invoke([HumanMessage(content=used_prompt)])

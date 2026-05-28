@@ -57,7 +57,7 @@ The Django project. Four installed apps:
 | `builder`        | `/api/builder/`      | Workflow CRUD, server-driven palette / nav / dashboard, atomic canvas save. |
 | `sop_ingestion`  | `/api/ingest/`       | Ingestion job rows, REST trigger, real-time stage/LLM logs, structured-SOP read APIs, HTML viewer. |
 | `agent_tools`    | `/api/agent-tools/`  | DB-backed LangChain tool registry, per-Shape `NodeRuleBinding` / `NodeToolBinding` tables, per-tool invoke surface, mock upstream services. |
-| `execution_app`  | `/api/execute/`      | Execution-engine REST surface (batch upload, batch detail, single-run audit) and persistence for `BatchExecutionRun` / `RuleExecutionRun` / `RuleEvaluation` / `ToolInvocationRecord`. |
+| `execution_app`  | `/api/execute/`      | Execution-engine REST surface (batch upload, batch detail, single-run audit, per-canvas-node rollup) and persistence for `BatchExecutionRun` / `RuleExecutionRun` / `RuleEvaluation` / `ToolInvocationRecord`. |
 
 Settings live in [sop_backend/settings.py](../sop_backend/settings.py). Routing root in [sop_backend/urls.py](../sop_backend/urls.py).
 
