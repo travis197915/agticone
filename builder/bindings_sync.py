@@ -77,9 +77,17 @@ def _resolve_tool(payload: dict[str, Any]):
 def extract_bindings_from_properties(shape) -> None:
     """Project ``shape.properties`` into NodeRuleBinding + NodeToolBinding rows.
 
-    Wipe-and-reinsert per shape (the canvas PUT is already a full
-    snapshot). Safe to call when agent_tools is unavailable — in that
-    case we simply leave the JSON blobs alone.
+    Uses upsert (update_or_create) for NodeRuleBinding so that existing rows
+    keep their UUIDs across saves.  This prevents an IntegrityError from
+    ``execution_rule_evaluation``, which holds a FK to ``node_rule_binding``
+    and cannot be satisfied by a wipe-and-reinsert strategy.
+
+    Stale bindings (rules removed from the shape) are deleted individually;
+    rows that are still referenced by execution history are left in place with
+    a warning rather than aborting the entire save.
+
+    Safe to call when agent_tools is unavailable — in that case we simply
+    leave the JSON blobs alone.
     """
     Tool, NodeRuleBinding, NodeToolBinding = _safe_import_agent_tools()
     if NodeRuleBinding is None or NodeToolBinding is None:
@@ -126,8 +134,10 @@ def extract_bindings_from_properties(shape) -> None:
             logger.warning("agent_tools: could not persist manual scope override "
                            "keys (shape=%s): %s", shape.id, exc)
 
-    NodeRuleBinding.objects.filter(shape=shape).delete()
+    # ── Rule bindings: upsert to preserve IDs referenced by execution history ─
     rule_binding_by_key: dict[str, Any] = {}
+    incoming_rule_keys: set[str] = set()
+
     for idx, rule in enumerate(raw_rules):
         if not isinstance(rule, dict):
             continue
@@ -139,24 +149,47 @@ def extract_bindings_from_properties(shape) -> None:
         if sop is None:
             continue
         try:
-            row = NodeRuleBinding.objects.create(
-                shape=shape, sop=sop, rule_key=rule_key,
-                condition=rule.get("condition", "") or "",
-                action=rule.get("action", "") or "",
-                references_json=list(rule.get("references") or []),
-                excluded_by_json=list(rule.get("excluded_by") or []),
-                html_reference_json=rule.get("html_reference") or {},
-                ordering=idx,
+            row, _ = NodeRuleBinding.objects.update_or_create(
+                shape=shape,
+                rule_key=rule_key,
+                defaults=dict(
+                    sop=sop,
+                    condition=rule.get("condition", "") or "",
+                    action=rule.get("action", "") or "",
+                    references_json=list(rule.get("references") or []),
+                    excluded_by_json=list(rule.get("excluded_by") or []),
+                    html_reference_json=rule.get("html_reference") or {},
+                    ordering=idx,
+                ),
             )
         except Exception as exc:
             logger.warning(
-                "agent_tools: could not persist NodeRuleBinding "
+                "agent_tools: could not upsert NodeRuleBinding "
                 "(shape=%s, rule_key=%s): %s",
                 shape.id, rule_key, exc,
             )
             continue
+        incoming_rule_keys.add(rule_key)
         rule_binding_by_key[rule_key] = row
 
+    # Delete stale bindings (rules removed from this shape).  Delete
+    # individually so a FK violation on execution_rule_evaluation is caught
+    # per-row — a referenced binding is left in place rather than blocking the
+    # entire canvas save.
+    stale_qs = NodeRuleBinding.objects.filter(shape=shape).exclude(
+        rule_key__in=incoming_rule_keys
+    )
+    for stale in stale_qs:
+        try:
+            stale.delete()
+        except Exception as exc:
+            logger.warning(
+                "agent_tools: could not delete stale NodeRuleBinding "
+                "(id=%s, rule_key=%s) — still referenced by execution history: %s",
+                stale.id, stale.rule_key, exc,
+            )
+
+    # ── Tool bindings: safe to wipe-and-reinsert (FK uses SET_NULL) ───────────
     NodeToolBinding.objects.filter(shape=shape).delete()
     for idx, tool_call in enumerate(raw_tools):
         if not isinstance(tool_call, dict):
