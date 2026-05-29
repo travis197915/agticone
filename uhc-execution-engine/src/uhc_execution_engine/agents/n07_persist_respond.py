@@ -60,6 +60,7 @@ def _persist(state: ExecutionState) -> None:
                 confidence=ev["confidence"],
                 reasoning=ev["reasoning"],
                 decision_type=ev["decision_type"],
+                verdict=ev["decision_type"] if ev["matched"] else "",
                 codes=ev["codes"],
                 tool_results_used=ev["tool_results_used"],
                 llm_provider=ev["llm_provider"],

@@ -101,6 +101,7 @@ class RuleEvaluation(models.Model):
     confidence = models.FloatField(default=0.0)
     reasoning = models.TextField(blank=True, default="")
     decision_type = models.CharField(max_length=32, blank=True, default="")
+    verdict = models.CharField(max_length=32, blank=True, default="")
     codes = models.JSONField(default=list, blank=True)
     tool_results_used = models.JSONField(default=list, blank=True)
     llm_provider = models.CharField(max_length=32, blank=True, default="")

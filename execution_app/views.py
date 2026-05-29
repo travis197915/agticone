@@ -528,12 +528,34 @@ class ClaimProcessingView(APIView):
             )
 
         nodes, outer_tools = _build_node_rollup(run)
+
+        # LLM-call telemetry — sourced from sop_ingestion.LLMCallLog where
+        # _log_llm_call inserts one row per attempt, stamped with
+        # execution_run_id by the ContextVar set in RuleEnginePipeline.run.
+        # Survives a RuleEvaluation persist failure because LLMCallLog
+        # rows are written inline by the LLM helper, not inside n07's
+        # atomic block.
+        from sop_ingestion.models import LLMCallLog
+        llm_calls = list(
+            LLMCallLog.objects.filter(execution_run_id=run.id).order_by("id")
+        )
+
         payload = {
             "claimId": run.claim_id,
             "runId": str(run.id),
             "batchId": str(run.batch_id) if run.batch_id else None,
             "workflowId": str(run.workflow_id),
             "claimStatus": _claim_status(run, nodes),
+            # Engine-level run state — useful when claimStatus=DEFECT and the
+            # SPA needs to render why. `runStatus` is the raw RuleExecutionRun
+            # state (FAILED / FETCH_FAILED / TERMINATED_EARLY / COMPLETED /
+            # RUNNING); `errorMessage` carries the n07 recovery-handler
+            # message when a persist or fetch step crashed, otherwise empty.
+            "runStatus": run.status,
+            "errorMessage": run.error_message or "",
+            "finalDecisionType": run.final_decision_type or "",
+            "appliedCodes": list(run.applied_codes or []),
+            "narrative": run.narrative or "",
             "processingTimeMin": _processing_time_min(run),
             "startedAt": _iso_utc(run.started_at),
             "finishedAt": _iso_utc(run.finished_at),
@@ -546,6 +568,22 @@ class ClaimProcessingView(APIView):
                     "durationMs": inv["duration_ms"],
                 }
                 for inv in outer_tools
+            ],
+            "llmCalls": [
+                {
+                    "stage":            log.stage,
+                    "agentName":        log.agent_name,
+                    "provider":         log.llm_provider,
+                    "model":            log.llm_model,
+                    "promptTokens":     log.prompt_tokens,
+                    "completionTokens": log.completion_tokens,
+                    "totalTokens":      log.total_tokens,
+                    "durationMs":       log.duration_ms,
+                    "success":          log.success,
+                    "error":            log.error_message,
+                    "calledAt":         _iso_utc(log.called_at),
+                }
+                for log in llm_calls
             ],
             "reviewStatus": None,
             "feedback": None,
