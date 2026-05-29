@@ -161,13 +161,24 @@ class BatchRunner:
         # ── 5. Per-claim loop ──────────────────────────────────────────────
         completed = 0
         failed = 0
+        logger.info("batch=%s starting per-claim loop over %d claim(s)",
+                    batch_id, len(claim_ids))
         for cid in claim_ids:
             res = self._run_one(workflow_id=str(workflow_id), claim_id=cid,
                                 batch_id=batch_id, use_parser=use_parser)
-            if res["status"] in {"COMPLETED", "TERMINATED_EARLY"}:
+            counted_as = ("completed" if res["status"]
+                          in {"COMPLETED", "TERMINATED_EARLY"} else "failed")
+            if counted_as == "completed":
                 completed += 1
             else:
                 failed += 1
+            logger.info(
+                "batch=%s claim=%s run=%s status=%s decision=%s counted_as=%s",
+                batch_id, cid, res.get("run_id") or "-",
+                res.get("status") or "-",
+                res.get("final_decision_type") or "-",
+                counted_as,
+            )
             yield {"kind": "claim", "result": res}
 
         # ── 6. Finalize the BatchExecutionRun row + emit summary ──────────

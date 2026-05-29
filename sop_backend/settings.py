@@ -163,15 +163,66 @@ CELERY_RESULT_BACKEND  = REDIS_URL
 CELERY_ACCEPT_CONTENT  = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 
-# Ingestion: thin master on job_queue; LangGraph runs in child OS processes.
+# Ingestion + execution: thin masters on job_queue; LangGraph runs in
+# child OS processes (see sop_ingestion/subprocess_manager.py and
+# execution_app/subprocess_manager.py).
 CELERY_TASK_ROUTES = {
-    "sop_ingestion.run_pipeline": {"queue": "job_queue"},
+    "sop_ingestion.run_pipeline":    {"queue": "job_queue"},
+    "execution_app.run_batch_async": {"queue": "job_queue"},
 }
 # Max parallel ingestion subprocesses (master waits for a slot before Popen).
 MAX_PIPELINE_SUBPROCESSES = int(os.environ.get("MAX_PIPELINE_SUBPROCESSES", "10"))
+# Max parallel execution-batch subprocesses (same shape as the ingestion knob).
+MAX_EXECUTION_SUBPROCESSES = int(os.environ.get("MAX_EXECUTION_SUBPROCESSES", "5"))
 
 # ── Pipeline defaults (picked up by PipelineConfig.from_env()) ────────────────
 SOP_MAX_DEPTH    = int(os.environ.get("MAX_DEPTH",    "4"))
 SOP_MAX_DOCS     = int(os.environ.get("MAX_DOCS",     "200"))
 SOP_LLM_PROVIDER = os.environ.get("LLM_PROVIDER",    "anthropic")
 SOP_LLM_MODEL    = os.environ.get("LLM_MODEL",        "claude-3-5-sonnet-20241022")
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Console + rotating file for the execution engine and execution_app so
+# silent-failure modes (e.g. "no shapes → default ALLOW") leave a
+# breadcrumb in the worker log.
+_LOG_DIR = BASE_DIR / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "engine": {
+            "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class":     "logging.StreamHandler",
+            "formatter": "engine",
+        },
+        "engine_file": {
+            "class":       "logging.handlers.RotatingFileHandler",
+            "filename":    str(_LOG_DIR / "execution_engine.log"),
+            "maxBytes":    10 * 1024 * 1024,   # 10 MB
+            "backupCount": 5,
+            "formatter":   "engine",
+        },
+    },
+    "loggers": {
+        # Execution engine package + the Django app that drives it. INFO so
+        # node-by-node breadcrumbs are visible; raise to WARNING in prod if
+        # the volume becomes an issue.
+        "uhc_execution_engine": {
+            "handlers":  ["console", "engine_file"],
+            "level":     "INFO",
+            "propagate": False,
+        },
+        "execution_app": {
+            "handlers":  ["console", "engine_file"],
+            "level":     "INFO",
+            "propagate": False,
+        },
+    },
+}

@@ -162,6 +162,22 @@ def persist_and_respond(state: ExecutionState) -> dict:
                 "stages": stages,
                 "response": _build_response(synthetic)}
 
+    # Post-persist breadcrumb: this is the canonical "what was actually
+    # written to the DB" line. Useful for grepping the log by run_id when
+    # the API response looks wrong.
+    final_status = state.get("status") or "COMPLETED"
+    if final_status == "RUNNING":
+        final_status = "COMPLETED"
+    logger.info(
+        "persist_and_respond run=%s claim=%s status=%s decision=%s "
+        "evals=%d tools=%d codes=%s",
+        state.get("run_id"), state.get("claim_id") or "-", final_status,
+        state.get("final_decision_type") or "-",
+        len(state.get("rule_results") or []),
+        len(state.get("tool_invocations") or []),
+        list(state.get("applied_codes") or []),
+    )
+
     stages.append({"node": "persist_and_respond", "status": "OK",
                    "ms": int((time.time() - t0) * 1000)})
     updated = dict(state)

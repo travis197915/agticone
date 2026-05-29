@@ -40,6 +40,8 @@ tags:
     description: Server-rendered HTML viewer (debug)
   - name: execute
     description: Per-Shape execution engine — batch claim adjudication.
+  - name: claims
+    description: Per-claim aggregated views over the execution engine's persisted runs.
 
 security:
   - bearerAuth: []
@@ -899,6 +901,50 @@ paths:
           content:
             text/event-stream:
               schema: { $ref: "#/components/schemas/BatchEventsStream" }
+
+  # ── CLAIMS · PROCESSING SNAPSHOT ────────────────────────────────────────
+  /api/claims/{claim_id}/processing/:
+    get:
+      tags: [claims]
+      summary: Aggregated processing snapshot for one claim
+      description: |
+        Returns the per-agent rollup, outer tool calls, and overall
+        status for a claim's most recent execution run. Walks the
+        already-persisted `RuleEvaluation` + `ToolInvocationRecord`
+        rows for the run and groups them by the Shape that owned each
+        binding — no new tables, purely a derived view shaped for the
+        claim-processing UI.
+
+        Defaults to the latest run for `claim_id`. Pin a specific run
+        with `run_id`, or scope the latest-run lookup to a batch with
+        `batch_id`. **No auth** — currently `AllowAny`.
+      security: []
+      parameters:
+        - name: claim_id
+          in: path
+          required: true
+          schema: { type: string }
+          description: The claim identifier as stored on the `RuleExecutionRun` row.
+        - name: run_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+          description: Pin to an exact run. When set, `claim_id` is informational and the row is looked up by run id.
+        - name: batch_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+          description: Restrict the latest-run lookup to one batch. Ignored when `run_id` is set.
+      responses:
+        "200":
+          description: Aggregated claim processing snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ClaimProcessingSnapshot" }
+        "400":
+          description: Malformed `run_id` or `batch_id` query parameter.
+        "404":
+          description: No run found for the given claim (or `run_id` does not exist).
 
 # ─────────────────────────────────────────────────────────────────────────────
 components:
@@ -1778,6 +1824,89 @@ components:
           type: array
           items: { $ref: "#/components/schemas/NodeToolInvocationItem" }
           description: Tool calls not tied to any Shape — the outer-layer FETCH (linx_claim_search) and optional PARSE.
+
+    ClaimProcessingAgentStep:
+      type: object
+      description: One tool invocation rendered as a step under an agent.
+      properties:
+        id:       { type: string, description: "Sequential step id within the agent (`s1`, `s2`, …)." }
+        name:     { type: string, description: "Tool name (matches `ToolInvocationRecord.tool_name`)." }
+        status:
+          type: string
+          enum: [completed, failed]
+        duration: { type: string, description: "Pre-formatted duration string (e.g. `1.2s`, `850ms`)." }
+        details:  { type: string, description: "Human-readable summary; includes the error message when `status == failed`." }
+
+    ClaimProcessingAgent:
+      type: object
+      description: |
+        One canvas node visited during the run, rendered for the claim-processing UI.
+        Status is derived from matched evaluations:
+        `NOT_MET` if a matched rule is DENY/STOP (or the run terminated here),
+        `MET` if any rule matched, otherwise `INCONCLUSIVE`.
+      properties:
+        id:          { type: string, description: "Shape UUID, or `orphaned:<rule_key>` when the binding was deleted." }
+        agentName:   { type: string, description: "Shape label, falling back to `id`." }
+        status:
+          type: string
+          enum: [MET, NOT_MET, INCONCLUSIVE]
+        beginTime:   { type: string, description: "Wall-clock string for the first tool call (or run start if no tools ran)." }
+        endTime:     { type: string, description: "Wall-clock string for the last tool call (or run end if no tools ran)." }
+        durationSec: { type: integer }
+        processSummary:
+          type: array
+          items: { type: string }
+          description: "Up to 10 reasoning strings pulled from this node's matched-rule evaluations."
+        steps:
+          type: array
+          items: { $ref: "#/components/schemas/ClaimProcessingAgentStep" }
+
+    ClaimProcessingOuterTool:
+      type: object
+      description: |
+        Tool calls not tied to any Shape — the outer-layer `FETCH`
+        (`linx_claim_search`) and optional `PARSE`.
+      properties:
+        phase:      { type: string, enum: [FETCH, PARSE, EVALUATE] }
+        tool:       { type: string }
+        status:
+          type: string
+          enum: [completed, failed]
+        durationMs: { type: integer }
+
+    ClaimProcessingSnapshot:
+      type: object
+      description: Response from GET /api/claims/{claim_id}/processing/.
+      properties:
+        claimId:           { type: string }
+        runId:             { type: string, format: uuid }
+        batchId:           { type: string, format: uuid, nullable: true, description: "Null for ad-hoc / single-claim runs." }
+        workflowId:        { type: string, format: uuid }
+        claimStatus:
+          type: string
+          enum: [MET, NOT_MET, INCONCLUSIVE, DEFECT]
+          description: |
+            `DEFECT` for FAILED / FETCH_FAILED, `NOT_MET` for TERMINATED_EARLY
+            or a DENY/STOP final decision, `INCONCLUSIVE` while RUNNING or
+            when no rules matched, `MET` otherwise.
+        processingTimeMin: { type: number, nullable: true, description: "Wall-clock minutes between started_at and finished_at; null while the run is in flight." }
+        startedAt:         { type: string, format: date-time, nullable: true }
+        finishedAt:        { type: string, format: date-time, nullable: true }
+        agents:
+          type: array
+          items: { $ref: "#/components/schemas/ClaimProcessingAgent" }
+          description: One entry per canvas node visited, in evaluation order.
+        outerToolInvocations:
+          type: array
+          items: { $ref: "#/components/schemas/ClaimProcessingOuterTool" }
+        reviewStatus:
+          type: string
+          nullable: true
+          description: Reserved for the human-review UI; always null today.
+        feedback:
+          type: string
+          nullable: true
+          description: Reserved for the human-review UI; always null today.
 
     BatchAsyncKickoffResponse:
       type: object

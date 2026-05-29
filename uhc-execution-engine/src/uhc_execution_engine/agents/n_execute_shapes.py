@@ -14,12 +14,15 @@ offending shape id is captured in ``state["terminated_at_shape_id"]``.
 """
 from __future__ import annotations
 
+import logging
 import time
 
 from ..config import get_config
 from ..llm import publish_event
 from ..state import ExecutionState
 from ._eval_common import _tool_context_for_rule, evaluate_one_rule
+
+logger = logging.getLogger(__name__)
 
 _HALT_DECISION_TYPES = {"DENY", "STOP"}
 
@@ -44,6 +47,17 @@ def execute_shapes(state: ExecutionState) -> dict:
 
     claim_id = state.get("claim_id", "")
 
+    if not shapes:
+        # Hard-to-spot failure mode: load_bindings accepted the workflow
+        # (flat pre/dec non-empty) but no shape carries any rules, so the
+        # per-rule LLM is never reached and the claim defaults to ALLOW
+        # in aggregate_decision. See EXECUTION_ENGINE.md §9 for details.
+        logger.warning(
+            "execute_shapes claim=%s zero shapes to iterate; no rule_evaluated "
+            "events will fire and Anthropic will not be called for this claim",
+            claim_id or "-",
+        )
+
     for shape in shapes:
         shapes_evaluated += 1
         shape_id = shape.get("shape_id", "")
@@ -52,6 +66,11 @@ def execute_shapes(state: ExecutionState) -> dict:
         shape_t0 = time.time()
         matched_count = 0
         halt_after_shape = False
+
+        logger.info(
+            "execute_shapes claim=%s shape=%s (%s) rules=%d",
+            claim_id or "-", shape_id, shape_label or "-", len(rules),
+        )
 
         # SSE side channel: announce the Shape so the SPA can open a
         # group and render a progress bar. No-op when no batch is in scope.

@@ -12,10 +12,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic as _monotonic
 from typing import Any, Iterator
 
 from django.conf import settings
@@ -243,45 +245,154 @@ def _serialize_agent(node: dict[str, Any], run: RuleExecutionRun) -> dict[str, A
     }
 
 
+_TERMINAL_BATCH_STATUSES = {"COMPLETED", "PARTIAL", "FAILED"}
+
+
+def _dispatch_batch(
+    *,
+    request: Request,
+    workflow_id: str,
+) -> tuple[Response, str | None]:
+    """Shared kickoff: validate upload → stash xlsx → reserve BatchExecutionRun
+    → dispatch the Celery master task → return (error_response_or_None, batch_id).
+
+    On success returns ``(None, batch_id)``. On validation failure returns
+    ``(Response(4xx/5xx), None)`` — callers should just forward that response.
+    """
+    upload = request.FILES.get("file")
+    if upload is None:
+        return Response({"detail": "file (multipart) is required"},
+                        status=status.HTTP_400_BAD_REQUEST), None
+    if not upload.name.lower().endswith(".xlsx"):
+        return Response({"detail": "only .xlsx is supported"},
+                        status=status.HTTP_400_BAD_REQUEST), None
+
+    batch_id = str(uuid.uuid4())
+
+    xlsx_path = _execution_upload_dir() / f"{batch_id}.xlsx"
+    try:
+        with xlsx_path.open("wb") as fh:
+            for chunk in upload.chunks():
+                fh.write(chunk)
+    except OSError as exc:
+        logger.exception("run-batch: could not stash upload")
+        return Response(
+            {"detail": f"failed to stash upload: {exc}"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        ), None
+
+    BatchExecutionRun.objects.create(
+        id=batch_id,
+        workflow_id=str(workflow_id),
+        source_filename=upload.name,
+        claim_id_column=str(request.data.get("claim_id_column") or "claim_id"),
+        total_claims=0,
+        status="RUNNING",
+    )
+
+    from .tasks import run_batch_async
+    run_batch_async.delay(
+        batch_id=batch_id,
+        xlsx_path=str(xlsx_path),
+        workflow_id=str(workflow_id),
+        filename=upload.name,
+        claim_id_column=request.data.get("claim_id_column") or None,
+        sheet_name=request.data.get("sheet_name") or None,
+    )
+    logger.info("run-batch dispatched batch=%s workflow=%s file=%s",
+                batch_id, workflow_id, upload.name)
+    return None, batch_id
+
+
 class RunBatchView(APIView):
     """POST /api/execute/workflows/<workflow_id>/run-batch/
 
     Multipart form: ``file`` (.xlsx, required), ``claim_id_column`` (optional),
-    ``sheet_name`` (optional). Runs every claim in the Excel through the rule
-    engine and returns a JSON batch summary. Synchronous for v1.
+    ``sheet_name`` (optional). Dispatches the batch through Celery to a
+    dedicated OS subprocess (same path as ``/run-batch-async/``), then
+    polls the ``BatchExecutionRun`` row until it reaches a terminal state
+    and returns the aggregated batch dict from the DB.
+
+    HTTP response is still synchronous — caller blocks until the batch
+    finishes — but the work no longer runs inside the gunicorn worker.
     """
     parser_classes = [MultiPartParser]
     permission_classes = [AllowAny]
 
-    def post(self, request: Request, workflow_id: str) -> Response:
-        upload = request.FILES.get("file")
-        if upload is None:
-            return Response({"detail": "file (multipart) is required"},
-                            status=status.HTTP_400_BAD_REQUEST)
-        if not upload.name.lower().endswith(".xlsx"):
-            return Response({"detail": "only .xlsx is supported"},
-                            status=status.HTTP_400_BAD_REQUEST)
+    # Bound on how long the sync HTTP request will wait. Overridable via env
+    # for CI/large batches; align with the gunicorn / proxy timeout in prod.
+    _DEFAULT_TIMEOUT_SEC = 600
+    _POLL_INTERVAL_SEC = 0.5
 
-        from uhc_execution_engine import BatchRunner
-        runner = BatchRunner()
-        try:
-            result = runner.run_xlsx(
-                workflow_id=workflow_id,
-                xlsx_bytes=upload.read(),
-                filename=upload.name,
-                claim_id_column=request.data.get("claim_id_column") or None,
-                sheet_name=request.data.get("sheet_name") or None,
-            )
-        except Exception as exc:
-            logger.exception("run-batch crashed")
-            return Response(
-                {"detail": f"engine crashed: {exc}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-        http_status = status.HTTP_200_OK
-        if result.get("status") == "FAILED":
-            http_status = status.HTTP_400_BAD_REQUEST
-        return Response(result, status=http_status)
+    def post(self, request: Request, workflow_id: str) -> Response:
+        err, batch_id = _dispatch_batch(request=request, workflow_id=workflow_id)
+        if err is not None:
+            return err
+
+        timeout = float(os.environ.get(
+            "RUN_BATCH_SYNC_TIMEOUT_SEC", str(self._DEFAULT_TIMEOUT_SEC)))
+        deadline = _monotonic() + timeout
+
+        # Poll the BatchExecutionRun row until terminal.
+        while True:
+            try:
+                batch = BatchExecutionRun.objects.prefetch_related("runs").get(id=batch_id)
+            except BatchExecutionRun.DoesNotExist:
+                # Shouldn't happen — _dispatch_batch just created it.
+                logger.error("run-batch: batch row %s disappeared mid-poll", batch_id)
+                return Response(
+                    {"detail": "batch row disappeared during run"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+            if batch.status in _TERMINAL_BATCH_STATUSES:
+                payload = BatchExecutionRunSerializer(batch).data
+                # Preserve the response shape the legacy in-process runner
+                # returned: top-level batch fields + a `results` list of
+                # per-claim dicts.
+                results = []
+                for run in batch.runs.all().order_by("started_at"):
+                    results.append({
+                        "run_id":              str(run.id),
+                        "claim_id":            run.claim_id,
+                        "status":              run.status,
+                        "final_decision_type": run.final_decision_type,
+                        "applied_codes":       list(run.applied_codes or []),
+                        "narrative":           run.narrative,
+                        "error_message":       run.error_message,
+                    })
+                response_body = {
+                    "batch_id":      str(batch.id),
+                    "status":        batch.status,
+                    "total_claims":  batch.total_claims,
+                    "completed":     batch.completed,
+                    "failed":        batch.failed,
+                    "error_message": batch.error_message,
+                    "results":       results,
+                }
+                http_status = (status.HTTP_400_BAD_REQUEST
+                               if batch.status == "FAILED"
+                               else status.HTTP_200_OK)
+                return Response(response_body, status=http_status)
+
+            if _monotonic() >= deadline:
+                logger.warning(
+                    "run-batch: timed out waiting on batch=%s after %ss "
+                    "(status=%s); returning 504 — work continues in the background",
+                    batch_id, timeout, batch.status,
+                )
+                return Response(
+                    {
+                        "detail":     "batch is still running; subscribe to the stream "
+                                       "URL or poll GET /api/execute/batches/<id>/",
+                        "batch_id":   batch_id,
+                        "status":     batch.status,
+                        "stream_url": f"/api/execute/batches/{batch_id}/events/",
+                    },
+                    status=status.HTTP_504_GATEWAY_TIMEOUT,
+                )
+
+            time.sleep(self._POLL_INTERVAL_SEC)
 
 
 class BatchDetailView(APIView):
@@ -478,52 +589,9 @@ class RunBatchAsyncView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request: Request, workflow_id: str) -> Response:
-        upload = request.FILES.get("file")
-        if upload is None:
-            return Response({"detail": "file (multipart) is required"},
-                            status=status.HTTP_400_BAD_REQUEST)
-        if not upload.name.lower().endswith(".xlsx"):
-            return Response({"detail": "only .xlsx is supported"},
-                            status=status.HTTP_400_BAD_REQUEST)
-
-        batch_id = str(uuid.uuid4())
-
-        # Stash the upload to disk; the Celery worker reads it and unlinks.
-        xlsx_path = _execution_upload_dir() / f"{batch_id}.xlsx"
-        try:
-            with xlsx_path.open("wb") as fh:
-                for chunk in upload.chunks():
-                    fh.write(chunk)
-        except OSError as exc:
-            logger.exception("run-batch-async: could not stash upload")
-            return Response(
-                {"detail": f"failed to stash upload: {exc}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        # Reserve a RUNNING BatchExecutionRun row eagerly so the SPA's
-        # 202 response carries a real batch_id it can subscribe to right
-        # away. The Celery task will patch in source_filename / total /
-        # final status once it parses the workbook.
-        BatchExecutionRun.objects.create(
-            id=batch_id,
-            workflow_id=str(workflow_id),
-            source_filename=upload.name,
-            claim_id_column=str(request.data.get("claim_id_column") or "claim_id"),
-            total_claims=0,
-            status="RUNNING",
-        )
-
-        from .tasks import run_batch_async
-        run_batch_async.delay(
-            batch_id=batch_id,
-            xlsx_path=str(xlsx_path),
-            workflow_id=str(workflow_id),
-            filename=upload.name,
-            claim_id_column=request.data.get("claim_id_column") or None,
-            sheet_name=request.data.get("sheet_name") or None,
-        )
-
+        err, batch_id = _dispatch_batch(request=request, workflow_id=workflow_id)
+        if err is not None:
+            return err
         return Response(
             {
                 "batch_id":   batch_id,

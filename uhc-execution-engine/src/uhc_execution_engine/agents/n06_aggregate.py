@@ -13,11 +13,14 @@ summary from the offending rule without burning an LLM call.
 from __future__ import annotations
 
 import json
+import logging
 import time
 
 from ..config import get_config
 from ..llm import llm_call
 from ..state import ExecutionState
+
+logger = logging.getLogger(__name__)
 
 
 _PRECEDENCE = ["DENY", "STOP", "PEND", "REFER", "BYPASS", "WAIVE",
@@ -84,8 +87,24 @@ def aggregate_decision(state: ExecutionState) -> dict:
             "stages": stages,
         }
 
-    matched = [r for r in (state.get("rule_results") or []) if r["matched"]]
+    rule_results = state.get("rule_results") or []
+    matched = [r for r in rule_results if r["matched"]]
     if not matched:
+        # No matches → no aggregator LLM call. Distinguish between
+        # "evaluator ran rules but nothing matched" (legitimate ALLOW)
+        # and "evaluator iterated zero rules" (silent misconfig).
+        if not rule_results:
+            logger.warning(
+                "aggregate_decision claim=%s rule_results is empty; defaulting "
+                "to ALLOW without any LLM call. This usually means execute_shapes "
+                "had no shapes to iterate — check the load_bindings line above.",
+                state.get("claim_id") or "-",
+            )
+        else:
+            logger.info(
+                "aggregate_decision claim=%s evaluated=%d matched=0 -> default ALLOW (no LLM)",
+                state.get("claim_id") or "-", len(rule_results),
+            )
         stages.append({"node": "aggregate_decision", "status": "OK",
                        "ms": int((time.time() - t0) * 1000),
                        "msg": "no matches; default ALLOW"})

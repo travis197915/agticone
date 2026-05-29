@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest import mock
 import uuid
 
 from django.test import TestCase
@@ -137,3 +138,95 @@ class ClaimProcessingEndpointTests(TestCase):
         body = resp.json()
         self.assertEqual(body["source"], "django")
         self.assertIn("Malformed run_id", body["error"])
+
+
+class PersistFailureRegressionTests(TestCase):
+    """If RuleEvaluation.bulk_create raises, the parent RuleExecutionRun
+    must end up FAILED with the real error — not COMPLETED with zero
+    children (the bug that hid persistence failures from operators)."""
+
+    def setUp(self) -> None:
+        self.workflow = Workflow.objects.create(
+            name="WF", slug=f"wf-{uuid.uuid4().hex[:8]}")
+        # Mimic what n01_validate._reserve_run_row does at the start of
+        # the engine: a RUNNING parent row with this run_id.
+        self.run_id = uuid.uuid4()
+        self.run = RuleExecutionRun.objects.create(
+            id=self.run_id,
+            workflow=self.workflow,
+            claim_id="CLAIM-1",
+            status="RUNNING",
+        )
+
+    def _state(self) -> dict:
+        return {
+            "run_id": str(self.run_id),
+            "workflow_id": str(self.workflow.id),
+            "claim_id": "CLAIM-1",
+            "claim": {"claim_id": "CLAIM-1"},
+            "raw_fetch": {},
+            "status": "COMPLETED",
+            "final_decision_type": "ALLOW",
+            "applied_codes": [],
+            "narrative": "ok",
+            "stages": [],
+            "tool_invocations": [],
+            "rule_results": [{
+                "order_index": 0,
+                "shape_id": "s1",
+                "shape_label": "Shape 1",
+                "rule_key": "step:1:1:0",
+                "binding_id": "",
+                "source": "decision",
+                "condition": "x",
+                "action": "y",
+                "matched": True,
+                "confidence": 0.9,
+                "reasoning": "because",
+                "decision_type": "ALLOW",
+                "codes": [],
+                "tool_results_used": [],
+                "llm_provider": "anthropic",
+                "llm_ms": 12,
+            }],
+        }
+
+    def test_child_failure_rolls_back_parent_and_records_error(self):
+        from uhc_execution_engine.agents.n07_persist_respond import (
+            persist_and_respond,
+        )
+
+        with mock.patch(
+            "execution_app.models.RuleEvaluation.objects.bulk_create",
+            side_effect=ValueError("boom"),
+        ):
+            result = persist_and_respond(self._state())
+
+        self.assertEqual(result["status"], "FAILED")
+        self.assertTrue(result["error_message"].startswith("persist: "))
+        self.assertIn("boom", result["error_message"])
+
+        # Atomic rollback: no half-written children.
+        self.assertEqual(
+            RuleEvaluation.objects.filter(run=self.run).count(), 0)
+
+        # Recovery update: parent row now reflects the real failure.
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, "FAILED")
+        self.assertIn("boom", self.run.error_message)
+        self.assertIsNotNone(self.run.finished_at)
+
+    def test_successful_persist_writes_children(self):
+        """Sanity check — the atomic block doesn't break the happy path."""
+        from uhc_execution_engine.agents.n07_persist_respond import (
+            persist_and_respond,
+        )
+
+        result = persist_and_respond(self._state())
+
+        self.assertNotIn("error_message", result.get("response", {})) or \
+            self.assertEqual(result["response"]["error_message"], "")
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, "COMPLETED")
+        self.assertEqual(
+            RuleEvaluation.objects.filter(run=self.run).count(), 1)
