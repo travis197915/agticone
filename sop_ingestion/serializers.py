@@ -18,7 +18,7 @@ class IngestionJobSerializer(serializers.ModelSerializer):
         model  = IngestionJob
         fields = ["job_id", "seed_url", "status", "docs_queued",
                   "docs_processed", "docs_failed", "max_depth", "max_docs",
-                  "llm_provider", "llm_model", "celery_task_id",
+                  "llm_provider", "llm_model", "celery_task_id", "trigger_source",
                   "created_at", "started_at", "completed_at",
                   "duration_seconds", "summary", "errors", "documents"]
         read_only_fields = ["job_id", "status", "docs_queued", "docs_processed",

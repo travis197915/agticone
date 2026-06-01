@@ -53,6 +53,7 @@ graphify-out/
 yaml_explained/
 datadump/
 yaml/
+.mypy_cache/
 
 # ── Claim audit scratch data & scripts ───────────────────────────────────
 CBD_Coverage.json

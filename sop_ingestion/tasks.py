@@ -97,3 +97,33 @@ def run_narrative_contextualizer(self, job_id: str) -> dict:
     except Exception as exc:
         log.exception("Narrative contextualizer failed  job=%s", job_id)
         return {"job_id": job_id, "error": str(exc)}
+
+
+@shared_task(bind=True, max_retries=0, name="sop_ingestion.check_all_sop_revisions")
+def check_all_sop_revisions(self) -> dict:
+    """Celery Beat entrypoint — probe tracked SOP URLs and queue re-ingest when changed."""
+    from .services.revision_scheduler import run_revision_check_batch
+
+    try:
+        result = run_revision_check_batch(dispatch=True)
+        log.info("Scheduled revision check finished  summary=%s", result.get("summary"))
+        return result
+    except Exception as exc:
+        log.exception("Scheduled revision check failed")
+        return {"error": str(exc), "celery_task_id": self.request.id}
+
+
+@shared_task(bind=True, max_retries=0, name="sop_ingestion.check_sop_revision")
+def check_sop_revision(self, document_id: int, *, dispatch: bool = True, force: bool = False) -> dict:
+    """Probe one SopDocument by primary key."""
+    from .models import SopDocument
+    from .services.revision_scheduler import check_tracked_sop, tracked_sop_from_document
+
+    try:
+        doc = SopDocument.objects.select_related("current_version", "current_version__job").get(
+            pk=document_id,
+        )
+    except SopDocument.DoesNotExist:
+        return {"document_id": document_id, "error": "document not found"}
+
+    return check_tracked_sop(tracked_sop_from_document(doc), dispatch=dispatch, force=force)

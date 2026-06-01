@@ -166,6 +166,45 @@ PYTHONPATH=. celery -A sop_backend worker -Q job_queue,celery --concurrency=1 -l
 export MAX_PIPELINE_SUBPROCESSES=10   # optional cap (default 10)
 ```
 
+Set parallel subprocess cap (default `10`):
+
+```bash
+export MAX_PIPELINE_SUBPROCESSES=10   # or 50 on a large host
+```
+
+### Celery Beat — scheduled revision checks
+
+When enabled, Beat probes every tracked SOP URL on a cron schedule. If the remote
+**Revision Date** or content hash changed since the current ingested version, a new
+`IngestionJob` is queued automatically (`trigger_source=revision_check`).
+
+Add to `.env`:
+
+```bash
+SOP_REVISION_CHECK_ENABLED=true
+SOP_REVISION_CHECK_HOUR=2      # UTC hour (default 02:00)
+SOP_REVISION_CHECK_MINUTE=0
+```
+
+Run Beat in a **separate terminal** (worker must also be running):
+
+```bash
+PYTHONPATH=. celery -A sop_backend beat -l INFO
+```
+
+Or use `./scripts/dev.sh --beat` to start Django, worker, and Beat together.
+
+Manual trigger (authenticated API):
+
+```bash
+curl -X POST http://localhost:8000/api/ingest/revision-check/ \
+  -H "Authorization: Bearer $JWT"
+
+# Dry-run: probe only, no ingestion jobs
+curl -X POST 'http://localhost:8000/api/ingest/revision-check/?async=0&dry_run=1' \
+  -H "Authorization: Bearer $JWT"
+```
+
 ### Frontend
 
 ```bash

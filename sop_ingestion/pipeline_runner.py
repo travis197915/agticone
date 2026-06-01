@@ -57,6 +57,7 @@ def execute_ingestion_job(job_id: str) -> dict:
             job_id=str(job.job_id),
             max_depth=job.max_depth,
             max_docs=job.max_docs,
+            trigger_source=job.trigger_source or "manual",
         )
     except Exception as exc:
         log.exception("Pipeline crashed  job=%s", job_id)

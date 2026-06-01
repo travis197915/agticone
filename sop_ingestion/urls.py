@@ -7,19 +7,62 @@ from .exclusion_views import (SopExclusionListCreateView,
                               SopExclusionToggleView,
                               SopHtmlBlocksView,
                               SopSourceHtmlView)
+from .version_views import (
+    RevisionCheckView,
+    SopDocumentRevisionCheckView,
+    SopDocumentVersionsView,
+    SopVersionActivateView,
+    SopVersionRejectView,
+    SopVersionDiffView,
+)
 from .dom_tree_views import SopDomTreeView, SopDomBlockView
 
 app_name = "sop_ingestion"
+
+
+def _slashless(name: str) -> str:
+    return f"{name}-no-slash"
+
 
 urlpatterns = [
     # REST API
     path("",                     JobListCreateView.as_view(), name="job-list-create"),
     path("health/",              HealthView.as_view(),        name="health"),
     path("run-sync/",            SyncRunView.as_view(),       name="run-sync"),
+    path("revision-check/",      RevisionCheckView.as_view(), name="revision-check"),
+    path("revision-check",       RevisionCheckView.as_view(), name=_slashless("revision-check")),
     path("<uuid:job_id>/",       JobDetailView.as_view(),     name="job-detail"),
     path("<uuid:job_id>/graph/",    JobGraphView.as_view(),    name="job-graph"),
     path("<uuid:job_id>/sections/",      JobSectionsView.as_view(),      name="job-sections"),
     path("<uuid:job_id>/contextualize/", JobContextualizeView.as_view(), name="job-contextualize"),
+
+    path("documents/<int:document_id>/versions/",
+         SopDocumentVersionsView.as_view(),
+         name="sop-document-versions"),
+    path("documents/<int:document_id>/revision-check/",
+         SopDocumentRevisionCheckView.as_view(),
+         name="sop-document-revision-check"),
+    path("documents/<int:document_id>/revision-check",
+         SopDocumentRevisionCheckView.as_view(),
+         name=_slashless("sop-document-revision-check")),
+    path("sops/<int:sop_id>/diff/",
+         SopVersionDiffView.as_view(),
+         name="sop-version-diff"),
+    path("sops/<int:sop_id>/diff",
+         SopVersionDiffView.as_view(),
+         name=_slashless("sop-version-diff")),
+    path("sops/<int:sop_id>/activate/",
+         SopVersionActivateView.as_view(),
+         name="sop-version-activate"),
+    path("sops/<int:sop_id>/activate",
+         SopVersionActivateView.as_view(),
+         name=_slashless("sop-version-activate")),
+    path("sops/<int:sop_id>/reject/",
+         SopVersionRejectView.as_view(),
+         name="sop-version-reject"),
+    path("sops/<int:sop_id>/reject",
+         SopVersionRejectView.as_view(),
+         name=_slashless("sop-version-reject")),
 
     # User-curated exclusions (per-SOP, no LLM)
     path("sops/<int:sop_id>/exclusions/",
