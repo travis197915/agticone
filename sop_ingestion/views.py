@@ -10,8 +10,9 @@ POST /api/ingest/run-sync/       — run pipeline inline (DEBUG only)
 
 Versioning
 ----------
-GET  /api/ingest/documents/<document_id>/versions/       — version history
-POST /api/ingest/documents/<document_id>/revision-check/ — probe one SOP for drift
+GET  /api/ingest/documents/<document_id>/versions/           — version history
+GET  /api/ingest/documents/<document_id>/affected-workflows/ — workflows using this SOP
+POST /api/ingest/documents/<document_id>/revision-check/     — probe one SOP for drift
 GET  /api/ingest/sops/<sop_id>/diff/                     — diff vs prior revision
 POST /api/ingest/sops/<sop_id>/activate/                 — approve pending version
 POST /api/ingest/sops/<sop_id>/reject/                   — reject pending version

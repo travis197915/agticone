@@ -46,6 +46,46 @@ class SopDocumentVersionsView(APIView):
         })
 
 
+class SopDocumentAffectedWorkflowsView(APIView):
+    """List builder workflows whose canvas nodes bind rules from this SOP document.
+
+    GET /api/ingest/documents/<document_id>/affected-workflows/
+      ?sop_id=N           — only bindings for one AuditSop version
+      ?current_only=1     — only bindings where sop.is_current=true
+    """
+
+    def get(self, request: Request, document_id: int) -> Response:
+        doc = get_object_or_404(SopDocument, pk=document_id)
+
+        sop_id = request.query_params.get("sop_id")
+        sop_id_filter: int | None = None
+        if sop_id:
+            try:
+                sop_id_filter = int(sop_id)
+            except (TypeError, ValueError):
+                return Response(
+                    {"detail": "sop_id must be an integer."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not AuditSop.objects.filter(pk=sop_id_filter, document_id=doc.id).exists():
+                return Response(
+                    {"detail": "sop_id not found for this document."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+        current_only = request.query_params.get("current_only", "").lower() in {
+            "1", "true", "yes",
+        }
+
+        from .services.affected_workflows import find_affected_workflows
+
+        return Response(find_affected_workflows(
+            doc,
+            sop_id=sop_id_filter,
+            current_bindings_only=current_only,
+        ))
+
+
 class SopDocumentRevisionCheckView(APIView):
     """Probe one tracked SOP document for revision/content drift.
 
