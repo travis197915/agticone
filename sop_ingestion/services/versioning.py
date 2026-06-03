@@ -284,7 +284,7 @@ def register_sop_version(
 @transaction.atomic
 def activate_sop_version(sop_id: int, *, reviewed_by: str = "") -> AuditSop:
     """Promote a pending-review version to the live active SOP."""
-    sop = AuditSop.objects.select_for_update().select_related("document").get(pk=sop_id)
+    sop = AuditSop.objects.select_for_update().get(pk=sop_id)
     if sop.activation_status != ActivationStatus.PENDING_REVIEW:
         raise ValueError(
             f"SOP {sop_id} is not pending review (status={sop.activation_status})"
@@ -292,12 +292,26 @@ def activate_sop_version(sop_id: int, *, reviewed_by: str = "") -> AuditSop:
     if not sop.document_id:
         raise ValueError(f"SOP {sop_id} is not linked to a SopDocument")
 
-    doc = sop.document
+    doc = SopDocument.objects.select_for_update().get(pk=sop.document_id)
     rev_norm = normalize_revision_date(sop.revision_date)
 
+    superseded_status = ActivationStatus.SUPERSEDED
+
+    # Deactivate all lower version numbers for this document.
+    AuditSop.objects.filter(
+        document=doc,
+        version_number__lt=sop.version_number,
+    ).exclude(
+        activation_status=ActivationStatus.REJECTED,
+    ).update(
+        is_current=False,
+        activation_status=superseded_status,
+    )
+
+    # Also clear any other version still marked current (same document).
     AuditSop.objects.filter(document=doc, is_current=True).exclude(pk=sop.pk).update(
         is_current=False,
-        activation_status=ActivationStatus.SUPERSEDED,
+        activation_status=superseded_status,
     )
     sop.is_current = True
     sop.activation_status = ActivationStatus.ACTIVE

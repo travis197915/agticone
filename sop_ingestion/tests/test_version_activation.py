@@ -76,11 +76,13 @@ class VersionActivationTests(TestCase):
         activated = activate_sop_version(self.pending.id, reviewed_by="auditor@example.com")
 
         self.current.refresh_from_db()
+        self.pending.refresh_from_db()
         self.doc.refresh_from_db()
         assert activated.is_current is True
         assert activated.activation_status == ActivationStatus.ACTIVE
         assert self.current.is_current is False
         assert self.current.activation_status == ActivationStatus.SUPERSEDED
+        assert self.current.version_number < self.pending.version_number
         assert self.doc.current_version_id == self.pending.id
 
     def test_reject_pending_version(self):

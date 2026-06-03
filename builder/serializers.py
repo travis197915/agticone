@@ -105,14 +105,23 @@ class WorkflowSopStatusSerializer(serializers.Serializer):
     docs_failed    = serializers.IntegerField()
     created_at     = serializers.DateTimeField()
     completed_at   = serializers.DateTimeField(allow_null=True)
-    # The primary AuditSop.id for this job (used to embed the graph viewer
-    # in the SPA). null while the job is still queued/running.
     audit_sop_id   = serializers.SerializerMethodField()
+    sop_version    = serializers.SerializerMethodField()
+
+    def _primary_sop(self, obj):
+        return (
+            obj.audit_sops.select_related("document", "document__current_version")
+            .order_by("id")
+            .first()
+        )
 
     def get_audit_sop_id(self, obj):
-        # obj is an IngestionJob row; pick the first ingested doc.
-        first = obj.audit_sops.order_by("id").first()
-        return first.id if first else None
+        sop = self._primary_sop(obj)
+        return sop.id if sop else None
+
+    def get_sop_version(self, obj):
+        from .sop_compliance import sop_approval_meta
+        return sop_approval_meta(self._primary_sop(obj))
 
 
 class WorkflowSerializer(serializers.ModelSerializer):
@@ -284,6 +293,7 @@ class WorkflowGraphSerializer(serializers.ModelSerializer):
     connections     = serializers.SerializerMethodField()
     sops            = serializers.SerializerMethodField(read_only=True)
     attached_agents = serializers.SerializerMethodField(read_only=True)
+    sop_compliance  = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Workflow
@@ -291,7 +301,7 @@ class WorkflowGraphSerializer(serializers.ModelSerializer):
             "id", "name", "slug", "description", "is_active",
             "metadata", "created_at", "updated_at",
             "work_areas", "connections",
-            "sops", "attached_agents",
+            "sops", "attached_agents", "sop_compliance",
         ]
 
     def get_connections(self, obj: Workflow):
@@ -301,8 +311,15 @@ class WorkflowGraphSerializer(serializers.ModelSerializer):
         return _NestedConnectionSerializer(qs, many=True).data
 
     def get_sops(self, obj: Workflow):
-        jobs = obj.ingestion_jobs.all().order_by("-created_at")
+        jobs = obj.ingestion_jobs.prefetch_related(
+            "audit_sops__document",
+            "audit_sops__document__current_version",
+        ).order_by("-created_at")
         return WorkflowSopStatusSerializer(jobs, many=True).data
+
+    def get_sop_compliance(self, obj: Workflow):
+        from .sop_compliance import workflow_binding_compliance
+        return workflow_binding_compliance(obj)
 
     def get_attached_agents(self, obj: Workflow):
         agents = (obj.metadata or {}).get("runtime_agents") or []

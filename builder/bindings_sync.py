@@ -43,10 +43,17 @@ def _rule_sop_id(rule_key: str) -> int | None:
         return None
 
 
+from .sop_compliance import require_approved_sop, sop_approval_meta
+
+
 def _resolve_sop(sop_id: int):
     try:
         from sop_ingestion.models import AuditSop
-        return AuditSop.objects.filter(id=sop_id).first()
+        return (
+            AuditSop.objects.filter(id=sop_id)
+            .select_related("document", "document__current_version")
+            .first()
+        )
     except Exception:
         return None
 
@@ -148,6 +155,7 @@ def extract_bindings_from_properties(shape) -> None:
         sop = _resolve_sop(sop_id) if sop_id else None
         if sop is None:
             continue
+        require_approved_sop(sop, context="save rule bindings")
         try:
             row, _ = NodeRuleBinding.objects.update_or_create(
                 shape=shape,
@@ -309,7 +317,15 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
     # the shape is reused instead of issuing a query; sort in Python to keep the
     # prefetch cache intact. Falls back to a query when not prefetched.
     try:
-        rule_rows = sorted(shape.rule_bindings.all(), key=lambda r: r.ordering)
+        prefetched = getattr(shape, "_prefetched_objects_cache", {})
+        if "rule_bindings" in prefetched:
+            rule_rows = sorted(shape.rule_bindings.all(), key=lambda r: r.ordering)
+        else:
+            rule_rows = list(
+                NodeRuleBinding.objects.filter(shape=shape)
+                .select_related("sop", "sop__document", "sop__document__current_version")
+                .order_by("ordering")
+            )
     except Exception:
         rule_rows = []
 
@@ -341,6 +357,7 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
             # forced the rule back in scope (force-in wins over everything).
             effective_oos = (is_manual or (row.rule_key in oos_keys)) and not forced_in
             # Authoritative fields from the binding row always win.
+            approval = sop_approval_meta(row.sop)
             entry.update({
                 "id":             str(row.id),
                 "key":            row.rule_key,
@@ -354,6 +371,10 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
                 "manual_out_of_scope": is_manual,
                 "manual_in_scope": forced_in,
                 "is_out_of_scope": effective_oos,
+                "is_approved":    approval["is_approved"],
+                "approval_issue": approval["approval_issue"],
+                "activation_status": approval["activation_status"],
+                "current_sop_id": approval["current_sop_id"],
             })
             return entry
 

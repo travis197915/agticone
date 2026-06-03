@@ -792,6 +792,8 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         from sop_ingestion.models import (  # local to avoid cycles
             AuditSop, AuditGraphNode, AuditGraphEdge, SopExclusion,
         )
+        from .sop_compliance import sop_approval_meta
+
         wf: Workflow = self.get_object()
 
         # ── Resolve optional sop_id filter ─────────────────────────────────────
@@ -804,19 +806,45 @@ class WorkflowViewSet(viewsets.ModelViewSet):
                 from rest_framework.exceptions import ValidationError
                 raise ValidationError({"sop_id": "Must be an integer."})
 
+        approved_only = _request.query_params.get("approved_only", "").lower() in {
+            "1", "true", "yes",
+        }
+
         sop_rules: list[dict] = []
         sop_summaries: list[dict] = []
+
+        def _summary_for(sop: AuditSop, *, rule_count=None) -> dict:
+            approval = sop_approval_meta(sop)
+            return {
+                "sop_id":      sop.id,
+                "title":       sop.title or f"SOP #{sop.id}",
+                "narrative":   sop.narrative_context or sop.llm_summary or "",
+                "source_url":  sop.url or "",
+                "doc_format":  sop.doc_format or "HTML",
+                "rule_count":  rule_count,
+                "is_approved": approval["is_approved"],
+                "approval_issue": approval["approval_issue"],
+                "activation_status": approval["activation_status"],
+                "current_sop_id": approval["current_sop_id"],
+                "version_number": approval["version_number"],
+            }
 
         # ── Base SOP queryset ───────────────────────────────────────────────────
         # For the fast path we skip the heavy prefetch; for the per-SOP path we
         # filter to one SOP and prefetch only its related rows.
         if sop_id_filter is not None:
-            sops_qs = AuditSop.objects.filter(
-                job__workflow=wf, id=sop_id_filter,
-            ).prefetch_related("preconditions", "steps__decisions").order_by("id")
+            sops_qs = (
+                AuditSop.objects.filter(job__workflow=wf, id=sop_id_filter)
+                .select_related("document", "document__current_version")
+                .prefetch_related("preconditions", "steps__decisions")
+                .order_by("id")
+            )
         else:
-            # Lightweight: no prefetch_related — we only read scalar fields.
-            sops_qs = AuditSop.objects.filter(job__workflow=wf).order_by("id")
+            sops_qs = (
+                AuditSop.objects.filter(job__workflow=wf)
+                .select_related("document", "document__current_version")
+                .order_by("id")
+            )
         # doc_format per SOP — drives whether the SPA shows an HTML iframe
         # (when the source is reachable) or a plain text panel (DOCX/PDF
         # uploads, where the snippet is the only viewable form).
@@ -825,17 +853,11 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         # ── Fast path: no sop_id → return SOP list + tools only ───────────────
         # Skip all rule / exclusion computation so the picker renders instantly.
         if sop_id_filter is None:
-            for sop in sops_qs.only(
-                "id", "title", "url", "doc_format", "narrative_context", "llm_summary",
-            ):
-                sop_summaries.append({
-                    "sop_id":      sop.id,
-                    "title":       sop.title or f"SOP #{sop.id}",
-                    "narrative":   sop.narrative_context or sop.llm_summary or "",
-                    "source_url":  sop.url or "",
-                    "doc_format":  sop.doc_format or "HTML",
-                    "rule_count":  None,   # populated after per-SOP lazy load
-                })
+            for sop in sops_qs:
+                summary = _summary_for(sop, rule_count=None)
+                if approved_only and not summary["is_approved"]:
+                    continue
+                sop_summaries.append(summary)
             tool_calls_fast: list[dict] = []
             try:
                 from agent_tools.models import Tool as _ToolFast
@@ -877,6 +899,21 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             })
 
         # ── Per-SOP path: compute rules + exclusions for sop_id_filter ─────────
+        target_sop = sops_qs.first()
+        if target_sop is None:
+            return Response({"detail": "SOP not found on this workflow."},
+                            status=status.HTTP_404_NOT_FOUND)
+        if not sop_approval_meta(target_sop)["is_approved"]:
+            approval = sop_approval_meta(target_sop)
+            return Response({
+                "detail": (
+                    f"SOP {target_sop.id} is not approved for rule attachment "
+                    f"({approval['approval_issue']}). Activate the current version first."
+                ),
+                "sop_id": target_sop.id,
+                "approval_issue": approval["approval_issue"],
+                "current_sop_id": approval["current_sop_id"],
+            }, status=status.HTTP_409_CONFLICT)
 
         # ── 1. Pull every OVERRIDES edge into a map keyed by source graph
         #       node key so we can derive (rule → excluded_by exclusions).
@@ -910,13 +947,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             sop_meta_by_id[sop.id] = {
                 "title": sop_title, "url": sop_url, "doc_format": doc_format,
             }
-            sop_summaries.append({
-                "sop_id":     sop.id,
-                "title":      sop_title,
-                "narrative":  sop.narrative_context or sop.llm_summary or "",
-                "source_url": sop_url,
-                "doc_format": doc_format,
-            })
+            sop_summaries.append(_summary_for(sop))
 
             # Pre-index step → decision-row keys (used by goto_step refs)
             step_to_keys: dict[int, list[str]] = {}
