@@ -1,1 +1,0 @@
-{"nodes": [{"id": "sop_ingestion_apps_sopingestionconfig", "label": "SopIngestionConfig (Django AppConfig)", "file_type": "code", "source_file": "sop_ingestion/apps.py", "source_location": "line 4", "source_url": null, "captured_at": null, "author": null, "contributor": null}], "edges": [], "hyperedges": []}

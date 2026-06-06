@@ -64,7 +64,9 @@ def aggregate_decision(state: ExecutionState) -> dict:
         results = list(state.get("rule_results") or [])
         halted = next(
             (r for r in reversed(results)
-             if r.get("matched") and r.get("decision_type") in {"DENY", "STOP"}),
+             if r.get("matched") and not r.get("skipped")
+             and not r.get("is_out_of_scope")
+             and r.get("decision_type") in {"DENY", "STOP"}),
             None,
         )
         shape_id = state.get("terminated_at_shape_id") or ""
@@ -88,7 +90,12 @@ def aggregate_decision(state: ExecutionState) -> dict:
         }
 
     rule_results = state.get("rule_results") or []
-    matched = [r for r in rule_results if r["matched"]]
+    # Skipped (routed-past / not-applicable) and out-of-scope rules never
+    # contribute to the verdict: a step the SOP told us to skip, or one whose
+    # match means "out of scope / stop", is a clean exclusion, not a defect.
+    matched = [r for r in rule_results
+               if r["matched"] and not r.get("skipped")
+               and not r.get("is_out_of_scope")]
     if not matched:
         # No matches → no aggregator LLM call. Distinguish between
         # "evaluator ran rules but nothing matched" (legitimate ALLOW)

@@ -30,9 +30,11 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from . import trace_builder
 from .models import BatchExecutionRun, RuleExecutionRun
 from .serializers import (BatchExecutionRunSerializer,
-                           RuleExecutionRunSerializer)
+                          RuleExecutionRunSerializer)
+from .trace_builder import CLEAN, DEFECT, INCONCLUSIVE, _DEFECT_DECISIONS
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +138,8 @@ def _build_node_rollup(run: RuleExecutionRun) -> tuple[list[dict[str, Any]], lis
             "condition": ev.condition,
             "action": ev.action,
             "matched": ev.matched,
+            "skipped": getattr(ev, "skipped", False),
+            "skip_reason": getattr(ev, "skip_reason", ""),
             "confidence": ev.confidence,
             "reasoning": ev.reasoning,
             "decision_type": ev.decision_type,
@@ -143,8 +147,9 @@ def _build_node_rollup(run: RuleExecutionRun) -> tuple[list[dict[str, Any]], lis
             "llm_provider": ev.llm_provider,
             "llm_ms": ev.llm_ms,
         })
-        slot["rules_evaluated"] += 1
-        if ev.matched:
+        if not getattr(ev, "skipped", False):
+            slot["rules_evaluated"] += 1
+        if ev.matched and not getattr(ev, "skipped", False):
             slot["rules_matched"] += 1
             if ev.decision_type and ev.decision_type not in slot["matched_decision_types"]:
                 slot["matched_decision_types"].append(ev.decision_type)
@@ -182,27 +187,69 @@ def _build_node_rollup(run: RuleExecutionRun) -> tuple[list[dict[str, Any]], lis
     return list(nodes.values()), outer_tools
 
 
-def _agent_status(node: dict[str, Any]) -> str:
+def _trace_status_by_shape(trace) -> dict[str, str]:
+    """shape_id -> aggregated audit status from the stored trace steps.
+
+    The trace is the most faithful per-step audit signal (it carries the LLM's
+    Met/Not-Met verdicts), so the agent chip should agree with the
+    Explainability view. Returns an empty map when no trace exists.
+    """
+    out: dict[str, list[str]] = {}
+    if trace is None:
+        return {}
+    for step in (trace.trace_json or []):
+        sid = str(step.get("shape_id") or "")
+        if not sid:
+            continue
+        out.setdefault(sid, []).append(str(step.get("status") or ""))
+    return {sid: trace_builder.aggregate_status(sts) for sid, sts in out.items()}
+
+
+def _agent_status(node: dict[str, Any], trace_by_shape: dict[str, str] | None = None) -> str:
+    """3-state audit status for one node (CLEAN / DEFECT / INCONCLUSIVE).
+
+    Prefers the trace-derived status so the agent chip matches the
+    Explainability tab; falls back to matched + decision type for runs that
+    predate the trace.
+    """
+    if trace_by_shape:
+        st = trace_by_shape.get(node["shape_id"])
+        if st:
+            return st
     matched = [e for e in node["evaluations"] if e.get("matched")]
-    if node.get("terminated_here") or any(e.get("decision_type") in {"DENY", "STOP"} for e in matched):
-        return "NOT_MET"
+    if node.get("terminated_here") or any(
+        (e.get("decision_type") or "").upper() in _DEFECT_DECISIONS for e in matched
+    ):
+        return DEFECT
     if matched:
-        return "MET"
-    return "INCONCLUSIVE"
+        return CLEAN
+    return INCONCLUSIVE
 
 
-def _claim_status(run: RuleExecutionRun, nodes: list[dict[str, Any]]) -> str:
-    if run.status in {"FAILED", "FETCH_FAILED"}:
-        return "DEFECT"
-    if run.status == "TERMINATED_EARLY":
-        return "NOT_MET"
+def _claim_status(
+    run: RuleExecutionRun,
+    nodes: list[dict[str, Any]],
+    trace=None,
+) -> str:
+    """3-state claim audit status (CLEAN / DEFECT / INCONCLUSIVE).
+
+    A system/fetch failure is *inconclusive* (the claim could not be audited),
+    not a claim defect. When a trace exists we trust its aggregate so the header
+    agrees with the per-agent / Explainability views.
+    """
     if run.status == "RUNNING":
-        return "INCONCLUSIVE"
-    if (run.final_decision_type or "").upper() in {"DENY", "STOP"}:
-        return "NOT_MET"
-    if any(node["rules_matched"] > 0 for node in nodes):
-        return "MET"
-    return "INCONCLUSIVE"
+        return INCONCLUSIVE
+    if run.status in {"FAILED", "FETCH_FAILED"}:
+        return INCONCLUSIVE
+    if trace is not None and trace.trace_json:
+        return trace_builder.claim_status(trace.trace_json)
+    if run.status == "TERMINATED_EARLY":
+        return DEFECT
+    decision = trace_builder.normalize_decision(run.final_decision_type)
+    if decision:
+        return decision
+    statuses = [_agent_status(node) for node in nodes]
+    return trace_builder.aggregate_status(statuses)
 
 
 def _processing_time_min(run: RuleExecutionRun) -> float | None:
@@ -211,7 +258,11 @@ def _processing_time_min(run: RuleExecutionRun) -> float | None:
     return round((run.finished_at - run.started_at).total_seconds() / 60.0, 2)
 
 
-def _serialize_agent(node: dict[str, Any], run: RuleExecutionRun) -> dict[str, Any]:
+def _serialize_agent(
+    node: dict[str, Any],
+    run: RuleExecutionRun,
+    trace_by_shape: dict[str, str] | None = None,
+) -> dict[str, Any]:
     invocations = node["tool_invocations"]
     begin_ts = invocations[0]["called_at"] if invocations else run.started_at
     end_ts = invocations[-1]["called_at"] if invocations else (run.finished_at or run.started_at)
@@ -236,7 +287,7 @@ def _serialize_agent(node: dict[str, Any], run: RuleExecutionRun) -> dict[str, A
     return {
         "id": node["shape_id"],
         "agentName": node["shape_label"] or node["shape_id"],
-        "status": _agent_status(node),
+        "status": _agent_status(node, trace_by_shape),
         "beginTime": _format_clock(begin_ts),
         "endTime": _format_clock(end_ts),
         "durationSec": duration_sec,
@@ -529,6 +580,13 @@ class ClaimProcessingView(APIView):
 
         nodes, outer_tools = _build_node_rollup(run)
 
+        # Trace drives the canonical 3-state status so the claim header, the
+        # agent chips and the Explainability tab all agree. Best-effort: a
+        # missing/old trace just falls back to the node + decision derivation.
+        from .models import ClaimTrace
+        trace = ClaimTrace.objects.filter(run=run).first()
+        trace_by_shape = _trace_status_by_shape(trace)
+
         # LLM-call telemetry — sourced from sop_ingestion.LLMCallLog where
         # _log_llm_call inserts one row per attempt, stamped with
         # execution_run_id by the ContextVar set in RuleEnginePipeline.run.
@@ -545,7 +603,7 @@ class ClaimProcessingView(APIView):
             "runId": str(run.id),
             "batchId": str(run.batch_id) if run.batch_id else None,
             "workflowId": str(run.workflow_id),
-            "claimStatus": _claim_status(run, nodes),
+            "claimStatus": _claim_status(run, nodes, trace),
             # Engine-level run state — useful when claimStatus=DEFECT and the
             # SPA needs to render why. `runStatus` is the raw RuleExecutionRun
             # state (FAILED / FETCH_FAILED / TERMINATED_EARLY / COMPLETED /
@@ -559,7 +617,7 @@ class ClaimProcessingView(APIView):
             "processingTimeMin": _processing_time_min(run),
             "startedAt": _iso_utc(run.started_at),
             "finishedAt": _iso_utc(run.finished_at),
-            "agents": [_serialize_agent(node, run) for node in nodes],
+            "agents": [_serialize_agent(node, run, trace_by_shape) for node in nodes],
             "outerToolInvocations": [
                 {
                     "phase": inv["phase"],
@@ -589,6 +647,69 @@ class ClaimProcessingView(APIView):
             "feedback": None,
         }
         return Response(payload, status=status.HTTP_200_OK)
+
+
+class ClaimTraceView(APIView):
+    """GET /api/claims/<claim_id>/trace/ and /explainability/.
+
+    Additive endpoints serving the denormalized ``ClaimTrace`` arrays in the
+    ``trace.json`` / ``explainability.json`` shapes. ``?run_id=`` overrides the
+    claim lookup; ``?batch_id=`` scopes it; ``?download=1`` returns the JSON as
+    a file attachment. ``kind`` is set per URL route ("trace" | "explainability").
+    """
+    permission_classes = [AllowAny]
+    kind = "trace"
+
+    def get(self, request: Request, claim_id: str) -> Response:
+        from django.http import JsonResponse
+
+        from .models import ClaimTrace
+
+        run_id_param = (request.query_params.get("run_id") or "").strip()
+        batch_id_param = (request.query_params.get("batch_id") or "").strip()
+        download = (request.query_params.get("download") or "").strip() in {"1", "true", "yes"}
+
+        run_uuid: uuid.UUID | None = None
+        batch_uuid: uuid.UUID | None = None
+        if run_id_param:
+            try:
+                run_uuid = uuid.UUID(run_id_param)
+            except ValueError:
+                return _relay_error("Malformed run_id query parameter",
+                                    status_code=status.HTTP_400_BAD_REQUEST,
+                                    details={"run_id": run_id_param})
+        if batch_id_param:
+            try:
+                batch_uuid = uuid.UUID(batch_id_param)
+            except ValueError:
+                return _relay_error("Malformed batch_id query parameter",
+                                    status_code=status.HTTP_400_BAD_REQUEST,
+                                    details={"batch_id": batch_id_param})
+
+        qs = ClaimTrace.objects.select_related("run")
+        if run_uuid is not None:
+            trace = qs.filter(run_id=run_uuid).first()
+        else:
+            qs = qs.filter(claim_id=claim_id)
+            if batch_uuid is not None:
+                qs = qs.filter(run__batch_id=batch_uuid)
+            trace = qs.order_by("-created_at").first()
+
+        if trace is None:
+            return _relay_error(
+                f"No trace found for claim {claim_id}",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+
+        data = trace.explainability_json if self.kind == "explainability" else trace.trace_json
+        data = data or []
+
+        if download:
+            resp = JsonResponse(data, safe=False, json_dumps_params={"indent": 2})
+            fname = f"{self.kind}_{trace.claim_id or claim_id}.json"
+            resp["Content-Disposition"] = f'attachment; filename="{fname}"'
+            return resp
+        return Response(data, status=status.HTTP_200_OK)
 
 
 # ── Streaming endpoints ──────────────────────────────────────────────────────

@@ -14,10 +14,24 @@ logger = logging.getLogger(__name__)
 
 
 def invoke_tool(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Run a single tool by name. Never raises; failures go in the result."""
+    """Run a single tool by name. Never raises; failures go in the result.
+
+    Routing order:
+    1. If an active ``McpServerConfig`` exists and the tool has an
+       ``mcp_path`` in ``Tool.metadata``, call that external endpoint
+       (``base_url + path``) live.
+    2. Otherwise fall back to the in-process ``agent_tools`` implementation.
+    """
     from agent_tools.registry import get_tool
 
+    from .mcp_client import mcp_invoke
+
     t0 = time.time()
+
+    routed = mcp_invoke(tool_name, args)
+    if routed is not None:
+        return routed
+
     tool = get_tool(tool_name)
     if tool is None:
         return {

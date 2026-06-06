@@ -1,6 +1,9 @@
 from django.contrib import admin
 from django.utils.html import format_html
-from .models import IngestionJob, IngestedDocument
+from .models import (
+    IngestionJob, IngestedDocument,
+    AuditSop, AuditStep, AuditDecision,
+)
 
 
 class IngestedDocumentInline(admin.TabularInline):
@@ -68,3 +71,72 @@ class IngestedDocumentAdmin(admin.ModelAdmin):
                        "status", "neo4j_sop_id", "pg_sop_id",
                        "steps_count", "rules_count", "codes_count",
                        "links_found", "created_at"]
+
+
+# ── Claims-audit rule tree (incl. YAML-imported nested rules) ─────────────────
+
+class AuditDecisionInline(admin.TabularInline):
+    model        = AuditDecision
+    extra        = 0
+    fields       = ["depth", "subrule_id", "parent", "row_index",
+                    "decision_type", "is_out_of_scope", "goto_step",
+                    "condition_if", "action_text"]
+    readonly_fields = fields
+    ordering     = ["depth", "row_index"]
+    show_change_link = True
+
+
+@admin.register(AuditStep)
+class AuditStepAdmin(admin.ModelAdmin):
+    list_display  = ["sop", "step_number", "yaml_rule_id", "oos_badge",
+                     "is_terminal", "question_short"]
+    list_filter   = ["is_out_of_scope", "is_terminal", "sop"]
+    search_fields = ["yaml_rule_id", "question", "sop__title"]
+    inlines       = [AuditDecisionInline]
+
+    @admin.display(description="Question")
+    def question_short(self, obj):
+        return (obj.question or "")[:80]
+
+    @admin.display(description="Scope", boolean=False)
+    def oos_badge(self, obj):
+        if obj.is_out_of_scope:
+            return format_html(
+                '<span style="background:#e11d48;color:#fff;padding:1px 8px;'
+                'border-radius:4px;font-size:10px;font-weight:700">OUT OF SCOPE</span>'
+            )
+        return "—"
+
+
+@admin.register(AuditDecision)
+class AuditDecisionAdmin(admin.ModelAdmin):
+    list_display  = ["sop_title", "step_no", "subrule_id", "depth", "row_index",
+                     "decision_type", "aggregation", "oos_badge", "goto_step"]
+    list_filter   = ["is_out_of_scope", "decision_type", "depth", "aggregation"]
+    search_fields = ["subrule_id", "condition_if", "action_text",
+                     "step__sop__title"]
+    raw_id_fields = ["step", "parent"]
+
+    @admin.display(description="SOP")
+    def sop_title(self, obj):
+        return obj.step.sop.title
+
+    @admin.display(description="Step")
+    def step_no(self, obj):
+        return obj.step.step_number
+
+    @admin.display(description="Scope")
+    def oos_badge(self, obj):
+        if obj.is_out_of_scope:
+            return format_html(
+                '<span style="background:#e11d48;color:#fff;padding:1px 8px;'
+                'border-radius:4px;font-size:10px;font-weight:700">OOS</span>'
+            )
+        return "—"
+
+
+@admin.register(AuditSop)
+class AuditSopAdmin(admin.ModelAdmin):
+    list_display  = ["id", "title", "platform", "step_count",
+                     "decision_count", "code_count"]
+    search_fields = ["title", "url"]

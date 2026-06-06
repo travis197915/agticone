@@ -297,6 +297,12 @@ class AuditStep(models.Model):
     # Sub-procedure steps belong to a named sub-flow
     is_sub_procedure = models.BooleanField(default=False)
     sub_procedure_name = models.CharField(max_length=256, blank=True)
+    # True when the SOP explicitly marks this step/section as out of scope
+    # for auditing (e.g. "Stop further auditing as this is out of scope").
+    is_out_of_scope  = models.BooleanField(default=False)
+    # Verbatim rule id from the source SOP/YAML (e.g. "RULE-007"). Lets the
+    # importer round-trip and re-key rows without relying on step_number alone.
+    yaml_rule_id     = models.CharField(max_length=64, blank=True, default="")
     # Neo4j reference
     neo4j_node_id    = models.CharField(max_length=256, blank=True)
     # LLM-generated per-step narrative: a 2-3 sentence paragraph that
@@ -334,8 +340,44 @@ class AuditDecision(models.Model):
         ("WAIVE",       "Waive"),
         ("CONDITIONAL", "Conditional"),
     ]
+    AGGREGATION_CHOICES = [
+        ("FIRST_MATCH",     "First matching child wins"),
+        ("XOR_ONE",         "Exactly one child must be Met"),
+        ("APPLICABLE_ONLY", "Only the applicable child is evaluated"),
+        ("ALWAYS_MET",      "Always Met regardless of children"),
+        ("ANY",             "Any matching child (lookup table)"),
+        ("LEAF",            "Leaf rule — no children"),
+    ]
     step             = models.ForeignKey(AuditStep, on_delete=models.CASCADE,
                                          related_name="decisions")
+    # ── Nesting (preserves YAML subrule hierarchy, levels 0..N) ──────────────
+    # A decision row may be a child of another decision row. Top-level rows
+    # have parent=NULL and depth=0. This is what lets a 3-level YAML
+    # (step → subrule → sub-subrule) round-trip without flattening.
+    parent           = models.ForeignKey("self", on_delete=models.CASCADE,
+                                          null=True, blank=True,
+                                          related_name="children")
+    depth            = models.PositiveSmallIntegerField(default=0, db_index=True)
+    # Verbatim id from the source (e.g. "RULE-007-002-001") + the named
+    # If/Then table this row belongs to (e.g. "Step 7 If... And... Then...").
+    subrule_id       = models.CharField(max_length=64, blank=True, default="")
+    table_name       = models.CharField(max_length=256, blank=True, default="")
+    # How a parent row folds its children's verdicts into its own.
+    aggregation      = models.CharField(max_length=16, choices=AGGREGATION_CHOICES,
+                                        default="LEAF")
+    # Free-text guard ("Provider is individual") from the YAML `applicable_when`.
+    # When set and the claim does not satisfy it, the execution engine SKIPS the
+    # rule (it does not apply) rather than marking it Not-Met.
+    applicable_when  = models.TextField(blank=True, default="")
+    # Verbatim Met/Not-Met semantics authored for the agent (the YAML `output`).
+    output_text      = models.TextField(blank=True, default="")
+    tooling_allowed  = models.BooleanField(default=True)
+    # True when the SOP marks this rule/sub-rule as out of scope for auditing.
+    is_out_of_scope  = models.BooleanField(default=False)
+    # Hybrid-store hook: when a subtree is offloaded to MongoDB (levels beyond
+    # the relational head), this holds the `rule_subtrees._id` reference.
+    # NULL/blank means all children live relationally here.
+    mongo_subtree_ref = models.CharField(max_length=128, blank=True, default="")
     row_index        = models.PositiveSmallIntegerField(default=0)
     # The condition the auditor evaluates
     condition_if     = models.TextField(blank=True)
@@ -362,11 +404,16 @@ class AuditDecision(models.Model):
     neo4j_edge_id    = models.CharField(max_length=256, blank=True)
 
     class Meta:
-        ordering     = ["step__step_number", "row_index"]
+        ordering     = ["step__step_number", "depth", "row_index"]
         verbose_name = "Audit Decision"
+        indexes = [
+            models.Index(fields=["step", "parent", "row_index"]),
+        ]
 
     def __str__(self):
-        return f"Step {self.step.step_number} row {self.row_index}: [{self.decision_type}]"
+        tag = self.subrule_id or f"row {self.row_index}"
+        scope = " (OUT OF SCOPE)" if self.is_out_of_scope else ""
+        return f"Step {self.step.step_number} {tag} [d{self.depth}]: [{self.decision_type}]{scope}"
 
 
 class AuditGroupLimit(models.Model):

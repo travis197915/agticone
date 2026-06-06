@@ -312,26 +312,50 @@ class JobSectionsView(APIView):
             "rules":        pc.llm_rules or [],
         } for pc in sop.preconditions.all().order_by("display_order", "id")]
 
+        def _serialize_decision(d, by_parent):
+            """One decision row + its nested children (preserves YAML subrules)."""
+            return {
+                "row_index":       d.row_index,
+                "depth":           d.depth,
+                "subrule_id":      d.subrule_id,
+                "table_name":      d.table_name,
+                "aggregation":     d.aggregation,
+                "condition_if":    d.condition_if,
+                "condition_and":   d.condition_and,
+                "action_text":     d.action_text,
+                "action_summary":  d.action_summary,
+                "output_text":     d.output_text,
+                "decision_type":   d.decision_type,
+                "tooling_allowed": d.tooling_allowed,
+                "is_out_of_scope": d.is_out_of_scope,
+                "goto_step":       d.goto_step,
+                "is_final":        d.is_final,
+                "eob_codes":       d.eob_codes or [],
+                "ex_codes":        d.ex_codes or [],
+                "denial_codes":    d.denial_codes or [],
+                "system_actions":  d.system_actions or [],
+                "all_codes":       d.all_codes or [],
+                "children":        [
+                    _serialize_decision(c, by_parent)
+                    for c in by_parent.get(d.id, [])
+                ],
+            }
+
         steps = []
         steps_qs = sop.steps.prefetch_related("decisions").order_by("step_number")
         for step in steps_qs:
-            decisions = [{
-                "row_index":      d.row_index,
-                "condition_if":   d.condition_if,
-                "condition_and":  d.condition_and,
-                "action_text":    d.action_text,
-                "action_summary": d.action_summary,
-                "decision_type":  d.decision_type,
-                "goto_step":      d.goto_step,
-                "is_final":       d.is_final,
-                "eob_codes":      d.eob_codes or [],
-                "ex_codes":       d.ex_codes or [],
-                "denial_codes":   d.denial_codes or [],
-                "system_actions": d.system_actions or [],
-                "all_codes":      d.all_codes or [],
-            } for d in step.decisions.all().order_by("row_index")]
+            # Group decisions by parent so we can rebuild the tree in one pass.
+            by_parent: dict = {}
+            for d in step.decisions.all().order_by("depth", "row_index"):
+                by_parent.setdefault(d.parent_id, []).append(d)
+            # Top-level rows (parent_id is None) carry the nested children.
+            decisions = [
+                _serialize_decision(d, by_parent)
+                for d in by_parent.get(None, [])
+            ]
             steps.append({
                 "step_number":      step.step_number,
+                "yaml_rule_id":     step.yaml_rule_id,
                 "question":         step.question,
                 "intro_text":       step.intro_text,
                 "narrative":        step.narrative_context,
@@ -339,6 +363,7 @@ class JobSectionsView(APIView):
                 "terminal_action":  step.terminal_action,
                 "is_sub_procedure": step.is_sub_procedure,
                 "sub_procedure":    step.sub_procedure_name,
+                "is_out_of_scope":  step.is_out_of_scope,
                 "decisions":        decisions,
             })
 

@@ -57,6 +57,8 @@ def _persist(state: ExecutionState) -> None:
                 condition=ev["condition"],
                 action=ev["action"],
                 matched=ev["matched"],
+                skipped=bool(ev.get("skipped")),
+                skip_reason=str(ev.get("skip_reason") or "")[:255],
                 confidence=ev["confidence"],
                 reasoning=ev["reasoning"],
                 decision_type=ev["decision_type"],
@@ -85,6 +87,37 @@ def _persist(state: ExecutionState) -> None:
         ])
 
 
+def _persist_trace(state: ExecutionState) -> None:
+    """Additive: build + store the trace/explainability log for this run.
+
+    Runs after the canonical run/evaluation/tool rows are written. Any failure
+    here is swallowed by the caller so it can never affect the run outcome.
+    """
+    from execution_app.models import ClaimTrace, RuleExecutionRun
+    from execution_app import trace_builder
+
+    run = RuleExecutionRun.objects.filter(id=state["run_id"]).first()
+    if run is None:
+        return
+    trace, explainability = trace_builder.build_trace(
+        run,
+        list(state.get("rule_results") or []),
+        list(state.get("tool_invocations") or []),
+    )
+    # Store the *overall* claim audit status (CLEAN / DEFECT / INCONCLUSIVE),
+    # not just the first agent's — the list view reads this directly.
+    final_status = trace_builder.claim_status(trace)
+    ClaimTrace.objects.update_or_create(
+        run=run,
+        defaults=dict(
+            claim_id=run.claim_id or "",
+            final_status=final_status,
+            trace_json=trace,
+            explainability_json=explainability,
+        ),
+    )
+
+
 def _build_response(state: ExecutionState) -> dict[str, Any]:
     evals_out: list[dict] = []
     for ev in (state.get("rule_results") or []):
@@ -94,6 +127,8 @@ def _build_response(state: ExecutionState) -> dict[str, Any]:
             "shape_id": ev.get("shape_id", ""),
             "shape_label": ev.get("shape_label", ""),
             "matched": ev["matched"],
+            "skipped": bool(ev.get("skipped")),
+            "skip_reason": ev.get("skip_reason", ""),
             "decision_type": ev["decision_type"],
             "confidence": ev["confidence"],
             "reasoning": ev["reasoning"],
@@ -162,6 +197,14 @@ def persist_and_respond(state: ExecutionState) -> dict:
                 "error_message": f"persist: {exc}",
                 "stages": stages,
                 "response": _build_response(synthetic)}
+
+    # Additive trace/explainability log. Best-effort: a failure here must
+    # never roll back or fail the run that already persisted above.
+    try:
+        _persist_trace(state)
+    except Exception:  # pragma: no cover - trace must never break a run
+        logger.exception("rule_engine: trace persist failed for run_id=%s",
+                         state.get("run_id"))
 
     # Post-persist breadcrumb: this is the canonical "what was actually
     # written to the DB" line. Useful for grepping the log by run_id when

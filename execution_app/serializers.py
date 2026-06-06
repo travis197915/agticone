@@ -3,8 +3,34 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
+from . import trace_builder
 from .models import (BatchExecutionRun, RuleEvaluation, RuleExecutionRun,
                       ToolInvocationRecord)
+
+
+def claim_audit_status(run: RuleExecutionRun) -> str:
+    """Canonical 3-state claim status (CLEAN / DEFECT / INCONCLUSIVE).
+
+    Mirrors ``views._claim_status`` but works off the lightweight run row +
+    its stored trace (no node rollup), so the list view stays consistent with
+    the detail page. A system/fetch failure is *inconclusive*, not a defect.
+    """
+    if run.status == "RUNNING":
+        return trace_builder.INCONCLUSIVE
+    if run.status in {"FAILED", "FETCH_FAILED"}:
+        return trace_builder.INCONCLUSIVE
+    trace = getattr(run, "trace", None)
+    if trace is not None:
+        # final_status is stored as the canonical value for new runs; older
+        # rows may carry Met/Not-Met, so normalize defensively.
+        if trace.trace_json:
+            return trace_builder.claim_status(trace.trace_json)
+        if trace.final_status:
+            return trace_builder.normalize_status(trace.final_status)
+    if run.status == "TERMINATED_EARLY":
+        return trace_builder.DEFECT
+    return (trace_builder.normalize_decision(run.final_decision_type)
+            or trace_builder.INCONCLUSIVE)
 
 
 class ToolInvocationRecordSerializer(serializers.ModelSerializer):
@@ -18,8 +44,8 @@ class RuleEvaluationSerializer(serializers.ModelSerializer):
     class Meta:
         model = RuleEvaluation
         fields = ["id", "order_index", "rule_key", "rule_source", "condition",
-                  "action", "matched", "confidence", "reasoning",
-                  "decision_type", "codes", "tool_results_used",
+                  "action", "matched", "skipped", "skip_reason", "confidence",
+                  "reasoning", "decision_type", "codes", "tool_results_used",
                   "llm_provider", "llm_ms"]
 
 
@@ -46,11 +72,14 @@ class BatchExecutionRunSerializer(serializers.ModelSerializer):
                   "runs"]
 
     def get_runs(self, obj):
+        # select_related('trace') so claim_audit_status doesn't fan out into a
+        # per-run query for the reverse OneToOne.
         return [{
             "id": str(r.id),
             "claim_id": r.claim_id,
             "status": r.status,
+            "claim_status": claim_audit_status(r),
             "final_decision_type": r.final_decision_type,
             "applied_codes": r.applied_codes,
             "error_message": r.error_message,
-        } for r in obj.runs.all()]
+        } for r in obj.runs.select_related("trace").all()]

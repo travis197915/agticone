@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 from ..claim_fetcher import FETCH_TOOL, PARSE_TOOL
+from ..config import get_config
 from ..state import ExecutionState
 from ..tool_runner import invoke_tool
 
@@ -40,6 +41,19 @@ def run_tools(state: ExecutionState) -> dict:
     invocations = list(state.get("tool_invocations") or [])
     results_by_binding: dict[str, dict[str, Any]] = dict(state.get("tool_results") or {})
 
+    # Lazy mode: defer EVALUATE-phase tool invocation to execute_shapes, which
+    # only runs the tools for steps the router actually reaches. Pre-seeded
+    # results (injected/cached) are preserved and reused as before.
+    if get_config().lazy_tools:
+        stages.append({"node": "run_tools", "status": "OK",
+                       "ms": int((time.time() - t0) * 1000),
+                       "msg": "deferred to execute_shapes (lazy_tools)"})
+        return {
+            "tool_invocations": invocations,
+            "tool_results": results_by_binding,
+            "stages": stages,
+        }
+
     # Collect every unique tool binding from both scoping maps
     seen: set[str] = set()
     bindings: list[dict[str, Any]] = []
@@ -48,6 +62,11 @@ def run_tools(state: ExecutionState) -> dict:
             if tb["binding_id"] in seen:
                 continue
             if tb["tool_name"] in _SKIP_TOOLS:
+                continue
+            # Reuse a pre-seeded result (e.g. injected/cached) instead of
+            # re-invoking the tool live. Backward compatible: empty seed map
+            # means every binding is invoked as before.
+            if tb["binding_id"] in results_by_binding:
                 continue
             seen.add(tb["binding_id"])
             bindings.append(tb)

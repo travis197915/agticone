@@ -134,10 +134,14 @@ class PipelineConfig:
 
     @property
     def mongo_uri(self) -> str:
-        return (
-            f"mongodb://{self.mongo_user}:{self.mongo_password}"
-            f"@{self.mongo_host}:{self.mongo_port}/"
-        )
+        # Omit the "user:pass@" credentials block when either is empty —
+        # an auth-less Mongo (local Docker) rejects "mongodb://:@host".
+        if self.mongo_user and self.mongo_password:
+            from urllib.parse import quote_plus
+            creds = f"{quote_plus(self.mongo_user)}:{quote_plus(self.mongo_password)}@"
+        else:
+            creds = ""
+        return f"mongodb://{creds}{self.mongo_host}:{self.mongo_port}/"
 
     @property
     def rabbitmq_url(self) -> str:

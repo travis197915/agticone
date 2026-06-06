@@ -31,3 +31,14 @@ sop_files/
 *.pyc
 __pycache__/
 .venv/
+out/
+explainability.json
+trace.json
+uhc-agentic.log
+synthetic_claims.xlsx
+synthetic_claims_3.xlsx
+SOP_Rule-to-Tool_Mapping_Report.docx
+graphify-out/
+yaml_explained/
+datadump/
+yaml/

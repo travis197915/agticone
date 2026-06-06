@@ -100,6 +100,42 @@ class Tool(_UUIDPK, _Timestamps):
         return f"{self.display_name} ({self.name})"
 
 
+# ── External MCP server config ─────────────────────────────────────────────────
+
+
+class McpServerConfig(_UUIDPK, _Timestamps):
+    """Shared connection config for an external (mock or real) claims MCP/REST
+    server that tools are routed to.
+
+    Only the **base endpoint** is stored here (once). Each tool stores **only
+    its path** in ``Tool.metadata['mcp_path']`` (e.g. ``/tools/facets_get_summary``).
+    The execution engine joins ``base_url + path`` at call time.
+
+    Exactly one row is normally active (``is_active=True``); the engine uses the
+    most recently updated active row. When no active row exists tools fall back
+    to their in-process ``agent_tools`` implementation (backward compatible).
+    """
+
+    label = models.CharField(max_length=128, default="claims-mock-mcp")
+    # Base endpoint, no trailing slash, e.g. https://claims-mock-mcp-server.toystack.dev
+    base_url = models.CharField(max_length=2048)
+    # Auth header sent on every call (mock uses ``x-api-key``).
+    auth_header = models.CharField(max_length=64, default="x-api-key")
+    api_key = models.CharField(max_length=512, blank=True, default="")
+    # HTTP verb + arg name the server expects for the claim identifier.
+    http_method = models.CharField(max_length=8, default="POST")
+    claim_arg = models.CharField(max_length=64, default="claim_number")
+    timeout_seconds = models.PositiveIntegerField(default=30)
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        db_table = "mcp_server_config"
+        ordering = ["-is_active", "-updated_at"]
+
+    def __str__(self) -> str:  # pragma: no cover - debug aid
+        return f"{self.label} ({self.base_url})"
+
+
 # ── Node bindings ─────────────────────────────────────────────────────────────
 
 

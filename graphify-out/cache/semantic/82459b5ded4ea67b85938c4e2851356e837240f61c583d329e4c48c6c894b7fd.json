@@ -1,1 +1,0 @@
-{"nodes": [{"id": "sop_backend_celery_app", "label": "Celery app (sop_backend Celery instance)", "file_type": "code", "source_file": "sop_backend/celery.py", "source_location": "line 6", "source_url": null, "captured_at": null, "author": null, "contributor": null}], "edges": [], "hyperedges": []}

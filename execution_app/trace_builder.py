@@ -1,0 +1,382 @@
+"""Build trace.json / explainability.json-shaped audit logs from a run.
+
+Purely additive: consumes the per-rule ``rule_results`` and ``tool_invocations``
+that the engine already produces (plus the additive trace fields threaded
+through ``n_execute_shapes``) and projects them into two denormalized arrays:
+
+* ``trace``          — one entry per (agent/shape, SOP, step), each carrying
+                       status, rationale, evidence_refs, subrule_results and
+                       the tools used/succeeded/failed/skipped.
+* ``explainability`` — the same data grouped per (agent, SOP) with light
+                       step summaries.
+
+Nothing here mutates engine state or existing rows; the output is stored in the
+``ClaimTrace`` table and served by the new read endpoints.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+# ── Two-layer status model ──────────────────────────────────────────────────
+# RULE / STEP level — the verdict for a single SOP rule/subrule, shown on each
+# trace step in the claim detail. These stay in the auditor's native vocabulary:
+MET = "Met"
+NOT_MET = "Not-Met"
+INCONCLUSIVE_RULE = "Inconclusive"
+# A rule/step the SOP routed past (goto / out-of-scope) or that was not
+# applicable. Skipped entries are excluded from the claim rollup — they are
+# neither a pass nor a defect — and the UI greys them out.
+SKIPPED_RULE = "Skipped"
+#
+# AGENT / CLAIM level — the rolled-up audit outcome shown on agent chips and the
+# claim header. A Met rule rolls up to CLEAN, a Not-Met rule to DEFECT:
+CLEAN = "CLEAN"
+DEFECT = "DEFECT"
+INCONCLUSIVE = "INCONCLUSIVE"
+
+# Engine decision types that always denote a claim-handling defect / a clean pass.
+_DEFECT_DECISIONS = {"DENY", "STOP", "REFER", "REFERRAL", "PEND", "PENDED"}
+_CLEAN_DECISIONS = {"ALLOW", "APPROVE", "APPROVED", "PAY", "PASS"}
+_HALT_DECISION_TYPES = _DEFECT_DECISIONS
+
+_MET_TOKENS = {"met", "match", "matched", "pass", "passed", "clean", "allow", "ok"}
+_NOT_MET_TOKENS = {
+    "not-met", "notmet", "fail", "failed", "deny", "denied", "defect",
+    "stop", "refer", "referral", "pend", "pended",
+}
+_INCONCLUSIVE_TOKENS = {"inconclusive", "unknown", "indeterminate", "n/a", "na"}
+
+
+def _iso(dt) -> str:
+    if dt is None:
+        return ""
+    try:
+        return dt.replace(microsecond=0).isoformat()
+    except Exception:  # pragma: no cover - defensive
+        return str(dt)
+
+
+# ── Rule / step level ────────────────────────────────────────────────────────
+def _normalize_rule_status(raw: str) -> str:
+    """Map a free-form status string onto Met / Not-Met / Inconclusive.
+
+    Returns ``""`` when empty/unrecognized so callers can fall back to other
+    signals. Accepts both rule words (met) and audit words (clean/defect).
+    """
+    s = (raw or "").strip().lower().replace("_", "-").replace(" ", "-")
+    if not s:
+        return ""
+    if s in ("skipped", "skip"):
+        return SKIPPED_RULE
+    if s in _MET_TOKENS:
+        return MET
+    if s in _NOT_MET_TOKENS:
+        return NOT_MET
+    if s in _INCONCLUSIVE_TOKENS:
+        return INCONCLUSIVE_RULE
+    return ""
+
+
+def _status_for_eval(ev: dict[str, Any]) -> str:
+    """Rule-level verdict for one evaluation (Met / Not-Met / Inconclusive / Skipped)."""
+    if ev.get("skipped"):
+        return SKIPPED_RULE
+    explicit = _normalize_rule_status(ev.get("llm_status", ""))
+    if explicit:
+        return explicit
+    matched = bool(ev.get("matched"))
+    decision_type = (ev.get("decision_type") or "").upper()
+    if matched and decision_type in _HALT_DECISION_TYPES:
+        return NOT_MET
+    if matched:
+        return MET
+    return INCONCLUSIVE_RULE
+
+
+def _aggregate_rule_status(statuses: list[str]) -> str:
+    """Roll subrule verdicts up to a step verdict (rule vocabulary).
+
+    Skipped subrules are dropped first; a step whose rules were all skipped
+    rolls up to Skipped (not Inconclusive) so the claim rollup ignores it.
+    """
+    norm = [_normalize_rule_status(s) or INCONCLUSIVE_RULE for s in (statuses or [])]
+    norm = [s for s in norm if s != SKIPPED_RULE]
+    if not norm:
+        return SKIPPED_RULE
+    if any(s == NOT_MET for s in norm):
+        return NOT_MET
+    if all(s == MET for s in norm):
+        return MET
+    return INCONCLUSIVE_RULE
+
+
+# ── Agent / claim level ──────────────────────────────────────────────────────
+def rule_to_audit(status: str) -> str:
+    """Map a rule verdict to the 3-state audit model (Met→CLEAN, Not-Met→DEFECT)."""
+    s = _normalize_rule_status(status)
+    if s == MET:
+        return CLEAN
+    if s == NOT_MET:
+        return DEFECT
+    if s == SKIPPED_RULE:
+        return ""   # ignored at the claim level
+    return INCONCLUSIVE
+
+
+def normalize_status(raw: str) -> str:
+    """Public: normalize any status/decision-ish string to the audit model."""
+    return rule_to_audit(raw)
+
+
+def normalize_decision(decision_type: str) -> str:
+    """Map an engine decision type to CLEAN / DEFECT, or ``""`` if unknown."""
+    d = (decision_type or "").strip().upper()
+    if d in _DEFECT_DECISIONS:
+        return DEFECT
+    if d in _CLEAN_DECISIONS:
+        return CLEAN
+    return ""
+
+
+def aggregate_status(statuses: list[str]) -> str:
+    """Public: roll any list of statuses up to one audit value.
+
+    any DEFECT → DEFECT; all CLEAN → CLEAN; otherwise INCONCLUSIVE.
+    Skipped statuses map to "" and are dropped before rolling up.
+    """
+    audit = [a for a in (rule_to_audit(s) for s in (statuses or [])) if a]
+    if not audit:
+        return INCONCLUSIVE
+    if any(s == DEFECT for s in audit):
+        return DEFECT
+    if all(s == CLEAN for s in audit):
+        return CLEAN
+    return INCONCLUSIVE
+
+
+def claim_status(trace_list: list[dict[str, Any]]) -> str:
+    """Overall audit status for a claim from its built ``trace`` array.
+
+    The per-step ``status`` is rule-level (Met/Not-Met/Inconclusive); this rolls
+    those up to the claim-level audit value (CLEAN/DEFECT/INCONCLUSIVE).
+    """
+    return aggregate_status(
+        [str(t.get("status") or "") for t in (trace_list or [])]
+    )
+
+
+def _subrule_entry(ev: dict[str, Any]) -> dict[str, Any]:
+    conditions = ev.get("conditions")
+    if not isinstance(conditions, list) or not conditions:
+        conditions = [{
+            "condition": ev.get("condition", ""),
+            "evaluated": bool(ev.get("matched")),
+            "using_fields": [],
+            "values": {},
+        }]
+    return {
+        "subrule_id": ev.get("subrule_id") or ev.get("rule_key", ""),
+        "status": _status_for_eval(ev),
+        "conditions": conditions,
+    }
+
+
+def _tool_lookup(tool_invocations: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """binding_id -> {tool_name, ok}. Falls back to tool_name keys too."""
+    out: dict[str, dict[str, Any]] = {}
+    for inv in tool_invocations or []:
+        rec = {"tool_name": inv.get("tool_name", ""), "ok": bool(inv.get("ok", True))}
+        bid = inv.get("binding_id") or inv.get("tool_binding_id")
+        if bid:
+            out[str(bid)] = rec
+        if inv.get("tool_name"):
+            out.setdefault(inv["tool_name"], rec)
+    return out
+
+
+def _group_key(ev: dict[str, Any]) -> tuple[str, Any, Any]:
+    """Group leaf evaluations into one step: (shape, sop, yaml_rule_id|step)."""
+    step_key = ev.get("yaml_rule_id") or ev.get("section_id") or ev.get("rule_key")
+    return (str(ev.get("shape_id", "")), ev.get("sop_id"), step_key)
+
+
+def build_trace(
+    run,
+    rule_results: list[dict[str, Any]],
+    tool_invocations: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return ``(trace_list, explainability_list)`` for one claim run."""
+    rule_results = rule_results or []
+    tool_invocations = tool_invocations or []
+    tool_by_binding = _tool_lookup(tool_invocations)
+
+    execution_id = str(run.id)
+    claim_id = run.claim_id or ""
+    started_at = _iso(run.started_at)
+    ended_at = _iso(run.finished_at)
+    ts = ended_at or started_at
+
+    # Preserve first-seen order of (shape, sop, step) groups.
+    groups: dict[tuple[str, Any, Any], list[dict[str, Any]]] = {}
+    for ev in rule_results:
+        groups.setdefault(_group_key(ev), []).append(ev)
+
+    trace: list[dict[str, Any]] = []
+    for (shape_id, sop_id, step_key), evs in groups.items():
+        head = evs[0]
+        # A "parent" evaluation is one without a subrule_id; subrules carry one.
+        parents = [e for e in evs if not e.get("subrule_id")]
+        subrules = [e for e in evs if e.get("subrule_id")]
+        parent = parents[0] if parents else head
+
+        sub_results = [_subrule_entry(e) for e in subrules]
+        component_statuses = [r["status"] for r in sub_results] or [
+            _status_for_eval(e) for e in evs
+        ]
+        # Step status stays in rule vocabulary (Met/Not-Met/Inconclusive).
+        step_status = _aggregate_rule_status(component_statuses)
+
+        # Evidence refs: merge any LLM-supplied refs across the group.
+        evidence_refs: list[str] = []
+        for e in evs:
+            for ref in (e.get("evidence_refs") or []):
+                if ref not in evidence_refs:
+                    evidence_refs.append(ref)
+
+        # Tools: resolve from the binding ids each evaluation relied on.
+        used: list[str] = []
+        succeeded: list[str] = []
+        failed: list[str] = []
+        for e in evs:
+            for bid in (e.get("tool_results_used") or []):
+                rec = tool_by_binding.get(str(bid))
+                if not rec:
+                    continue
+                name = rec["tool_name"]
+                if name and name not in used:
+                    used.append(name)
+                    (succeeded if rec["ok"] else failed).append(name)
+        for name in used:
+            evidence_refs.append(
+                f"TOOL_OK:{name}" if name in succeeded else f"TOOL_FAIL:{name}"
+            )
+
+        llm_ms = sum(int(e.get("llm_ms") or 0) for e in evs)
+        rationale = "; ".join(
+            (e.get("reasoning") or "").strip() for e in evs if (e.get("reasoning") or "").strip()
+        )
+
+        trace.append({
+            "timestamp": ts,
+            "claim_id": claim_id,
+            "execution_id": execution_id,
+            "agent_name": head.get("shape_label") or shape_id,
+            "shape_id": shape_id,
+            "sop_name": head.get("sop_title", ""),
+            "sop_step_number": head.get("section_id"),
+            "sop_step_name": head.get("yaml_rule_id") or head.get("section_label", ""),
+            "sop_rule_id": head.get("yaml_rule_id", ""),
+            "sop_step_description": head.get("step_question") or head.get("section_label", ""),
+            "sop_action": parent.get("action", ""),
+            "step_exec_status": "success",
+            "status": step_status,
+            "rationale": rationale,
+            "evidence_refs": evidence_refs,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "transaction_time_sec": round(llm_ms / 1000.0, 3),
+            "tools_used": used,
+            "tools_succeeded": succeeded,
+            "tools_failed": failed,
+            "tools_skipped": [],
+            "decision_type": parent.get("decision_type", ""),
+            "codes": list(parent.get("codes") or []),
+            "subrule_results": sub_results,
+        })
+
+    explainability = _build_explainability(
+        trace, execution_id, claim_id, started_at, ended_at, run,
+    )
+    return trace, explainability
+
+
+def _build_explainability(
+    trace: list[dict[str, Any]],
+    execution_id: str,
+    claim_id: str,
+    started_at: str,
+    ended_at: str,
+    run,
+) -> list[dict[str, Any]]:
+    """Group trace steps per (agent, SOP) into the explainability shape."""
+    agents: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in trace:
+        key = (entry["agent_name"], entry["sop_name"])
+        bucket = agents.setdefault(key, {
+            "claim_id": claim_id,
+            "execution_id": execution_id,
+            "agent_name": entry["agent_name"],
+            "sop_name": entry["sop_name"],
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "_steps": [],
+        })
+        bucket["_steps"].append(entry)
+
+    out: list[dict[str, Any]] = []
+    for bucket in agents.values():
+        steps = bucket.pop("_steps")
+        statuses = [s["status"] for s in steps]
+        # Agent final_status is the rolled-up audit value (CLEAN/DEFECT/INCONCLUSIVE).
+        final_status = aggregate_status(statuses)
+        first_failing = next(
+            (s for s in steps if s["status"] not in (MET, SKIPPED_RULE)), None
+        )
+        rationale_summary = [f"Overall outcome: {final_status}."]
+        if first_failing is not None and final_status != CLEAN:
+            rationale_summary.append(
+                f"First non-Met step: {first_failing.get('sop_step_name') or first_failing.get('sop_step_number')}"
+                f" ({first_failing.get('sop_step_description', '')})"
+            )
+        total_sec = sum(float(s.get("transaction_time_sec") or 0.0) for s in steps)
+        out.append({
+            **bucket,
+            "sop_step_summary": [
+                f"SOP executed for agent '{bucket['agent_name']}' with outcome {final_status}."
+            ],
+            "sop_action_summary": ["Actions were executed per SOP steps."],
+            "rationale_summary": rationale_summary,
+            "duration": round(total_sec, 1),
+            "final_status": final_status,
+            "step_results": {
+                "steps": [
+                    {
+                        "sop_step_number": s.get("sop_step_number"),
+                        "sop_step_name": s.get("sop_step_name"),
+                        "sop_rule_id": s.get("sop_rule_id"),
+                        "status": s.get("status"),
+                        "step_exec_status": s.get("step_exec_status"),
+                        "subrule_results": s.get("subrule_results", []),
+                        "evidence_refs": s.get("evidence_refs", []),
+                        "timestamp": s.get("timestamp"),
+                        "result_summary": _result_summary(s),
+                        "sop_step_description": s.get("sop_step_description"),
+                        "sop_action": s.get("sop_action"),
+                        "rationale": s.get("rationale"),
+                        "started_at": s.get("started_at"),
+                        "ended_at": s.get("ended_at"),
+                        "transaction_time_sec": s.get("transaction_time_sec"),
+                    }
+                    for s in steps
+                ],
+            },
+            "router_errors": [],
+        })
+    return out
+
+
+def _result_summary(step: dict[str, Any]) -> str:
+    tools = ", ".join(step.get("tools_used") or [])
+    desc = step.get("sop_step_description", "")
+    base = f"{step.get('status')}: {desc}"
+    return f"{base} | tools: {tools}" if tools else base

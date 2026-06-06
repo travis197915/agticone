@@ -32,6 +32,17 @@ class EngineConfig:
     openai_model: str
     llm_max_tokens: int = 4096
     llm_retries: int = 2
+    # When true, EVALUATE-phase tool bindings are invoked lazily per step inside
+    # execute_shapes (only for steps the router actually reaches) instead of all
+    # upfront in run_tools — so steps the SOP skips spend no tool calls.
+    lazy_tools: bool = True
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
 
 
 @lru_cache(maxsize=1)
@@ -44,4 +55,5 @@ def get_config() -> EngineConfig:
         openai_model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
         llm_max_tokens=int(os.environ.get("RULE_ENGINE_MAX_TOKENS", "4096")),
         llm_retries=int(os.environ.get("RULE_ENGINE_RETRIES", "2")),
+        lazy_tools=_env_bool("RULE_ENGINE_LAZY_TOOLS", True),
     )

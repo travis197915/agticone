@@ -98,6 +98,11 @@ class RuleEvaluation(models.Model):
     condition = models.TextField(blank=True, default="")
     action = models.TextField(blank=True, default="")
     matched = models.BooleanField(default=False)
+    # True when the rule was NOT evaluated against Met/Not-Met because routing
+    # skipped its step (goto/out-of-scope) or it was not applicable. Skipped
+    # rows are excluded from the claim verdict and shown greyed in the UI.
+    skipped = models.BooleanField(default=False)
+    skip_reason = models.CharField(max_length=255, blank=True, default="")
     confidence = models.FloatField(default=0.0)
     reasoning = models.TextField(blank=True, default="")
     decision_type = models.CharField(max_length=32, blank=True, default="")
@@ -110,6 +115,29 @@ class RuleEvaluation(models.Model):
     class Meta:
         db_table = "execution_rule_evaluation"
         ordering = ["run", "order_index"]
+
+
+class ClaimTrace(_UUIDPK):
+    """Denormalized trace + explainability log for one claim run.
+
+    Additive: written after the existing run/evaluation/tool rows persist
+    (guarded so a trace failure never affects the run). Stores the two arrays
+    in the ``trace.json`` / ``explainability.json`` shapes the UI consumes.
+    """
+    run = models.OneToOneField(
+        RuleExecutionRun, on_delete=models.CASCADE, related_name="trace",
+    )
+    claim_id = models.CharField(max_length=128, db_index=True, blank=True, default="")
+    final_status = models.CharField(max_length=32, blank=True, default="")
+    trace_json = models.JSONField(default=list, blank=True)
+    explainability_json = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "execution_claim_trace"
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["claim_id"])]
 
 
 class ToolInvocationRecord(models.Model):

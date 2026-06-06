@@ -1,0 +1,16 @@
+---
+description: Always query the graphify knowledge graph before responding or writing code
+alwaysApply: true
+---
+
+# Query the graph first
+
+Before responding to ANY prompt:
+
+1. Run `graphify query "<topic of the prompt>"` first.
+2. Use the graph results to understand codebase context.
+3. Then write code based on what the graph reveals.
+
+Never write code without querying the graph first.
+
+Use `graphify-out/graph.json` as the source of truth for this codebase.

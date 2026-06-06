@@ -26,10 +26,16 @@ class RuleEnginePipeline:
             raw_fetch: dict[str, Any] | None = None,
             claim_id: str = "",
             batch_id: str | None = None,
-            run_id: str | None = None) -> dict[str, Any]:
+            run_id: str | None = None,
+            tool_results: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
         # Mint the run_id up here (instead of inside n01_validate) so we can
         # stamp it on every LLMCallLog row via the contextvar set below.
         run_id = run_id or str(uuid.uuid4())
+        # Optional pre-seeded tool results, keyed by NodeToolBinding id. When a
+        # binding already has a result here, ``run_tools`` skips the live
+        # invocation and reuses it. Lets callers inject already-fetched/cached
+        # tool payloads; default empty preserves the original fetch-everything
+        # behaviour.
         initial: ExecutionState = {
             "workflow_id": str(workflow_id),
             "claim": claim or {},
@@ -38,7 +44,7 @@ class RuleEnginePipeline:
             "batch_id": batch_id,
             "stages": [],
             "tool_invocations": [],
-            "tool_results": {},
+            "tool_results": tool_results or {},
             "status": "RUNNING",
             "run_id": run_id,
         }
