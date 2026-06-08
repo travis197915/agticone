@@ -19,21 +19,61 @@ from ..llm import llm_call
 _EVAL_REQUIRED = ["matched", "reasoning", "confidence"]
 
 # ── Tool-result compaction ───────────────────────────────────────────────────
-# Tool results are embedded verbatim into the rule-eval prompt. A few tools
-# (notably ``cbd_coverage``) return very large reference grids — e.g. ~734
-# coverage rows ≈ 265k tokens — which on their own blow past the model's 200k
-# context window (Anthropic 400 "prompt is too long"). When that happens the
-# OpenAI fallback can't recover and the rule silently returns a "not matched"
-# fallback, so coverage checks are skipped while the claim still reports CLEAN.
+# Tool results are embedded verbatim into the rule-eval prompt. Some tools
+# (notably ``cbd_coverage``) return very large *reference grids* — e.g. 734
+# coverage rows ≈ 326k tokens, and sometimes tens of thousands of rows — which
+# on their own blow past the model's 200k context window (Anthropic 400 "prompt
+# is too long"). When that happens the OpenAI fallback can't recover and the
+# rule silently returns a "not matched" fallback, so coverage checks are skipped
+# while the claim still reports CLEAN.
 #
-# To keep every rule actually evaluated we compact each tool result before it
-# enters the prompt: (1) drop empty values and audit/id metadata — lossless for
-# decisioning; (2) if a result is still oversized, keep the rows most relevant
-# to the claim (token overlap) so the needle stays in.
-_TOOL_RESULT_CHAR_BUDGET = 560_000   # per single tool result (~140k tokens)
-_TOOL_CONTEXT_CHAR_BUDGET = 600_000  # all tool results combined (~150k tokens)
+# Strategy (most → least precise):
+#   1. Drop empty values + audit/id metadata (lossless for decisioning).
+#   2. Coverage grids: keep ONLY the rows whose ``descCode`` matches one of the
+#      claim's procedure codes (modifier-normalised). 734 rows → a handful.
+#   3. If nothing matched (or the payload isn't a coverage grid) fall back to a
+#      token-budgeted, claim-relevance-ranked trim so the needle still fits.
+import functools
+
+# Real token budgets (measured ratio for this JSON ≈ 3.25 chars/token, so a
+# char budget over-counts badly — we size in tokens instead).
+_TOOL_RESULT_TOKEN_BUDGET = 110_000   # per single tool result
+_TOOL_CONTEXT_TOKEN_BUDGET = 130_000  # all tool results combined
 
 _EMPTY_SCALARS = {None, "", "N/A", "None", "null"}
+
+# Decision-relevant columns kept when projecting a coverage-grid row.
+_COVERAGE_KEEP = {
+    "descCode", "descName", "diagnosis", "serviceType", "covered",
+    "authorization", "modifier", "telehealth", "behavioralProviderTypes",
+    "placeOfService", "limitType", "limitAmount", "limitQuantity",
+    "limitTimeframe", "ageLimits", "ageLimitsMin", "ageLimitsMax",
+    "effectiveDate", "termDate", "lob", "parityClassification",
+    "requiredCptCodes", "requiredCodes", "asamLevel", "stateMandate",
+}
+# A row "looks like" a coverage grid row when it carries this key.
+_COVERAGE_ROW_KEY = "descCode"
+# Claim keys that hold procedure / CPT / HCPCS codes.
+_PROC_KEY_RE = re.compile(r"ipcd|proc.*c(?:o)?de|cpt|hcpcs|srv.*cd", re.IGNORECASE)
+
+
+@functools.lru_cache(maxsize=1)
+def _encoder():
+    try:
+        import tiktoken
+        return tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        return None
+
+
+def _ntok(s: str) -> int:
+    enc = _encoder()
+    if enc is not None:
+        try:
+            return len(enc.encode(s))
+        except Exception:
+            pass
+    return len(s) // 3 + 1  # conservative when tiktoken is unavailable
 
 
 def _is_empty(v: Any) -> bool:
@@ -73,40 +113,112 @@ def _tokens(obj: Any) -> set[str]:
     return set(re.findall(r"[a-z0-9]{3,}", json.dumps(obj, default=str).lower()))
 
 
-def _compact_one(result: Any, claim_toks: set[str], budget: int) -> Any:
+def claim_procedure_codes(claim: dict[str, Any]) -> set[str]:
+    """All procedure/CPT/HCPCS codes on the claim, plus modifier-stripped bases.
+
+    e.g. a line with IPCD_ID="90837GT" yields {"90837GT", "90837"} so it matches
+    a coverage grid keyed on the base CPT "90837".
+    """
+    codes: set[str] = set()
+
+    def visit(o: Any) -> None:
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if isinstance(v, (str, int)) and _PROC_KEY_RE.search(str(k)):
+                    raw = str(v).strip().upper()
+                    if re.match(r"^[A-Z]?\d{3,5}", raw):
+                        codes.add(raw)
+                        m = re.match(r"^([A-Z]?\d{4,5})", raw)
+                        if m:
+                            codes.add(m.group(1))
+                else:
+                    visit(v)
+        elif isinstance(o, list):
+            for v in o:
+                visit(v)
+
+    visit(claim)
+    return codes
+
+
+def _project_coverage_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in row.items()
+            if k in _COVERAGE_KEEP and not _is_empty(v)}
+
+
+def _dominant_list(d: dict[str, Any]) -> tuple[str | None, list | None]:
+    key, best = None, -1
+    for k, v in d.items():
+        if isinstance(v, list):
+            sz = len(json.dumps(v, default=str))
+            if sz > best:
+                best, key = sz, k
+    return key, (d[key] if key is not None else None)
+
+
+def filter_coverage_grid(rows: list[Any], claim_codes: set[str]
+                         ) -> list[dict[str, Any]] | None:
+    """Return only the coverage rows for the claim's procedure code(s),
+    projected to decision-relevant columns. ``None`` when no row matched."""
+    if not claim_codes:
+        return None
+    kept = [
+        _project_coverage_row(r) for r in rows
+        if isinstance(r, dict) and str(r.get(_COVERAGE_ROW_KEY)) in claim_codes
+    ]
+    return kept or None
+
+
+def _compact_one(result: Any, claim_codes: set[str], claim_toks: set[str],
+                 budget_tokens: int) -> Any:
     pruned = _prune(result)
-    if len(json.dumps(pruned, default=str)) <= budget:
+    if _ntok(json.dumps(pruned, default=str)) <= budget_tokens:
         return pruned
-    # Oversized: find the dominant list and keep the rows most relevant to the
-    # claim until the budget is spent.
+
     if isinstance(pruned, dict):
-        list_key, best = None, -1
-        for k, v in pruned.items():
-            if isinstance(v, list):
-                sz = len(json.dumps(v, default=str))
-                if sz > best:
-                    best, list_key = sz, k
-        if list_key is not None:
-            rows = pruned[list_key]
-            ranked = sorted(rows, key=lambda r: -len(_tokens(r) & claim_toks))
+        list_key, rows = _dominant_list(pruned)
+        if list_key is not None and rows:
             shell = {k: v for k, v in pruned.items() if k != list_key}
-            acc = len(json.dumps(shell, default=str))
+            looks_coverage = isinstance(rows[0], dict) and _COVERAGE_ROW_KEY in rows[0]
+
+            # 1) Coverage grid → keep only the claim's procedure-code rows.
+            if looks_coverage:
+                matched = filter_coverage_grid(rows, claim_codes)
+                if matched is not None:
+                    out = dict(shell)
+                    out[list_key] = matched
+                    out["_filtered"] = {
+                        "kept": len(matched), "total": len(rows),
+                        "claim_codes": sorted(claim_codes),
+                        "note": ("coverage rows filtered to the claim's procedure "
+                                 "code(s); audit columns dropped"),
+                    }
+                    if _ntok(json.dumps(out, default=str)) <= budget_tokens:
+                        return out
+                # No code match (or still too big) → project all rows and let
+                # the relevance/budget trim below handle it.
+                rows = [_project_coverage_row(r) if isinstance(r, dict) else r
+                        for r in rows]
+
+            # 2) Generic: rank rows by claim relevance, keep until budget spent.
+            ranked = sorted(rows, key=lambda r: -len(_tokens(r) & claim_toks))
+            acc = _ntok(json.dumps(shell, default=str))
             kept: list[Any] = []
             for row in ranked:
-                rj = len(json.dumps(row, default=str)) + 1
-                if kept and acc + rj > budget:
+                t = _ntok(json.dumps(row, default=str))
+                if kept and acc + t > budget_tokens:
                     break
                 kept.append(row)
-                acc += rj
+                acc += t
             shell[list_key] = kept
             shell["_filtered"] = {
                 "kept": len(kept), "total": len(rows),
-                "note": ("rows filtered to those most relevant to this claim "
-                         "to fit the model context window"),
+                "note": "rows trimmed to the most claim-relevant to fit context",
             }
             return shell
+
     s = json.dumps(pruned, default=str)
-    return {"_truncated_text": s[:budget], "_total_chars": len(s)}
+    return {"_truncated_text": s[: budget_tokens * 3], "_total_chars": len(s)}
 
 
 def _compact_tool_context(tool_context: list[dict[str, Any]],
@@ -114,15 +226,18 @@ def _compact_tool_context(tool_context: list[dict[str, Any]],
     """Shrink tool results so the assembled prompt stays under the LLM limit."""
     if not tool_context:
         return tool_context
+    claim_codes = claim_procedure_codes(claim)
     claim_toks = _tokens(claim)
-    remaining = _TOOL_CONTEXT_CHAR_BUDGET
+    remaining = _TOOL_CONTEXT_TOKEN_BUDGET
     out: list[dict[str, Any]] = []
     for rec in tool_context:
         rec = dict(rec)
         if rec.get("result") is not None:
-            budget = max(20_000, min(_TOOL_RESULT_CHAR_BUDGET, remaining))
-            rec["result"] = _compact_one(rec["result"], claim_toks, budget)
-        remaining -= len(json.dumps(rec, default=str))
+            budget = max(5_000, min(_TOOL_RESULT_TOKEN_BUDGET, remaining))
+            rec["result"] = _compact_one(
+                rec["result"], claim_codes, claim_toks, budget
+            )
+        remaining -= _ntok(json.dumps(rec, default=str))
         out.append(rec)
     return out
 

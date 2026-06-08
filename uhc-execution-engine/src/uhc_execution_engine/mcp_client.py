@@ -26,6 +26,15 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# Retry policy for transient network/TLS failures talking to the MCP host.
+_MCP_MAX_ATTEMPTS = 3
+_MCP_BACKOFF_SECONDS = 0.75
+_RETRYABLE_ERRORS = (
+    requests.exceptions.SSLError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
+
 
 @lru_cache(maxsize=1)
 def _active_config() -> dict[str, Any] | None:
@@ -88,29 +97,47 @@ def mcp_invoke(tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
     body = {cfg["claim_arg"]: claim_id}
 
     t0 = time.time()
-    try:
-        resp = requests.request(
-            cfg["http_method"], url, json=body, headers=headers,
-            timeout=cfg["timeout"],
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        # Unwrap the ToolCallResult envelope → the data the rules care about.
-        result: Any = payload
-        if isinstance(payload, dict):
-            inner = payload.get("response", payload)
-            if isinstance(inner, dict) and "body" in inner:
-                result = inner["body"]
-            else:
-                result = inner
-        return {
-            "ok": True, "tool": tool_name, "args": dict(args),
-            "result": result, "error": "",
-            "duration_ms": int((time.time() - t0) * 1000),
-        }
-    except Exception as exc:
-        return {
-            "ok": False, "tool": tool_name, "args": dict(args),
-            "result": None, "error": f"mcp call failed: {exc}",
-            "duration_ms": int((time.time() - t0) * 1000),
-        }
+    # Transient TLS/connection blips on the MCP host (e.g. an incomplete cert
+    # chain served mid-deploy, or a dropped connection) must not fail an entire
+    # claim at the fetch step. Retry a few times with a short backoff; only
+    # network-level errors are retried, not HTTP 4xx/5xx responses.
+    last_exc: Exception | None = None
+    for attempt in range(_MCP_MAX_ATTEMPTS):
+        try:
+            resp = requests.request(
+                cfg["http_method"], url, json=body, headers=headers,
+                timeout=cfg["timeout"],
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            # Unwrap the ToolCallResult envelope → the data the rules care about.
+            result: Any = payload
+            if isinstance(payload, dict):
+                inner = payload.get("response", payload)
+                if isinstance(inner, dict) and "body" in inner:
+                    result = inner["body"]
+                else:
+                    result = inner
+            return {
+                "ok": True, "tool": tool_name, "args": dict(args),
+                "result": result, "error": "",
+                "duration_ms": int((time.time() - t0) * 1000),
+            }
+        except _RETRYABLE_ERRORS as exc:
+            last_exc = exc
+            if attempt + 1 < _MCP_MAX_ATTEMPTS:
+                logger.warning(
+                    "mcp_invoke %s transient error (attempt %d/%d): %s",
+                    tool_name, attempt + 1, _MCP_MAX_ATTEMPTS, exc,
+                )
+                time.sleep(_MCP_BACKOFF_SECONDS * (attempt + 1))
+                continue
+        except Exception as exc:  # non-retryable (HTTP error, bad JSON, …)
+            last_exc = exc
+            break
+
+    return {
+        "ok": False, "tool": tool_name, "args": dict(args),
+        "result": None, "error": f"mcp call failed: {last_exc}",
+        "duration_ms": int((time.time() - t0) * 1000),
+    }
