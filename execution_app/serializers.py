@@ -19,18 +19,21 @@ def claim_audit_status(run: RuleExecutionRun) -> str:
         return trace_builder.INCONCLUSIVE
     if run.status in {"FAILED", "FETCH_FAILED"}:
         return trace_builder.INCONCLUSIVE
-    trace = getattr(run, "trace", None)
-    if trace is not None:
-        # final_status is stored as the canonical value for new runs; older
-        # rows may carry Met/Not-Met, so normalize defensively.
-        if trace.trace_json:
-            return trace_builder.claim_status(trace.trace_json)
-        if trace.final_status:
-            return trace_builder.normalize_status(trace.final_status)
     if run.status == "TERMINATED_EARLY":
         return trace_builder.DEFECT
-    return (trace_builder.normalize_decision(run.final_decision_type)
-            or trace_builder.INCONCLUSIVE)
+    # The engine's aggregated verdict is authoritative: ALLOW → CLEAN,
+    # DENY/REFER/PEND/STOP → DEFECT. Intermediate Not-Met sub-checks never
+    # by themselves make a claim a defect.
+    decided = trace_builder.normalize_decision(run.final_decision_type)
+    if decided:
+        return decided
+    trace = getattr(run, "trace", None)
+    if trace is not None:
+        if trace.final_status:
+            return trace_builder.normalize_status(trace.final_status)
+        if trace.trace_json:
+            return trace_builder.claim_status(trace.trace_json)
+    return trace_builder.INCONCLUSIVE
 
 
 class ToolInvocationRecordSerializer(serializers.ModelSerializer):

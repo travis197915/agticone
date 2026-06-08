@@ -156,6 +156,43 @@ def extract_bindings_from_properties(shape) -> None:
 # ── Read path: binding tables → properties ──────────────────────────────────
 
 
+def _rule_keys_out_of_scope(rule_keys) -> set[str]:
+    """Return the subset of ``rule_keys`` whose SOP step/decision is out of scope.
+
+    A rule_key is ``step:<sop_id>:<step_no>:<row_index>`` for decision rules.
+    OOS is true when either the AuditStep or its AuditDecision is flagged
+    ``is_out_of_scope`` (mirrors ``rule_loader._hydrate_decision``).
+    Preconditions (``pre:...``) are never out of scope.
+    """
+    oos: set[str] = set()
+    try:
+        from sop_ingestion.models import AuditDecision  # local import
+    except Exception:
+        return oos
+
+    for key in rule_keys:
+        m = re.match(r"^step:(\d+):(\d+):(\d+)$", key or "")
+        if not m:
+            continue
+        sop_id, step_no, row_index = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        try:
+            dec = (
+                AuditDecision.objects
+                .select_related("step")
+                .filter(
+                    step__sop_id=sop_id,
+                    step__step_number=step_no,
+                    row_index=row_index,
+                )
+                .first()
+            )
+        except Exception:
+            dec = None
+        if dec is not None and (dec.is_out_of_scope or dec.step.is_out_of_scope):
+            oos.add(key)
+    return oos
+
+
 def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
     """Return shape.properties augmented with sop_rules + tool_calls from DB."""
     props = dict(shape.properties or {})
@@ -179,6 +216,7 @@ def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
             if isinstance(raw, dict) and raw.get("key"):
                 raw_by_key[raw["key"]] = raw
 
+        oos_keys = _rule_keys_out_of_scope([r.rule_key for r in rule_rows])
         props["sop_rules"] = []
         for row in rule_rows:
             entry = dict(raw_by_key.get(row.rule_key) or {})
@@ -193,8 +231,17 @@ def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
                 "excluded_by":    row.excluded_by_json or [],
                 "html_reference": row.html_reference_json or {},
                 "ordering":       row.ordering,
+                "is_out_of_scope": row.rule_key in oos_keys,
             })
             props["sop_rules"].append(entry)
+
+        # Shape-level rollup so the canvas can flag the node without having to
+        # inspect every rule. ``is_out_of_scope`` is true only when EVERY bound
+        # rule is an out-of-scope (clean-exclusion) rule; ``oos_rule_count`` /
+        # ``rule_count`` let the UI mark partially-OOS nodes too.
+        props["oos_rule_count"] = len(oos_keys)
+        props["rule_count"] = len(rule_rows)
+        props["is_out_of_scope"] = bool(oos_keys) and len(oos_keys) == len(rule_rows)
 
     try:
         tool_rows = list(

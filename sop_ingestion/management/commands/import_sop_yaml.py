@@ -56,16 +56,45 @@ _VALID_DECISIONS = {
 
 
 def _classify_decision(text: str) -> str:
-    t = (text or "").upper()
-    if "CDD" in t:                              return "DENY"
+    """Map a rule's action/output text to an adjudication disposition.
+
+    CRITICAL: only *terminal dispositions* (DENY/REFER/PEND/STOP/...) may drive
+    the claim verdict. Flow-control language — "proceed to next step", "skip to
+    step N", "go to step N", "retrieve ...", "call <tool>" — and "out of scope"
+    (a clean line-item exclusion, tracked separately via is_out_of_scope) are
+    NOT dispositions. Classifying routing as REFER/STOP was producing false
+    DEFECT/REFER verdicts on clean claims, so routing now falls through to the
+    neutral CONDITIONAL bucket and never outranks ALLOW in the aggregator.
+    """
+    # Normalize hyphenated/underscored spellings so "out-of-scope" and
+    # "out of scope" (and "skip-to" / "skip to") are treated identically.
+    t = re.sub(r"[-_]+", " ", (text or "").upper())
+    if "CDD" in t:                                    return "DENY"
     if "DENY" in t or "DENIAL" in t or "DENIED" in t: return "DENY"
-    if "BYPASS" in t or "OVERRIDE" in t:        return "BYPASS"
-    if "PEND" in t:                             return "PEND"
-    if "STOP" in t or "OUT OF SCOPE" in t:      return "STOP"
+    if "BYPASS" in t or "OVERRIDE" in t:              return "BYPASS"
+    if "PEND" in t:                                   return "PEND"
+    if "WAIVE" in t:                                  return "WAIVE"
     if "ALLOW" in t or ("PROCESS" in t and "F3" in t): return "ALLOW"
-    if "WAIVE" in t:                            return "WAIVE"
-    if "PROCEED" in t or "SKIP TO" in t or "REFER" in t: return "REFER"
+    # A genuine referral disposition routes the claim to a human reviewer. In
+    # this SOP corpus "refer to <SOP / list / table / section>" is a *citation*,
+    # not a disposition — so only treat explicit reviewer routing as REFER.
+    if "REFERRAL" in t or ("REFER" in t and any(
+        kw in t for kw in _REVIEWER_TARGETS)):        return "REFER"
+    # A genuine hard stop — but NOT "out of scope" (a clean exclusion / handoff,
+    # tracked via is_out_of_scope) and NOT the routing verbs below.
+    if "STOP" in t and "OUT OF SCOPE" not in t:       return "STOP"
+    # "proceed", "skip to", "go to step", "retrieve", "call <tool>",
+    # "refer to <document>" and "out of scope" are routing / data-gathering,
+    # not dispositions.
     return "CONDITIONAL"
+
+
+# Phrases that mark a genuine "send this claim to a human" referral, as opposed
+# to a "refer to <document/SOP/list>" citation.
+_REVIEWER_TARGETS = (
+    "NURSE", "SPECIALIST", "MEDICAL DIRECTOR", "CLINICAL REVIEW", "MANUAL REVIEW",
+    "REVIEWER", "ADJUSTER", "REFER THE CLAIM", "REFER FOR", "REFER TO A ",
+)
 
 
 def _extract_codes(text: str) -> dict[str, list[str]]:
@@ -305,6 +334,12 @@ class Command(BaseCommand):
         intro_text = "\n\n".join(intro_bits)
 
         step_oos = _is_out_of_scope(description, conditions, actions, output)
+        # A "blank" step has no real evaluation criteria (empty conditions,
+        # actions and subrules — e.g. a placeholder rung). When such a step is
+        # out of scope it must be SKIPPED and the audit must CONTINUE to the
+        # next step, NOT treated as a terminal exclusion that halts the path.
+        # We mark it non-final so the execution engine pre-skips it in place.
+        is_blank = not conditions and not actions and not subrules
         action_blob = " ".join([description] + actions + [output])
         terminal_action = ""
         is_terminal = False
@@ -348,7 +383,9 @@ class Command(BaseCommand):
                 "tooling_allowed": bool(rule.get("tooling_allowed", True)),
                 "is_out_of_scope": step_oos,
                 "goto_step": _extract_goto(action_blob),
-                "is_final": is_terminal or step_oos,
+                # Blank out-of-scope steps are skip-and-continue (non-final);
+                # content-bearing OOS exclusions remain terminal stops.
+                "is_final": is_terminal or (step_oos and not is_blank),
                 "aggregation": "LEAF",
                 "codes": codes,
                 "children": [],

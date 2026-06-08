@@ -105,8 +105,15 @@ def _persist_trace(state: ExecutionState) -> None:
         list(state.get("tool_invocations") or []),
     )
     # Store the *overall* claim audit status (CLEAN / DEFECT / INCONCLUSIVE),
-    # not just the first agent's — the list view reads this directly.
-    final_status = trace_builder.claim_status(trace)
+    # not just the first agent's — the list view reads this directly. The
+    # engine's aggregated verdict (final_decision_type) is authoritative: an
+    # ALLOW means "no adverse disposition applied" → CLEAN, regardless of how
+    # many intermediate sub-checks were Not-Met. Fall back to the per-step
+    # trace rollup only when there is no decision (e.g. a fetch/exec failure).
+    final_status = (
+        trace_builder.normalize_decision(state.get("final_decision_type") or "")
+        or trace_builder.claim_status(trace)
+    )
     ClaimTrace.objects.update_or_create(
         run=run,
         defaults=dict(

@@ -134,7 +134,9 @@ class Shape(_UUIDPK, _Timestamps):
     definition = models.ForeignKey(
         "ShapeDefinition", on_delete=models.PROTECT, related_name="instances",
     )
-    label = models.CharField(max_length=255, blank=True, default="")
+    # TextField (not CharField) so a node can carry the FULL SOP step text
+    # untruncated — some audit steps run well past 255 chars.
+    label = models.TextField(blank=True, default="")
     description = models.TextField(blank=True, default="")
     position_x = models.FloatField(default=0)
     position_y = models.FloatField(default=0)

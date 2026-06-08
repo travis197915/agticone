@@ -241,13 +241,16 @@ def _claim_status(
         return INCONCLUSIVE
     if run.status in {"FAILED", "FETCH_FAILED"}:
         return INCONCLUSIVE
-    if trace is not None and trace.trace_json:
-        return trace_builder.claim_status(trace.trace_json)
     if run.status == "TERMINATED_EARLY":
         return DEFECT
+    # The engine's aggregated verdict is authoritative (ALLOW → CLEAN,
+    # DENY/REFER/PEND/STOP → DEFECT). Only fall back to the trace / node rollup
+    # when there is no decision at all.
     decision = trace_builder.normalize_decision(run.final_decision_type)
     if decision:
         return decision
+    if trace is not None and trace.trace_json:
+        return trace_builder.claim_status(trace.trace_json)
     statuses = [_agent_status(node) for node in nodes]
     return trace_builder.aggregate_status(statuses)
 

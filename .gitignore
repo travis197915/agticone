@@ -38,7 +38,20 @@ uhc-agentic.log
 synthetic_claims.xlsx
 synthetic_claims_3.xlsx
 SOP_Rule-to-Tool_Mapping_Report.docx
+SOP_Rule-to-Tool_Mapping_Report (1).docx
 graphify-out/
 yaml_explained/
 datadump/
 yaml/
+
+# ── Claim audit scratch data & scripts ───────────────────────────────────
+CBD_Coverage.json
+claimid_*.json
+ClaimPopulation.xlsx
+Copy_final_samples.xlsx
+test_claim_*.xlsx
+IMG20260607124519.jpg.jpeg
+dispatch_claim_batch.py
+run_claim_audit.py
+seed_claim_to_mock.py
+docs/data/

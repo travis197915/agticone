@@ -39,6 +39,32 @@ _DEFECT_DECISIONS = {"DENY", "STOP", "REFER", "REFERRAL", "PEND", "PENDED"}
 _CLEAN_DECISIONS = {"ALLOW", "APPROVE", "APPROVED", "PAY", "PASS"}
 _HALT_DECISION_TYPES = _DEFECT_DECISIONS
 
+# Coverage-validation tools. Per the auditor spec sheet, "Coverage validation
+# failed due to ... failed tool execution" is a DEFECT for the CoverageBenefit
+# process — so a *failed* coverage tool is treated as a hard finding, not as a
+# silent pass. Every other tool that a step relied on, when it fails, leaves the
+# auditor unable to conclude → INCONCLUSIVE (never auto-CLEAN).
+_COVERAGE_TOOLS = {
+    "cbd_coverage", "check_medicare_coverage",
+    "check_coverage_commercial", "check_coverage_medicaid",
+}
+
+
+def tool_failure_status(failed_tool_names) -> str:
+    """Audit impact of the tools a step relied on having failed.
+
+    Think like a human auditor: if the coverage API you needed errored out you
+    cannot sign the claim off — that is a DEFECT (Not-Met). If any other check
+    you needed errored out you simply cannot conclude — that is INCONCLUSIVE.
+    Returns ``""`` when nothing failed.
+    """
+    failed = {str(n) for n in (failed_tool_names or [])}
+    if not failed:
+        return ""
+    if failed & _COVERAGE_TOOLS:
+        return NOT_MET
+    return INCONCLUSIVE_RULE
+
 _MET_TOKENS = {"met", "match", "matched", "pass", "passed", "clean", "allow", "ok"}
 _NOT_MET_TOKENS = {
     "not-met", "notmet", "fail", "failed", "deny", "denied", "defect",
@@ -81,6 +107,14 @@ def _status_for_eval(ev: dict[str, Any]) -> str:
     """Rule-level verdict for one evaluation (Met / Not-Met / Inconclusive / Skipped)."""
     if ev.get("skipped"):
         return SKIPPED_RULE
+    # An out-of-scope match is usually a clean line-item exclusion / handoff
+    # ("corrected/void claim — refer to Attachment Validation, out of scope"),
+    # which must not be painted Not-Met (the UI renders that as DEFECT). The
+    # exception is a terminal adverse disposition that applies a code and then
+    # stops (e.g. "Deny with F24 ... out of scope"): those carry codes and stay
+    # real findings.
+    if ev.get("is_out_of_scope") and not ev.get("codes"):
+        return SKIPPED_RULE
     explicit = _normalize_rule_status(ev.get("llm_status", ""))
     if explicit:
         return explicit
@@ -91,6 +125,47 @@ def _status_for_eval(ev: dict[str, Any]) -> str:
     if matched:
         return MET
     return INCONCLUSIVE_RULE
+
+
+def _eval_applies_defect(ev: dict[str, Any]) -> bool:
+    """True only when an evaluation *applies* an adverse disposition.
+
+    A defect is a rule that fired (matched) AND carries an adverse decision
+    type (DENY / REFER / PEND / STOP). A rule whose condition is merely
+    "Not-Met", or that routes the flow ("proceed" / "skip to" → CONDITIONAL),
+    is NOT a defect — that is normal SOP branching. This mirrors the engine's
+    own aggregator, whose ALLOW verdict means "no adverse disposition applied".
+    """
+    if ev.get("skipped"):
+        return False
+    if not ev.get("matched"):
+        return False
+    return (ev.get("decision_type") or "").upper() in _DEFECT_DECISIONS
+
+
+def _step_audit_status(evs: list[dict[str, Any]]) -> str:
+    """Step verdict for the audit view (Met / Not-Met / Inconclusive / Skipped).
+
+    Disposition-driven, NOT condition-driven: a step is Not-Met (DEFECT) only
+    when one of its rules applied an adverse disposition. A step that was
+    evaluated without any adverse disposition is Met (CLEAN) even if individual
+    sub-checks reported "Not-Met" (e.g. "this defect code is absent" / "rule
+    does not apply"). Steps with nothing to evaluate roll up to Skipped.
+    """
+    considered = [
+        e for e in evs
+        if not e.get("skipped")
+        and not (e.get("is_out_of_scope") and not e.get("codes"))
+    ]
+    if not considered:
+        return SKIPPED_RULE
+    if any(_eval_applies_defect(e) for e in considered):
+        return NOT_MET
+    evaluated = any(
+        e.get("matched") or _normalize_rule_status(e.get("llm_status", ""))
+        for e in considered
+    )
+    return MET if evaluated else INCONCLUSIVE_RULE
 
 
 def _aggregate_rule_status(statuses: list[str]) -> str:
@@ -129,12 +204,19 @@ def normalize_status(raw: str) -> str:
 
 
 def normalize_decision(decision_type: str) -> str:
-    """Map an engine decision type to CLEAN / DEFECT, or ``""`` if unknown."""
+    """Map an engine decision type to CLEAN / DEFECT / INCONCLUSIVE, or ``""``.
+
+    Returns ``""`` only for genuinely unknown types so callers can fall back to
+    the per-step trace rollup. The explicit ``INCONCLUSIVE`` verdict (emitted by
+    the aggregator when a required tool failed) maps straight through.
+    """
     d = (decision_type or "").strip().upper()
     if d in _DEFECT_DECISIONS:
         return DEFECT
     if d in _CLEAN_DECISIONS:
         return CLEAN
+    if d == "INCONCLUSIVE":
+        return INCONCLUSIVE
     return ""
 
 
@@ -229,12 +311,12 @@ def build_trace(
         subrules = [e for e in evs if e.get("subrule_id")]
         parent = parents[0] if parents else head
 
+        # Sub-rule rows keep their *factual* Met/Not-Met for the detail view…
         sub_results = [_subrule_entry(e) for e in subrules]
-        component_statuses = [r["status"] for r in sub_results] or [
-            _status_for_eval(e) for e in evs
-        ]
-        # Step status stays in rule vocabulary (Met/Not-Met/Inconclusive).
-        step_status = _aggregate_rule_status(component_statuses)
+        # …but the step's audit verdict is disposition-driven: Not-Met (DEFECT)
+        # only when a rule actually applied an adverse disposition, never just
+        # because a sub-check's condition was Not-Met.
+        step_status = _step_audit_status(evs)
 
         # Evidence refs: merge any LLM-supplied refs across the group.
         evidence_refs: list[str] = []
@@ -260,6 +342,16 @@ def build_trace(
             evidence_refs.append(
                 f"TOOL_OK:{name}" if name in succeeded else f"TOOL_FAIL:{name}"
             )
+
+        # Auditor rule: a step that relied on a tool which *failed* cannot be a
+        # silent pass. A failed coverage tool is a DEFECT (Not-Met); any other
+        # failed tool the step needed makes the step INCONCLUSIVE. We only
+        # escalate (never downgrade a real Not-Met to Inconclusive).
+        fail_status = tool_failure_status(failed)
+        if fail_status == NOT_MET:
+            step_status = NOT_MET
+        elif fail_status == INCONCLUSIVE_RULE and step_status not in (NOT_MET,):
+            step_status = INCONCLUSIVE_RULE
 
         llm_ms = sum(int(e.get("llm_ms") or 0) for e in evs)
         rationale = "; ".join(

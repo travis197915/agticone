@@ -20,7 +20,8 @@ from typing import Any, Iterator
 
 from django.utils import timezone
 
-from .claim_fetcher import fetch_claim, parse_claim, workflow_uses_parser
+from .claim_fetcher import (fetch_claim, parse_claim, workflow_fetch_tool,
+                            workflow_uses_parser)
 from .pipeline import RuleEnginePipeline
 from .rule_loader import load_workflow_bindings
 from .xlsx_parser import XlsxParseError, extract_claim_ids
@@ -124,6 +125,7 @@ class BatchRunner:
             }
             return
         use_parser = workflow_uses_parser(loaded["all_tool_bindings"])
+        fetch_tool = workflow_fetch_tool(workflow_id)
 
         # ── 3. Reserve / fetch the BatchExecutionRun row ──────────────────
         # If the caller pre-created it (async path), update it with the
@@ -165,7 +167,8 @@ class BatchRunner:
                     batch_id, len(claim_ids))
         for cid in claim_ids:
             res = self._run_one(workflow_id=str(workflow_id), claim_id=cid,
-                                batch_id=batch_id, use_parser=use_parser)
+                                batch_id=batch_id, use_parser=use_parser,
+                                fetch_tool=fetch_tool)
             counted_as = ("completed" if res["status"]
                           in {"COMPLETED", "TERMINATED_EARLY"} else "failed")
             if counted_as == "completed":
@@ -262,12 +265,15 @@ class BatchRunner:
     # ── Per-claim worker (unchanged) ────────────────────────────────────────
 
     def _run_one(self, *, workflow_id: str, claim_id: str,
-                 batch_id: str, use_parser: bool) -> dict[str, Any]:
+                 batch_id: str, use_parser: bool,
+                 fetch_tool: str | None = None) -> dict[str, Any]:
         from execution_app.models import (RuleExecutionRun,
                                              ToolInvocationRecord)
 
-        # 1. Fetch the claim via linx_claim_search
-        fetch_out = fetch_claim(claim_id)
+        # 1. Fetch the claim via the workflow's configured fetch tool
+        #    (defaults to linx_claim_search; this flow overrides it via
+        #    Workflow.metadata['fetch_tool'] so linx is never used).
+        fetch_out = fetch_claim(claim_id, tool_name=fetch_tool)
         if not fetch_out["ok"]:
             run_id = str(uuid.uuid4())
             run = RuleExecutionRun.objects.create(
@@ -276,7 +282,7 @@ class BatchRunner:
                 raw_fetch=fetch_out.get("result") if isinstance(fetch_out.get("result"), dict) else {},
                 finished_at=timezone.now(),
                 status="FETCH_FAILED",
-                error_message=f"linx_claim_search: {fetch_out['error']}",
+                error_message=f"{fetch_out['tool']}: {fetch_out['error']}",
             )
             ToolInvocationRecord.objects.create(
                 run=run, tool_name=fetch_out["tool"], phase="FETCH",
@@ -286,7 +292,7 @@ class BatchRunner:
             return {
                 "run_id": run_id, "claim_id": claim_id,
                 "status": "FETCH_FAILED",
-                "error_message": f"linx_claim_search: {fetch_out['error']}",
+                "error_message": f"{fetch_out['tool']}: {fetch_out['error']}",
                 "tool_invocations": [{
                     "tool": fetch_out["tool"], "phase": "FETCH",
                     "ok": False, "ms": fetch_out["duration_ms"],

@@ -9,6 +9,7 @@ Each rule produces one LLM call. The prompt gets:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from ..config import EngineConfig
@@ -16,6 +17,114 @@ from ..field_mapping import format_mapped_fields_block, resolve_sop_fields
 from ..llm import llm_call
 
 _EVAL_REQUIRED = ["matched", "reasoning", "confidence"]
+
+# ── Tool-result compaction ───────────────────────────────────────────────────
+# Tool results are embedded verbatim into the rule-eval prompt. A few tools
+# (notably ``cbd_coverage``) return very large reference grids — e.g. ~734
+# coverage rows ≈ 265k tokens — which on their own blow past the model's 200k
+# context window (Anthropic 400 "prompt is too long"). When that happens the
+# OpenAI fallback can't recover and the rule silently returns a "not matched"
+# fallback, so coverage checks are skipped while the claim still reports CLEAN.
+#
+# To keep every rule actually evaluated we compact each tool result before it
+# enters the prompt: (1) drop empty values and audit/id metadata — lossless for
+# decisioning; (2) if a result is still oversized, keep the rows most relevant
+# to the claim (token overlap) so the needle stays in.
+_TOOL_RESULT_CHAR_BUDGET = 560_000   # per single tool result (~140k tokens)
+_TOOL_CONTEXT_CHAR_BUDGET = 600_000  # all tool results combined (~150k tokens)
+
+_EMPTY_SCALARS = {None, "", "N/A", "None", "null"}
+
+
+def _is_empty(v: Any) -> bool:
+    if isinstance(v, (dict, list)):
+        return len(v) == 0
+    return v in _EMPTY_SCALARS
+
+
+def _is_noise_key(key: Any) -> bool:
+    """Audit/identifier columns that carry no decisioning signal."""
+    k = str(key).lower()
+    if k in {"updatedby", "updateddate", "createdby", "createddate",
+             "filename", "fileextension", "documentlinks", "per",
+             "mappingid", "gridid", "cnpid"}:
+        return True
+    return k.endswith("id") or k.endswith("comment") or k == "comments"
+
+
+def _prune(obj: Any) -> Any:
+    """Recursively drop empty values + audit/id metadata. Lossless for rules."""
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            if _is_noise_key(k):
+                continue
+            pv = _prune(v)
+            if _is_empty(pv):
+                continue
+            out[k] = pv
+        return out
+    if isinstance(obj, list):
+        return [_prune(v) for v in obj]
+    return obj
+
+
+def _tokens(obj: Any) -> set[str]:
+    return set(re.findall(r"[a-z0-9]{3,}", json.dumps(obj, default=str).lower()))
+
+
+def _compact_one(result: Any, claim_toks: set[str], budget: int) -> Any:
+    pruned = _prune(result)
+    if len(json.dumps(pruned, default=str)) <= budget:
+        return pruned
+    # Oversized: find the dominant list and keep the rows most relevant to the
+    # claim until the budget is spent.
+    if isinstance(pruned, dict):
+        list_key, best = None, -1
+        for k, v in pruned.items():
+            if isinstance(v, list):
+                sz = len(json.dumps(v, default=str))
+                if sz > best:
+                    best, list_key = sz, k
+        if list_key is not None:
+            rows = pruned[list_key]
+            ranked = sorted(rows, key=lambda r: -len(_tokens(r) & claim_toks))
+            shell = {k: v for k, v in pruned.items() if k != list_key}
+            acc = len(json.dumps(shell, default=str))
+            kept: list[Any] = []
+            for row in ranked:
+                rj = len(json.dumps(row, default=str)) + 1
+                if kept and acc + rj > budget:
+                    break
+                kept.append(row)
+                acc += rj
+            shell[list_key] = kept
+            shell["_filtered"] = {
+                "kept": len(kept), "total": len(rows),
+                "note": ("rows filtered to those most relevant to this claim "
+                         "to fit the model context window"),
+            }
+            return shell
+    s = json.dumps(pruned, default=str)
+    return {"_truncated_text": s[:budget], "_total_chars": len(s)}
+
+
+def _compact_tool_context(tool_context: list[dict[str, Any]],
+                          claim: dict[str, Any]) -> list[dict[str, Any]]:
+    """Shrink tool results so the assembled prompt stays under the LLM limit."""
+    if not tool_context:
+        return tool_context
+    claim_toks = _tokens(claim)
+    remaining = _TOOL_CONTEXT_CHAR_BUDGET
+    out: list[dict[str, Any]] = []
+    for rec in tool_context:
+        rec = dict(rec)
+        if rec.get("result") is not None:
+            budget = max(20_000, min(_TOOL_RESULT_CHAR_BUDGET, remaining))
+            rec["result"] = _compact_one(rec["result"], claim_toks, budget)
+        remaining -= len(json.dumps(rec, default=str))
+        out.append(rec)
+    return out
 
 
 def _tool_context_for_rule(rule: dict[str, Any],
@@ -55,6 +164,10 @@ def evaluate_one_rule(cfg: EngineConfig, *, rule: dict[str, Any],
                       tool_context: list[dict[str, Any]],
                       stage: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run one LLM evaluation. Returns (verdict, meta)."""
+    # Compact oversized tool results (e.g. cbd_coverage's coverage grid) so the
+    # assembled prompt stays within the model's context window. Without this a
+    # single large tool result 400s the call and the rule is never evaluated.
+    tool_context = _compact_tool_context(tool_context, claim)
     # Resolve canonical SOP fields (Provider TIN, Received Date, …) from the
     # claim + tool results via sop_field_mapping.yaml. Additive: an empty
     # result simply omits the block and the prompt is unchanged.

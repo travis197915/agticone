@@ -26,6 +26,43 @@ logger = logging.getLogger(__name__)
 _PRECEDENCE = ["DENY", "STOP", "PEND", "REFER", "BYPASS", "WAIVE",
                "CONDITIONAL", "SYSTEM", "ALLOW"]
 
+# Coverage-validation tools. Per the auditor spec, a *failed* coverage tool is a
+# DEFECT for CoverageBenefit ("Coverage validation failed due to ... failed tool
+# execution"). Any other tool a step relied on, when it fails, means the auditor
+# cannot conclude → INCONCLUSIVE (never a silent ALLOW).
+_COVERAGE_TOOLS = {
+    "cbd_coverage", "check_medicare_coverage",
+    "check_coverage_commercial", "check_coverage_medicaid",
+}
+
+
+def _failed_tools_relied_on(state: ExecutionState) -> tuple[set[str], set[str]]:
+    """Return (failed_coverage_tools, failed_other_tools) for tools that a
+    non-skipped, evaluated rule actually relied on. Tools attached to skipped
+    (routed-past) steps are ignored — a human auditor doesn't fault a step the
+    SOP told them to skip."""
+    tool_results = state.get("tool_results") or {}
+    failed_bindings = {
+        str(bid) for bid, rec in tool_results.items()
+        if isinstance(rec, dict) and not rec.get("ok", True)
+    }
+    if not failed_bindings:
+        return set(), set()
+    relied: set[str] = set()
+    for r in (state.get("rule_results") or []):
+        if r.get("skipped"):
+            continue
+        for bid in (r.get("tool_results_used") or []):
+            if str(bid) in failed_bindings:
+                relied.add(str(bid))
+    names = {
+        (tool_results.get(bid) or {}).get("tool_name", "")
+        for bid in relied
+    }
+    names.discard("")
+    cov = {n for n in names if n in _COVERAGE_TOOLS}
+    return cov, names - cov
+
 
 def _fallback_aggregate(matched: list[dict]) -> dict:
     """Deterministic fallback used when the LLM aggregator fails."""
@@ -119,6 +156,78 @@ def aggregate_decision(state: ExecutionState) -> dict:
             "final_decision_type": "ALLOW",
             "applied_codes": [],
             "narrative": "No decision rules matched; defaulting to ALLOW.",
+            "stages": stages,
+        }
+
+    # Deterministic clean-claim guard. A claim is a defect ONLY when a matched
+    # rule applies an adverse disposition (DENY/STOP/PEND/REFER...). If every
+    # matched rule is routing / data-gathering / pass (CONDITIONAL, SYSTEM,
+    # ALLOW), the verdict is ALLOW — decided here, deterministically, with NO
+    # LLM call. This prevents the aggregator from ever hallucinating a defect
+    # onto a structurally clean claim.
+    _ADVERSE = {"DENY", "STOP", "PEND", "REFER", "REFERRAL", "PENDED"}
+    adverse = [r for r in matched
+               if (r.get("decision_type") or "").upper() in _ADVERSE]
+    if not adverse:
+        # Auditor guard: before signing off CLEAN, make sure the tools the
+        # evaluated steps relied on actually returned. A failed *coverage* tool
+        # is a DEFECT (per spec → REFER for manual coverage review); any other
+        # failed tool the auditor needed makes the claim INCONCLUSIVE. Only a
+        # claim whose needed tools all succeeded is a true ALLOW.
+        cov_failed, other_failed = _failed_tools_relied_on(state)
+        if cov_failed:
+            narrative = (
+                "Coverage validation could not be completed — coverage tool(s) "
+                f"failed: {', '.join(sorted(cov_failed))}. Per audit policy a "
+                "failed coverage check is a DEFECT; routing to manual review."
+            )
+            logger.info("aggregate_decision claim=%s coverage tool failure -> REFER (%s)",
+                        state.get("claim_id") or "-", sorted(cov_failed))
+            stages.append({"node": "aggregate_decision", "status": "OK",
+                           "ms": int((time.time() - t0) * 1000),
+                           "msg": "coverage tool failed; DEFECT (REFER)"})
+            return {
+                "final_decision_type": "REFER",
+                "applied_codes": ["COVERAGE_VALIDATION_FAILED"],
+                "narrative": narrative,
+                "stages": stages,
+            }
+        if other_failed:
+            narrative = (
+                "Audit inconclusive — required tool(s) failed so the relevant "
+                f"checks could not be evaluated: {', '.join(sorted(other_failed))}. "
+                "No adverse disposition was found, but the claim cannot be "
+                "cleared without this evidence."
+            )
+            logger.info("aggregate_decision claim=%s tool failure -> INCONCLUSIVE (%s)",
+                        state.get("claim_id") or "-", sorted(other_failed))
+            stages.append({"node": "aggregate_decision", "status": "OK",
+                           "ms": int((time.time() - t0) * 1000),
+                           "msg": "required tool failed; INCONCLUSIVE"})
+            return {
+                "final_decision_type": "INCONCLUSIVE",
+                "applied_codes": [],
+                "narrative": narrative,
+                "stages": stages,
+            }
+        n_cond = sum(1 for r in matched
+                     if (r.get("decision_type") or "").upper() not in _ADVERSE)
+        logger.info(
+            "aggregate_decision claim=%s matched=%d adverse=0 -> deterministic "
+            "ALLOW (no LLM); %d routing/clean rules matched",
+            state.get("claim_id") or "-", len(matched), n_cond,
+        )
+        stages.append({"node": "aggregate_decision", "status": "OK",
+                       "ms": int((time.time() - t0) * 1000),
+                       "msg": "no adverse disposition; deterministic ALLOW"})
+        return {
+            "final_decision_type": "ALLOW",
+            "applied_codes": [],
+            "narrative": (
+                f"No adverse disposition applied: {len(matched)} rule(s) "
+                f"matched, all routing/clean (no DENY/REFER/PEND/STOP). "
+                f"Verdict ALLOW."
+            ),
             "stages": stages,
         }
 
