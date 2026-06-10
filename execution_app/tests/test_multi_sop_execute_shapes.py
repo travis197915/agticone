@@ -174,6 +174,51 @@ class MultiSopNamespacingTests(SimpleTestCase):
         self.assertIn("step:200:1:0", out["_eval_calls"])
 
 
+class ManualOutOfScopeTests(SimpleTestCase):
+    """A node the auditor manually marks out of scope is excluded from the
+    execution engine: every rule on it is SKIPPED with no LLM call, and the
+    rest of the workflow continues normally (it is NOT a clean stop)."""
+
+    def test_manual_oos_node_is_skipped_and_workflow_continues(self):
+        rules = [
+            _rule(1, 1, 0),
+            _rule(1, 2, 0, manual_oos=True),   # auditor-excluded node
+            _rule(1, 2, 1, manual_oos=True),   # second rule on the same node
+            _rule(1, 3, 0),
+        ]
+        verdicts = {
+            "step:1:1:0": {"matched": False},
+            "step:1:3:0": {"matched": False},
+        }
+        out = _run(rules, verdicts)
+        res = _by_key(out["rule_results"])
+
+        # Excluded node's rules are skipped, never evaluated.
+        self.assertTrue(res["step:1:2:0"]["skipped"])
+        self.assertTrue(res["step:1:2:1"]["skipped"])
+        self.assertTrue(res["step:1:2:0"]["manual_oos"])
+        self.assertNotIn("step:1:2:0", out["_eval_calls"])
+        self.assertNotIn("step:1:2:1", out["_eval_calls"])
+
+        # Surrounding steps still run — exclusion is not a clean stop.
+        self.assertFalse(res["step:1:1:0"]["skipped"])
+        self.assertFalse(res["step:1:3:0"]["skipped"])
+        self.assertIn("step:1:1:0", out["_eval_calls"])
+        self.assertIn("step:1:3:0", out["_eval_calls"])
+        self.assertNotIn("status", out)  # no TERMINATED_EARLY
+
+    def test_manual_oos_precondition_is_skipped(self):
+        pre = _rule(1, 1, 0, source="precondition",
+                    key="pre:1:7:0", manual_oos=True, decision_type="DENY")
+        # A DENY precondition would normally halt — but exclusion skips it.
+        rules = [pre, _rule(1, 1, 0)]
+        out = _run(rules, {"pre:1:7:0": {"matched": True}})
+        res = _by_key(out["rule_results"])
+        self.assertTrue(res["pre:1:7:0"]["skipped"])
+        self.assertNotIn("pre:1:7:0", out["_eval_calls"])
+        self.assertNotIn("status", out)  # not halted — precondition excluded
+
+
 class SingleSopParityTests(SimpleTestCase):
     def test_single_sop_goto_still_skips_intermediate_steps(self):
         rules = [

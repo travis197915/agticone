@@ -34,6 +34,48 @@ logger = logging.getLogger(__name__)
 _EXTRACTED_FLAG = "_ctx_codes_extracted"
 
 
+def _make_json_llm(cfg, max_tokens: int):
+    """JSON-extraction LLM, honouring the LLM_FORCE_PROVIDER override.
+
+    Defaults to OpenAI json_object mode; with ``LLM_FORCE_PROVIDER=anthropic``
+    returns Claude instead (caller prompts already demand JSON-only output and
+    the response is parsed defensively either way).
+    """
+    from .a07_enrich import _forced_provider
+    if _forced_provider() == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        return (
+            ChatAnthropic(
+                model=cfg.anthropic_model,
+                api_key=cfg.anthropic_api_key,
+                max_tokens=max_tokens,
+            ),
+            "anthropic",
+            cfg.anthropic_model,
+        )
+    from langchain_openai import ChatOpenAI
+    return (
+        ChatOpenAI(
+            model=cfg.openai_model,
+            api_key=cfg.openai_api_key,
+            max_tokens=max_tokens,
+            model_kwargs={"response_format": {"type": "json_object"}},
+        ),
+        "openai",
+        cfg.openai_model,
+    )
+
+
+def _parse_json_relaxed(text: str):
+    """json.loads that also tolerates ```json fences (Claude output)."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+        text = "\n".join(inner).strip()
+    return json.loads(text)
+
+
 def _all_text(state) -> str:
     """Collect all structured text into one block for the LLM."""
     parts = []
@@ -56,8 +98,7 @@ def _all_text(state) -> str:
 
 
 def _llm_extract_codes(cfg, text: str) -> list[dict]:
-    """Single OpenAI JSON-mode call to extract all code types."""
-    from langchain_openai import ChatOpenAI
+    """Single JSON-mode LLM call to extract all code types."""
     from langchain_core.messages import HumanMessage
 
     pg_logger = getattr(cfg, "_pg_logger", None)
@@ -93,12 +134,7 @@ Text to analyse:
 {text}"""
 
     try:
-        llm = ChatOpenAI(
-            model=cfg.openai_model,
-            api_key=cfg.openai_api_key,
-            max_tokens=4096,
-            model_kwargs={"response_format": {"type": "json_object"}},
-        )
+        llm, prov_name, model_name = _make_json_llm(cfg, max_tokens=4096)
         # Wrap in object because json_object mode requires an object root
         wrapped_prompt = (
             prompt.replace(
@@ -109,6 +145,9 @@ Text to analyse:
                 "}]}\n\nText"
             )
         )
+        if prov_name == "anthropic":
+            wrapped_prompt += ("\n\nIMPORTANT: Reply with valid JSON only. "
+                               "No markdown, no explanation.")
         resp  = llm.invoke([HumanMessage(content=wrapped_prompt)])
         usage = getattr(resp, "usage_metadata", None) or {}
         inp   = usage.get("input_tokens", 0)
@@ -119,15 +158,15 @@ Text to analyse:
             pg_logger.log_llm_call(
                 agent_name="code_detector",
                 stage="context_stage",
-                provider="openai",
-                model=cfg.openai_model,
+                provider=prov_name,
+                model=model_name,
                 prompt_tokens=inp,
                 completion_tokens=out,
                 duration_ms=ms,
                 success=True,
             )
 
-        data = json.loads(resp.content)
+        data = _parse_json_relaxed(resp.content)
         # OpenAI json_object mode always wraps in a dict — find the list
         if isinstance(data, dict):
             codes = data.get("codes") or next(
@@ -144,8 +183,8 @@ Text to analyse:
             pg_logger.log_llm_call(
                 agent_name="code_detector",
                 stage="context_stage",
-                provider="openai",
-                model=getattr(cfg, "openai_model", "unknown"),
+                provider=locals().get("prov_name", "openai"),
+                model=locals().get("model_name", "unknown"),
                 prompt_tokens=0,
                 completion_tokens=0,
                 duration_ms=ms,
@@ -156,8 +195,7 @@ Text to analyse:
 
 
 def _llm_extract_list_refs(cfg, text: str) -> list[dict]:
-    """OpenAI call to detect entity list references."""
-    from langchain_openai import ChatOpenAI
+    """JSON-mode LLM call to detect entity list references."""
     from langchain_core.messages import HumanMessage
 
     t0 = time.time()
@@ -178,12 +216,10 @@ Text:
 {text[:3000]}"""
 
     try:
-        llm = ChatOpenAI(
-            model=cfg.openai_model,
-            api_key=cfg.openai_api_key,
-            max_tokens=2048,
-            model_kwargs={"response_format": {"type": "json_object"}},
-        )
+        llm, prov_name, model_name = _make_json_llm(cfg, max_tokens=2048)
+        if prov_name == "anthropic":
+            prompt += ("\n\nIMPORTANT: Reply with valid JSON only. "
+                       "No markdown, no explanation.")
         resp  = llm.invoke([HumanMessage(content=prompt)])
         usage = getattr(resp, "usage_metadata", None) or {}
         ms    = int((time.time() - t0) * 1000)
@@ -191,14 +227,14 @@ Text:
             pg_logger.log_llm_call(
                 agent_name="entity_list_ref_detector",
                 stage="context_stage",
-                provider="openai",
-                model=cfg.openai_model,
+                provider=prov_name,
+                model=model_name,
                 prompt_tokens=usage.get("input_tokens", 0),
                 completion_tokens=usage.get("output_tokens", 0),
                 duration_ms=ms,
                 success=True,
             )
-        data = json.loads(resp.content)
+        data = _parse_json_relaxed(resp.content)
         if isinstance(data, dict):
             refs = data.get("refs") or next(
                 (v for v in data.values() if isinstance(v, list)), []
@@ -213,8 +249,8 @@ Text:
             pg_logger.log_llm_call(
                 agent_name="entity_list_ref_detector",
                 stage="context_stage",
-                provider="openai",
-                model=getattr(cfg, "openai_model", "unknown"),
+                provider=locals().get("prov_name", "openai"),
+                model=locals().get("model_name", "unknown"),
                 prompt_tokens=0, completion_tokens=0,
                 duration_ms=ms, success=False, error_message=str(exc),
             )

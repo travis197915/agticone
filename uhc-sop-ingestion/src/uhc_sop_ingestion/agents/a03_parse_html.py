@@ -580,6 +580,175 @@ def html_steps(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     return {"steps": steps}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 5b.  HTMLStepInventoryAgent — deterministic step context store + checklist
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# html_steps only extracts ONE primary consecutive-integer table. Many real
+# SOPs lay out EACH step as its own table (repeated step number per row, or a
+# single-row table, or an If/And/Then table under a "Step N — …" heading).
+# Those steps were silently swallowed into pre-sections and re-emerged as one
+# mega "Step 0" node.
+#
+# This agent walks the document IN ORDER with BS4 and claims every step number
+# it can find from any table shape, producing:
+#   * step_inventory — the context store: [{number, title, rows, raw_text,
+#     source_html}] with the raw cell grid of every row that belongs to the step
+#   * step_checklist — sorted list of step numbers found (the checklist the
+#     LLM reconciler downstream must satisfy — no step may be dropped)
+# It also prunes pre_sections that wrap claimed tables so the same rules are
+# not extracted twice (once as a step, once as "Step 0" preconditions).
+
+# Matches "Step 5 — Submission types" AND "Document search (pre–Step 3)" —
+# any heading that references a step number claims the content that follows.
+_RE_STEP_HEADING = re.compile(r"\bStep\s+(\d+)\b", re.I)
+_HDR_TOKENS = (_IF_HEADERS | _AND_HEADERS | _THEN_HEADERS
+               | {"step", "action", "step/action", "and… / then…"})
+
+
+def _cells_of(tr) -> list[str]:
+    return [_t(c) for c in tr.find_all(["td", "th"], recursive=False)]
+
+
+def _cell_split_nested(td) -> tuple[str, list]:
+    """Return (own_text, nested_tables): cell text EXCLUDING nested-table
+    content, plus the nested table tags. Keeps a step's question separate from
+    its inner If/Then decision grid."""
+    nested = td.find_all("table")
+    if not nested:
+        return _t(td), []
+    from bs4 import BeautifulSoup
+    clone = BeautifulSoup(str(td), "lxml")
+    for t in clone.find_all("table"):
+        t.decompose()
+    return clone.get_text(" ", strip=True), nested
+
+
+def _is_header_row_cells(cells: list[str]) -> bool:
+    norm = [re.sub(r"[…./\s]+$", "", c).strip().lower() for c in cells if c.strip()]
+    if not norm:
+        return True
+    return all(c in _HDR_TOKENS or
+               re.sub(r"[…./\s]+", "", c) in {"if", "and", "then", "andthen"}
+               for c in norm)
+
+
+def html_step_inventory(state: "PipelineState", cfg: "PipelineConfig") -> dict:
+    """Build the deterministic step inventory (context store) from the soup."""
+    soup = _soup(state)
+    if not soup:
+        return {}
+
+    entries: dict[int, dict] = {}
+    consumed_tables: list = []
+    consumed_blocks: list[str] = []   # html of claimed non-table blocks (lists)
+    current: int | None = None        # step context carried across elements
+
+    def _claim(num: int, cells: list[str], table) -> None:
+        e = entries.setdefault(num, {
+            "number": num, "title": "", "rows": [],
+            "raw_text": "", "source_html": "",
+        })
+        if cells and not _is_header_row_cells(cells):
+            e["rows"].append({"cells": cells})
+        if table is not None and table not in consumed_tables:
+            consumed_tables.append(table)
+        # Title = first substantive non-header cell text of the step
+        if not e["title"]:
+            for c in cells:
+                if c and not _is_pure_int(c) and len(c) > 10:
+                    e["title"] = c[:300]
+                    break
+
+    for el in soup.find_all(["h1", "h2", "h3", "h4", "table", "ul", "ol"]):
+        if el.name in ("h1", "h2", "h3", "h4"):
+            m = _RE_STEP_HEADING.search(_t(el))
+            current = int(m.group(1)) if m else None
+            continue
+
+        if el.name in ("ul", "ol"):
+            # Bullet-list instructions under a step heading (e.g. a
+            # "Document search (pre–Step 3)" block) — claim each bullet as a
+            # row of that step. Lists inside tables / nested lists are owned
+            # by their parent element.
+            if current is None:
+                continue
+            if el.find_parent("table") or el.find_parent(["ul", "ol"]):
+                continue
+            for li in el.find_all("li", recursive=False):
+                txt = _t(li)
+                if txt:
+                    _claim(current, [txt], None)
+            consumed_blocks.append(str(el))
+            continue
+
+        if el.find_parent("table") is not None:   # nested table → parent owns it
+            continue
+        rows = [tr for tr in el.find_all("tr") if tr.find_parent("table") == el]
+        table_current = None
+        table_has_int = False
+        for tr in rows:
+            cell_tags = tr.find_all(["td", "th"], recursive=False)
+            if not cell_tags:
+                continue
+            # Separate each cell's own text from any nested If/Then grid so
+            # the question and its decision rows become distinct rows.
+            own_texts: list[str] = []
+            nested_tables: list = []
+            for c in cell_tags:
+                txt, nested = _cell_split_nested(c)
+                own_texts.append(txt)
+                nested_tables.extend(nested)
+
+            num_idx = next((i for i, c in enumerate(own_texts[:2])
+                            if _is_pure_int(c)), None)
+            if num_idx is not None:
+                table_current = int(own_texts[num_idx])
+                table_has_int = True
+                _claim(table_current,
+                       own_texts[:num_idx] + own_texts[num_idx + 1:], el)
+            elif table_current is not None:
+                _claim(table_current, own_texts, el)
+            elif current is not None:
+                _claim(current, own_texts, el)
+
+            target = table_current if table_current is not None else current
+            if target is not None:
+                for nt in nested_tables:
+                    for ntr in nt.find_all("tr"):
+                        _claim(target, _cells_of(ntr), el)
+        # Numberless follow-up tables (e.g. a Group/Guidelines table right
+        # after "Is your claim for any of the Groups below?") belong to the
+        # last numbered table until a non-step heading resets the context.
+        if table_has_int:
+            current = table_current
+
+    for e in entries.values():
+        e["raw_text"] = "\n".join(
+            " | ".join(r["cells"]) for r in e["rows"])[:4000]
+
+    inventory = [entries[n] for n in sorted(entries)]
+    checklist = sorted(entries)
+    out: dict = {"step_inventory": inventory, "step_checklist": checklist}
+
+    # ── Prune pre-sections that wrap tables now claimed as steps ──────────────
+    pre = state.get("pre_sections") or []
+    if pre and (consumed_tables or consumed_blocks):
+        consumed_html = [str(t) for t in consumed_tables] + consumed_blocks
+        kept = []
+        for s in pre:
+            sh = s.get("source_html", "")
+            if sh and any(ch in sh or sh in ch for ch in consumed_html):
+                continue
+            kept.append(s)
+        if len(kept) != len(pre):
+            out["pre_sections"] = kept
+
+    logger.info("step_inventory: checklist=%s (%d tables claimed)",
+                checklist, len(consumed_tables))
+    return out
+
+
 def _parse_step_cell(num: int, td) -> dict:
     full_text = _t(td)
     step = {

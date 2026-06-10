@@ -207,18 +207,21 @@ def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
     except Exception:
         rule_rows = []
 
-    if rule_rows:
+    raw_rules = [r for r in (props.get("sop_rules") or []) if isinstance(r, dict)]
+    if rule_rows or raw_rules:
         # Build a lookup of the raw JSONB rules by key so we can preserve
         # fields not stored in NodeRuleBinding (sop_title, source,
-        # section_label, section_narrative, decision_type, codes, etc.).
-        raw_by_key: dict[str, dict] = {}
-        for raw in props.get("sop_rules") or []:
-            if isinstance(raw, dict) and raw.get("key"):
-                raw_by_key[raw["key"]] = raw
+        # section_label, section_narrative, decision_type, codes, etc.) AND so
+        # user-authored custom rules — which have no SOP and therefore never
+        # become NodeRuleBinding rows — survive the round-trip instead of being
+        # overwritten by the binding-derived list.
+        raw_by_key: dict[str, dict] = {
+            r["key"]: r for r in raw_rules if r.get("key")
+        }
+        bound_by_key = {row.rule_key: row for row in rule_rows}
+        oos_keys = _rule_keys_out_of_scope(list(bound_by_key))
 
-        oos_keys = _rule_keys_out_of_scope([r.rule_key for r in rule_rows])
-        props["sop_rules"] = []
-        for row in rule_rows:
+        def _binding_entry(row) -> dict:
             entry = dict(raw_by_key.get(row.rule_key) or {})
             # Authoritative fields from the binding row always win.
             entry.update({
@@ -233,15 +236,52 @@ def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
                 "ordering":       row.ordering,
                 "is_out_of_scope": row.rule_key in oos_keys,
             })
-            props["sop_rules"].append(entry)
+            return entry
+
+        merged: list[dict] = []
+        seen_bound: set[str] = set()
+        # Walk the saved order so custom rules keep their position relative to
+        # the SOP rules the auditor interleaved them with.
+        for raw in raw_rules:
+            key = raw.get("key") or ""
+            row = bound_by_key.get(key)
+            if row is not None:
+                merged.append(_binding_entry(row))
+                seen_bound.add(key)
+            else:
+                # Unbound rule = custom (no SOP). Keep it exactly as authored.
+                entry = dict(raw)
+                entry["is_custom"] = bool(raw.get("is_custom")) or key.startswith("custom:")
+                merged.append(entry)
+        # Defensive: surface any binding rows the raw list didn't mention.
+        for row in rule_rows:
+            if row.rule_key not in seen_bound:
+                merged.append(_binding_entry(row))
+
+        # Renormalise ordering to the final merged sequence.
+        for i, entry in enumerate(merged):
+            entry["ordering"] = i
+
+        props["sop_rules"] = merged
 
         # Shape-level rollup so the canvas can flag the node without having to
-        # inspect every rule. ``is_out_of_scope`` is true only when EVERY bound
-        # rule is an out-of-scope (clean-exclusion) rule; ``oos_rule_count`` /
+        # inspect every rule. ``is_out_of_scope`` is true only when EVERY rule
+        # is an out-of-scope (clean-exclusion) rule; ``oos_rule_count`` /
         # ``rule_count`` let the UI mark partially-OOS nodes too.
         props["oos_rule_count"] = len(oos_keys)
-        props["rule_count"] = len(rule_rows)
-        props["is_out_of_scope"] = bool(oos_keys) and len(oos_keys) == len(rule_rows)
+        props["rule_count"] = len(merged)
+        props["is_out_of_scope"] = bool(oos_keys) and len(oos_keys) == len(merged)
+
+    # ── Manual per-node override (auditor-set on the canvas) ──────────────────
+    # ``manual_out_of_scope`` is a user toggle that excludes the WHOLE node from
+    # the execution engine regardless of the SOP-derived rollup above, and works
+    # even for custom / rule-less nodes (which never produce ``oos_keys``). It is
+    # stored verbatim in ``shape.properties`` (round-trips via the graph save) so
+    # we simply preserve it and fold it into the effective ``is_out_of_scope``
+    # the canvas badge reads. Kept on a SEPARATE key so a save never clobbers the
+    # auditor's choice with the computed rollup.
+    if bool(props.get("manual_out_of_scope")):
+        props["is_out_of_scope"] = True
 
     try:
         tool_rows = list(

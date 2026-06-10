@@ -10,13 +10,18 @@ Exposes:
 from __future__ import annotations
 
 import html as _html
+import os
 import re
 import unicodedata
+import uuid
 from copy import deepcopy
+from pathlib import Path
 
+from django.conf import settings as djsettings
 from django.shortcuts import get_object_or_404
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -29,6 +34,24 @@ from .models import (
     Workbench,
     Workflow,
 )
+
+
+_SOP_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls",
+                          ".html", ".htm"}
+
+
+def _sop_upload_dir() -> Path:
+    """Directory where uploaded SOP documents are stashed for ingestion.
+
+    Sits under ``MEDIA_ROOT`` when configured, else under ``BASE_DIR``. The
+    ingestion subprocess reads these via a ``file://`` seed URL, so the path
+    must be readable by both the web process and the Celery workers.
+    """
+    media = getattr(djsettings, "MEDIA_ROOT", "") or ""
+    base = Path(media) if media else Path(djsettings.BASE_DIR)
+    target = base / "sop_uploads"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
 
 
 def _text_to_basic_html(text: str) -> str:
@@ -170,12 +193,23 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         validated = serializer.validated_data
         sop_urls       = validated.pop("sop_urls", None)
         runtime_agents = validated.pop("runtime_agents", None)
+        auto_build     = validated.pop("auto_build_from_sop", False)
 
         workflow = serializer.save(
             slug=_unique_workflow_slug(validated["name"]),
             owner_id=getattr(user, "id", ""),
             owner_email=getattr(user, "email", ""),
         )
+
+        # Opt-in add-on: flag the workflow so the post-ingestion hook auto-
+        # builds the canvas from the ingested SOP(s). Stored before dispatch so
+        # the ingestion subprocess sees it. No-op for the existing flow.
+        if auto_build and sop_urls:
+            meta = dict(workflow.metadata or {})
+            meta["auto_build_canvas"] = True
+            meta["source_sop"] = sop_urls[0]
+            workflow.metadata = meta
+            workflow.save(update_fields=["metadata", "updated_at"])
 
         if sop_urls or runtime_agents:
             attach_to_workflow(
@@ -193,6 +227,209 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             WorkflowGraphWriter(workflow).save(request.data)
             workflow.refresh_from_db()
         return Response(WorkflowGraphSerializer(workflow).data)
+
+    # ── Auto-build progress (polled by the SPA loading screen) ──────────────
+
+    @action(detail=True, methods=["get"], url_path="build_status")
+    def build_status(self, _request, pk=None):
+        """Real-time progress for an auto-built-from-SOP workflow.
+
+        The SPA shows a loading screen (with streaming stage logs) instead of
+        the empty canvas until ``phase == "done"``.  No-op for regular
+        workflows (``auto_build`` is False → SPA renders the canvas directly).
+
+        Phases: ``queued`` → ``ingesting`` → ``building`` → ``done`` (or
+        ``failed``).  ``idle`` means this workflow was not flagged for
+        auto-build.
+        """
+        wf = self.get_object()
+        meta = wf.metadata or {}
+        auto_build = bool(meta.get("auto_build_canvas"))
+        built = bool(meta.get("auto_build_complete"))
+
+        jobs = list(wf.ingestion_jobs.all().order_by("created_at"))
+        statuses = [j.status for j in jobs]
+        shape_count = Shape.objects.filter(
+            workbench__work_area__workflow=wf
+        ).count()
+
+        if not auto_build:
+            phase = "idle"
+        elif built:
+            phase = "done"
+        elif jobs and all(s == "FAILED" for s in statuses):
+            phase = "failed"
+        elif any(s == "RUNNING" for s in statuses):
+            phase = "ingesting"
+        elif jobs and all(s in {"COMPLETED", "FAILED", "PARTIAL"}
+                          for s in statuses):
+            # Ingestion finished; the post-ingest hook is building the canvas.
+            phase = "building"
+        else:
+            phase = "queued"
+
+        # ── Stream the most recent stage + LLM logs ─────────────────────────
+        logs: list[dict] = []
+        llm_errors: list[dict] = []
+        job_ids = [j.job_id for j in jobs]
+        if job_ids:
+            try:
+                from sop_ingestion.models import PipelineStageLog, LLMCallLog
+                stage_qs = (
+                    PipelineStageLog.objects
+                    .filter(job_id__in=job_ids)
+                    .order_by("-started_at")[:120]
+                )
+                for lg in reversed(list(stage_qs)):
+                    logs.append({
+                        "stage": lg.stage_name,
+                        "status": lg.status,
+                        "doc_url": (lg.doc_url or "")[:160],
+                        "duration_ms": lg.duration_ms,
+                        "ts": lg.started_at.isoformat() if lg.started_at else None,
+                        "error": (lg.error_detail or "")[:400],
+                    })
+                err_qs = (
+                    LLMCallLog.objects
+                    .filter(job_id__in=job_ids)
+                    .exclude(error_message="")
+                    .order_by("-id")[:10]
+                )
+                for e in reversed(list(err_qs)):
+                    llm_errors.append({"error": (e.error_message or "")[:400]})
+            except Exception:  # logs are best-effort; never break the poll
+                pass
+
+        return Response({
+            "auto_build":   auto_build,
+            "phase":        phase,
+            "built":        built,
+            "needs_tools":  bool(meta.get("needs_tools")),
+            "shape_count":  shape_count,
+            "stats":        meta.get("auto_build_stats"),
+            "jobs": [
+                {
+                    "job_id":         str(j.job_id),
+                    "seed_url":       j.seed_url,
+                    "status":         j.status,
+                    "docs_processed": j.docs_processed,
+                    "docs_failed":    j.docs_failed,
+                }
+                for j in jobs
+            ],
+            "logs":        logs,
+            "llm_errors":  llm_errors,
+        })
+
+    @action(detail=True, methods=["get"], url_path="build_stream")
+    def build_stream(self, _request, pk=None):
+        """Server-Sent Events stream of live pipeline stage logs for the build.
+
+        Tails ``PipelineStageLog`` (Postgres, written in real time by the
+        ingestion subprocess) and pushes each new row as it appears, so the
+        SPA's build screen shows progress without client-side polling. The
+        authoritative "done" gate is still ``build_status`` — this stream is
+        purely for low-latency log tailing and emits a terminal event when the
+        canvas is built or the job fails.
+
+        Consume with fetch + ReadableStream (keeps the JWT header; the native
+        EventSource API cannot send Authorization).
+        """
+        import json
+        import time
+
+        from django.db import close_old_connections
+        from django.http import StreamingHttpResponse
+
+        wf_pk = self.get_object().pk
+        HEARTBEAT_S = 15
+        POLL_S = 1.0
+        MAX_S = 15 * 60
+
+        def _event(kind: str, payload: dict) -> str:
+            return f"event: {kind}\ndata: {json.dumps(payload)}\n\n"
+
+        def _stream():
+            from sop_ingestion.models import PipelineStageLog, LLMCallLog
+
+            last_log_id = 0
+            last_err_id = 0
+            last_beat = time.monotonic()
+            started = time.monotonic()
+
+            yield _event("open", {"ok": True})
+
+            while True:
+                close_old_connections()
+                # Re-read the workflow + jobs fresh each tick.
+                wf = Workflow.objects.filter(pk=wf_pk).first()
+                if wf is None:
+                    yield _event("error", {"detail": "workflow gone"})
+                    return
+                meta = wf.metadata or {}
+                job_ids = list(
+                    wf.ingestion_jobs.values_list("job_id", flat=True)
+                )
+
+                if job_ids:
+                    new_logs = (
+                        PipelineStageLog.objects
+                        .filter(id__gt=last_log_id, job_id__in=job_ids)
+                        .order_by("id")[:200]
+                    )
+                    for lg in new_logs:
+                        last_log_id = lg.id
+                        yield _event("log", {
+                            "stage": lg.stage_name,
+                            "status": lg.status,
+                            "doc_url": (lg.doc_url or "")[:160],
+                            "duration_ms": lg.duration_ms,
+                            "ts": lg.started_at.isoformat() if lg.started_at else None,
+                            "error": (lg.error_detail or "")[:400],
+                        })
+
+                    new_errs = (
+                        LLMCallLog.objects
+                        .filter(id__gt=last_err_id, job_id__in=job_ids)
+                        .exclude(error_message="")
+                        .order_by("id")[:20]
+                    )
+                    for e in new_errs:
+                        last_err_id = e.id
+                        yield _event("llm_error", {
+                            "error": (e.error_message or "")[:400],
+                        })
+
+                # Terminal conditions.
+                if meta.get("auto_build_complete"):
+                    yield _event("done", {
+                        "stats": meta.get("auto_build_stats"),
+                        "needs_tools": bool(meta.get("needs_tools")),
+                    })
+                    return
+                statuses = list(
+                    wf.ingestion_jobs.values_list("status", flat=True)
+                )
+                if statuses and all(s == "FAILED" for s in statuses):
+                    yield _event("failed", {"detail": "ingestion failed"})
+                    return
+
+                now = time.monotonic()
+                if now - started > MAX_S:
+                    yield _event("timeout", {})
+                    return
+                if now - last_beat > HEARTBEAT_S:
+                    last_beat = now
+                    yield ": ping\n\n"
+
+                time.sleep(POLL_S)
+
+        resp = StreamingHttpResponse(
+            _stream(), content_type="text/event-stream"
+        )
+        resp["Cache-Control"] = "no-cache"
+        resp["X-Accel-Buffering"] = "no"  # disable proxy buffering (nginx)
+        return resp
 
     # ── Lifecycle helpers ───────────────────────────────────────────────────
 
@@ -670,20 +907,80 @@ class WorkflowViewSet(viewsets.ModelViewSet):
     def attach(self, request, pk=None):
         """Attach additional SOP URLs or runtime agents to an existing workflow.
 
-        Body: ``{ sop_urls?: string[], runtime_agents?: [{...}] }``.
+        Body: ``{ sop_urls?: string[], runtime_agents?: [{...}],
+        auto_build_from_sop?: bool }``.
         Dispatches ingestion + endpoint registration via the same code path
-        used on create.
+        used on create. When ``auto_build_from_sop`` is true (or the workflow
+        was already auto-built) the post-ingestion hook rebuilds the canvas
+        from ALL of the workflow's SOPs, so a workflow accumulates N SOP
+        columns over time.
         """
         wf = self.get_object()
+        sop_urls = request.data.get("sop_urls") or []
+        if sop_urls and request.data.get("auto_build_from_sop"):
+            meta = dict(wf.metadata or {})
+            if not meta.get("auto_build_canvas"):
+                meta["auto_build_canvas"] = True
+                meta.setdefault("source_sop", sop_urls[0])
+                wf.metadata = meta
+                wf.save(update_fields=["metadata", "updated_at"])
         result = attach_to_workflow(
             wf,
-            sop_urls=request.data.get("sop_urls") or [],
+            sop_urls=sop_urls,
             runtime_agents=request.data.get("runtime_agents") or [],
         )
         return Response({
             "workflow": WorkflowSerializer(wf).data,
             "dispatched": result,
         }, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=False, methods=["post"], url_path="sop_upload",
+            parser_classes=[MultiPartParser, FormParser])
+    def sop_upload(self, request):
+        """Upload a local SOP document (PDF/DOCX/XLSX/HTML) for ingestion.
+
+        Multipart form field ``file``. The file is stashed on the server and a
+        ``file://`` seed URL is returned. The SPA then passes that URL inside
+        ``sop_urls`` to create/attach exactly like an HTML link — the ingestion
+        pipeline's local-file fetcher reads it and runs the same parse →
+        enrich → auto-build flow. PDFs decompose into one node per Step/Action
+        row just like HTML SOPs.
+
+        Returns ``{ url, name, size }``.
+        """
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response({"detail": "file (multipart) is required"},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        name = upload.name or "document.pdf"
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in _SOP_UPLOAD_EXTENSIONS:
+            return Response(
+                {"detail": f"unsupported file type '{ext or '?'}'. "
+                           f"Allowed: {', '.join(sorted(_SOP_UPLOAD_EXTENSIONS))}"},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        max_bytes = 64 * 1024 * 1024
+        if upload.size and upload.size > max_bytes:
+            return Response({"detail": "file too large (max 64 MiB)"},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "document"
+        dest = _sop_upload_dir() / f"{uuid.uuid4().hex}_{safe}"
+        try:
+            with dest.open("wb") as fh:
+                for chunk in upload.chunks():
+                    fh.write(chunk)
+        except OSError as exc:
+            return Response({"detail": f"failed to store upload: {exc}"},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response({
+            "url":  f"file://{dest}",
+            "name": name,
+            "size": dest.stat().st_size,
+        }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"])
     def duplicate(self, request, pk=None):

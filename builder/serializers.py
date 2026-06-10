@@ -13,6 +13,7 @@ Two kinds of serializers live here:
 """
 from __future__ import annotations
 
+from django.core.validators import RegexValidator
 from rest_framework import serializers
 
 from .models import (
@@ -116,10 +117,29 @@ class WorkflowSopStatusSerializer(serializers.Serializer):
 
 class WorkflowSerializer(serializers.ModelSerializer):
     # Write-only fields accepted on create (not stored as columns).
+    # A SOP source is either an http(s) link OR a ``file://`` seed URL returned
+    # by the ``sop_upload`` endpoint (uploaded PDF/DOCX/XLSX/HTML), so we allow
+    # the ``file`` scheme in addition to the web schemes.
     sop_urls = serializers.ListField(
-        child=serializers.URLField(max_length=2048),
+        child=serializers.CharField(
+            max_length=2048,
+            validators=[RegexValidator(
+                regex=r"^(https?|file)://",
+                message="SOP source must be an http(s) link or a file:// "
+                        "upload reference.",
+            )],
+        ),
         required=False, write_only=True, allow_empty=True,
-        help_text="Static-rule SOP URLs to ingest and link to this workflow.",
+        help_text="Static-rule SOP URLs (http/https) or file:// upload refs "
+                  "to ingest and link to this workflow.",
+    )
+    # Opt-in add-on: when true, the canvas (shapes + rule bindings) is built
+    # automatically from the ingested SOP once ingestion completes. Tool calls
+    # are left empty for the user to attach. Default false keeps the existing
+    # behaviour (ingest + link only) byte-for-byte.
+    auto_build_from_sop = serializers.BooleanField(
+        required=False, write_only=True, default=False,
+        help_text="Auto-build the workflow canvas from the ingested SOP(s).",
     )
     runtime_agents = RuntimeAgentSerializer(
         many=True, required=False, write_only=True,
@@ -137,7 +157,7 @@ class WorkflowSerializer(serializers.ModelSerializer):
             "metadata", "owner_id", "owner_email",
             "created_at", "updated_at",
             # write-only
-            "sop_urls", "runtime_agents",
+            "sop_urls", "runtime_agents", "auto_build_from_sop",
             # read-only
             "sops", "attached_agents",
         ]

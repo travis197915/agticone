@@ -1,0 +1,648 @@
+[
+  {
+    "number": 1,
+    "question": "Is your claim/line denying for TF1 or TF0?",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "Yes",
+        "condition_and": "",
+        "action": "Proceed to next step.",
+        "decision": "ALLOW",
+        "codes": [],
+        "skip_to_step": 2,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "No",
+        "condition_and": "",
+        "action": "This P&P does not apply.",
+        "decision": "STOP",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "Proceed to next step.",
+    "branch_no": "This P&P does not apply.",
+    "skip_to_step_yes": 2,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "If\u2026 Then\u2026\nYes Proceed to next step.\nNo This P&P does not apply.",
+    "source_html": ""
+  },
+  {
+    "number": 2,
+    "question": "Determine the state your member is located in and perform the following:",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "",
+        "condition_and": "",
+        "action": "Open the OBH and OPH Care Emergency Response Bulletins policy. Press CTRL + F to open the navigation bar in the document. In the Search Document box, enter the state the member resides in. Example: For CA enter California. Press Enter. Proceed to next step.",
+        "decision": "SYSTEM",
+        "codes": [],
+        "skip_to_step": 3,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "",
+    "branch_no": "",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "Open the OBH and OPH Care Emergency Response Bulletins policy.\nPress CTRL + F to open the navigation bar in the document.\nIn the Search Document box, enter the state the member resides in.\nExample: For CA enter California.\nPress Enter.\nProceed to next step.",
+    "source_html": ""
+  },
+  {
+    "number": 3,
+    "question": "Were results returned for the member's state?",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "Meets Criteria",
+        "condition_and": "",
+        "action": "Skip to Emergency Response Bulletins Step/Action table.",
+        "decision": "BYPASS",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "Does not meet criteria",
+        "condition_and": "It is receiving MA CBHC SERVICES warning message and the Group/Plan is Mass General Bingham",
+        "action": "DOS 01/01/2023 \u2013 06/30/2023 waive timely filing. All other DOS proceed to next step.",
+        "decision": "WAIVE",
+        "codes": [],
+        "skip_to_step": 4,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "All others",
+        "condition_and": "",
+        "action": "Proceed to next step.",
+        "decision": "ALLOW",
+        "codes": [],
+        "skip_to_step": 4,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "Skip to Emergency Response Bulletins Step/Action table.",
+    "branch_no": "DOS 01/01/2023 \u2013 06/30/2023 waive timely filing. All other DOS proceed to next step.",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": 4,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "If\u2026 And\u2026 Then\u2026\nMeets\nCriteria\n\u2013 Skip to Emergency\nResponse Bulletins Step/\nAction table.\nDoes not\nmeet\ncriteria\nIt is receiving MA CBHC\nSERVICES warning message\nand the Group/Plan is Mass\nGeneral Bingham\nDOS 01/01/2023 \u2013 06/30/2023 waive\ntimely filing.\nAll other DOS proceed\nto next step.\nAll others \u2013 Proceed to next step.",
+    "source_html": ""
+  },
+  {
+    "number": 4,
+    "question": "Is your claim for any of the Groups below?",
+    "intro_text": "Check if claim belongs to GE, NALC, MPI, Medicaid Reclamation, VA Providers New Day Claims, Medica, PGA TOUR INC./PGA TOUR ENTERPRISES LLC, or EMHP of Suffolk County",
+    "decision_rows": [
+      {
+        "condition_if": "Yes \u2013 GE For OON Claims",
+        "condition_and": "",
+        "action": "Claims should be submitted by June 30 for expenses that were incurred in the previous calendar year. Claims filed after June 30 of the following year will not be reimbursed. For INN: 90 days from the date of service (DOS). Process claims according to Group step guidelines and proceed to Step 10.",
+        "decision": "CONDITIONAL",
+        "codes": [],
+        "skip_to_step": 10,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "Yes \u2013 NALC (Member submitted Claims Only)",
+        "condition_and": "",
+        "action": "NALC members may submit claims through December 31st of the year following the year in which the service was rendered (i.e., if service date is 4/1/2020, the member can submit the claim through 12/31/2021). Note: Provider submitted claims follow normal timely filing guidelines based on TF1 or TF0. Process claims according to Group step guidelines and proceed to Step 10.",
+        "decision": "CONDITIONAL",
+        "codes": [],
+        "skip_to_step": 10,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "Yes \u2013 MPI",
+        "condition_and": "",
+        "action": "OON providers \u2013 15 months from the date of service. INN providers \u2013 90 days from the date of service to submit a claim (DOS). Process claims according to Group step guidelines and proceed to Step 10.",
+        "decision": "CONDITIONAL",
+        "codes": [],
+        "skip_to_step": 10,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "Yes \u2013 Medicaid Reclamation \u2013 36 months (standard)",
+        "condition_and": "",
+        "action": "Providers billing directly for Medicaid recoupment follow special rules: refer to OHBS Facets Medicaid Reclamation P&P for further information. The Ohio Department of Job and Family Services (ODJFS) observes a timely filing limit of 6 years due to specific state legislative requirements. Process claims according to Group step guidelines and proceed to Step 10.",
+        "decision": "CONDITIONAL",
+        "codes": [],
+        "skip_to_step": 10,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "Yes \u2013 VA Providers New Day Claims",
+        "condition_and": "",
+        "action": "VA facilities have the right to request reimbursement within 6 years from the last date of service on the claim. Adjustments Only: Confirm the claim's DOS falls within 6 years of submission date. Check benefits/guidelines for the year of the claim's DOS. Process claims according to Group step guidelines and proceed to Step 10.",
+        "decision": "CONDITIONAL",
+        "codes": [],
+        "skip_to_step": 10,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "Yes \u2013 Medica",
+        "condition_and": "",
+        "action": "INN providers \u2013 180 days or 6 months from the date of service. OON provider \u2013 365 days or 1 year from the date of service. Notes: Medica does not follow the Provider Timely Filing limit. Exception for possible review for timely filling up to 18 months. Submit a request to a business manager via email for determination. If approved by select group of people (Claims, BP team members etc.) Make sure to document your claim notes with the answer obtained by a business manager using his or her MSID (not his or her full name). Process claims according to Group step guidelines and proceed to Step 10.",
+        "decision": "CONDITIONAL",
+        "codes": [],
+        "skip_to_step": 10,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "Yes \u2013 PGA TOUR, INC. / PGA TOUR ENTERPRISES, LLC.",
+        "condition_and": "",
+        "action": "INN Providers \u2013 90 days from the date of service to submit a claim (DOS). OON Provider \u2013 15 months from the date of service. Note: If Medicare or Medicaid paid primary in error, the timely filing requirement may be increased to three years from the date of service. Process claims according to Group step guidelines and proceed to Step 10.",
+        "decision": "CONDITIONAL",
+        "codes": [],
+        "skip_to_step": 10,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "Yes \u2013 EMHP of Suffolk County",
+        "condition_and": "",
+        "action": "INN Providers \u2013 90 days from the date of service to submit a claim (DOS). Process claims according to Group step guidelines and proceed to Step 10.",
+        "decision": "CONDITIONAL",
+        "codes": [],
+        "skip_to_step": 10,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "No",
+        "condition_and": "",
+        "action": "Proceed to the next step.",
+        "decision": "ALLOW",
+        "codes": [],
+        "skip_to_step": 5,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "INN Providers \u2013 90 days from the date of service to submit a claim (DOS). Process claims according to Group step guidelines and proceed to Step 10.",
+    "branch_no": "Proceed to the next step.",
+    "skip_to_step_yes": 10,
+    "skip_to_step_no": 5,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "Yes \u2013 Process claims according to Group step guidelines below and proceed to\nStep 10.\nNo \u2013 Proceed to the next step.\nGroup Guidelines\nGE For OON Claims:\nClaims should be submitted by June 30 for expenses\nthat were incurred in the previous calendar year.\nClaims filed after June 30 of the following year will not\nbe reimbursed.\nFor INN: 90 days from the date of service (DOS).\nNALC (Member submitted Claims Only) NALC members may\nsubmit claims through December 31st of the year\nfollowing the year in which the service was rendered (i.e.,\nif service date is 4/1/2020, the member can submit the\nclaim through 12/31/2021).\nNote: Provider submitted claims follow normal timely\nfiling guidelines based on TF1 or TF0.\nMPI OON providers \u2013 15 months from the date of service.\nINN providers \u2013 90 days from the date of service to\nsubmit a claim (DOS).\nMedicaid\nReclamation \u2013 36\nmonths (standard)\nProviders billing directly for Medicaid recoupment\nfollow special rules: refer to OHBS Facets Medicaid\nReclamation P&P for further information.\nThe Ohio Department of Job and Family Services (ODJFS) observes a timely filing limit of 6 years due to\nspecific state legislative requirements.\nVA Providers New Day Claims: VA facilities have the right to request\nreimbursement within 6 years from the last date of\nservice on the claim.\nAdjustments Only:\nConfirm the claim's DOS falls within 6 years of submission date.\nCheck benefits/guidelines for the year of the claim's DOS.\nMedica INN providers \u2013 180 days or 6 months from the date of\nservice.\nOON provider \u2013 365 days or 1 year from the date of\nservice.\nNotes:\nMedica does not follow the Provider Timely Filing limit.\nException for possible review for timely filling up to 18\nmonths. Submit a request to a business manager via\nemail for determination.\nIf approved by select group of people (Claims, BP\nteam members etc.) Make sure to document your\nclaim notes with the answer obtained by a business\nmanager using his or her MSID (not his or her full\nname).\nPGA TOUR, INC.\nPGA TOUR\nENTERPRISES, LLC.\nINN Providers \u2013 90 days from the date of service to\nsubmit a claim (DOS).\nOON Provider \u2013 15 months from the date of service.\nNote: If Medicare or Medicaid paid primary in error,\nthe timely filing requirement may be increased to\nthree years from the date of service.\nEMHP of Suffolk\nCounty\nINN Providers \u2013 90 days from the date of service to\nsubmit a claim (DOS).\nOON Provider \u2013 (90) Days after the end of the\nCalendar Year (March 31) in which covered medical\nexpenses were incurred.\nExample:\nClaims for all dates of service in 2023 no later than\nMarch 31, 2024.\nClaims for all dates of service in 2024 no later than\nMarch 31, 2025.\nClaims for all dates of service in 2025 no later than\nMarch 31, 2026.",
+    "source_html": ""
+  },
+  {
+    "number": 5,
+    "question": "Follow the bullets below and continue to the If/And table for instruction.",
+    "intro_text": "Access Timely Filing Calculator and review COB submission rules",
+    "decision_rows": [
+      {
+        "condition_if": "COB Submission (Includes new day COB claims) - Claims Processed on or before 12/31/2023",
+        "condition_and": "See COB submission note above",
+        "action": "Access the Timely Filing Calculator to determine the number of days from DOS to Received date of claim. Exception: For Facility claims, R&B charges are calculated from date of discharge. Always check Group Notes for any group exclusions. Medica Group does not follow the Provider Timely Filing limit. COB Submission Note: (Applies to claims processed 01/01/2024 and after) Electronic Image: Open COB tab in Facets and locate the Paid Date field. Other Carriers Paid Date will auto populate \u2013 use populated date in timely filing calculation below. Exception: If Facets COB field is blank: Update COB Paid Date field in Facets to reflect current claims received date. Use in place of Other Carrier paid date in timely filing calculation below. (F3) claim to update, if timely filing denial drops, timely filing policy no longer applies. INN providers or OON Providers \u2013 365 days from the date of service or 90 days from the other carriers Paid Date. Note: Electronic image does not reflect the date of ",
+        "decision": "CONDITIONAL",
+        "codes": [
+          "F3"
+        ],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "COB Submission (Includes new day COB claims) - Claims Processed on or after 01/01/2024",
+        "condition_and": "See COB submission note above",
+        "action": "Access the Timely Filing Calculator to determine the number of days from DOS to Received date of claim. Exception: For Facility claims, R&B charges are calculated from date of discharge. Always check Group Notes for any group exclusions. Medica Group does not follow the Provider Timely Filing limit. COB Submission Note: (Applies to claims processed 01/01/2024 and after) Electronic Image: Open COB tab in Facets and locate the Paid Date field. Other Carriers Paid Date will auto populate \u2013 use populated date in timely filing calculation below. Exception: If Facets COB field is blank: Update COB Paid Date field in Facets to reflect current claims received date. Use in place of Other Carrier paid date in timely filing calculation below. (F3) claim to update, if timely filing denial drops, timely filing policy no longer applies. INN/OON Providers: 90 days from the Other Carriers Paid Date. Refer to COB Submission Note above to determine paid date on electronic image. If COB Submission was re",
+        "decision": "CONDITIONAL",
+        "codes": [
+          "F3"
+        ],
+        "skip_to_step": 6,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "",
+    "branch_no": "",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": true,
+    "raw_text": "Access the Timely Filing Calculator to determine the number of days from DOS\nto Received date of claim. Exception: For Facility claims, R&B charges are\ncalculated from date of discharge.\nAlways check Group Notes for any group exclusions.\nMedica Group does not follow the Provider Timely Filing limit.\nCOB Submission Note: (Applies to claims processed 01/01/2024 and after)\nElectronic Image:\nOpen COB tab in Facets and locate the Paid Date field.\nOther Carriers Paid Date will auto populate \u2013 use populated date in\ntimely filing calculation below.\nException: If Facets COB field is blank:\nUpdate COB Paid Date field in Facets to reflect current claims\nreceived date.\n\u25e6\n\u25aa\n\u25aa\n\u25aa\n\u25aa\nUse in place of Other Carrier paid date in timely filing calculation\nbelow.\n(F3) claim to update, if timely filing denial drops, timely filing policy\nno longer applies.\nIf\u2026 And\u2026 Then\u2026\nCOB Submission (Includes new day\nCOB claims)\nSee COB\nsubmission note\nabove\nClaims Processed on\nor before 12/31/2023:\nINN providers or OON\nProviders \u2013 365 days\nfrom the date of\nservice or 90 days\nfrom the other carriers\nPaid Date.\nNote: Electronic image\ndoes not reflect the\ndate of the primary\ninsurance payment.\nUse received date of\nthe claim with the\nprimary insurance\nEOB attached.\nClaims Processed on\nor after 01/01/2024:\nINN/OON Providers:\n90 days from the\nOther Carriers Paid\nDate.\nRefer to COB\nSubmission Note\nabove to\ndetermine paid\ndate on electronic\nimage.\nIf COB Submission\nwas received within\ntimely filing\nguideline \u2013 Skip to\nStep 9.\nIf COB Submission\nwas not received\nwithin timely\nguidelines \u2013 Skip to\nStep 6.\nResubmission /\nCorrected Claim (7 or 8)\nSubmission\nINN Providers \u2013 Billing\nEWS/EAP Services: If\nthe original claim is\nnot found in history\nallow 365 days from\nDOS.\nNote:Emotional\nWellbeing Solutions (EWS) is a rebrand;\nIf corrected/void\nclaims was received\nwithin timely filing\nguideline. Bypass\ntimely filing:\nFor Corrected\nclaim Frequency 7 \u2013 Skip to\nFrequency 7\n\u25aa\n\u25aa\n\u25e6\n\u25e6\n\u2022 \u2022\n\u25e6\nformerly known as\nEmployee Assistance\nProgram (EAP).\nINN providers \u2013 365\ndays from date claim\nwas last processed/\npaid.\nOON providers \u2013 365\ndays from the date of\nservice or 90 days\nfrom the date of\npayment.\nindicator section P&P.\nFor Void Claim\nSubmission code 8 \u2013 Continue to\nVoid Claim\nIndicator P&P for\nprocessing.\nIf corrected/void\nclaims was not\nreceived within\ntimely guidelines \u2013\nSkip to Step 6.\nNew day claim\nSubmission\nINN providers \u2013 90\ndays from the date of\nservice to submit a\nclaim (DOS).\nException:IHC (Indian Health Clinic/\nCenter).\nOON providers \u2013 365\ndays from the date of\nservice or date of\ndischarge.\nIf received within\ntimely filing \u2013\nOverride timely\nfiling by claim-level\noverride Bypass\nClaim Accept Period\nwith EXP OCA and\nskip to Step 15.\nIf not received\nwithin timely filing \u2013\nSkip to Step 6.\nAdjustments/\nAppeals\nSubmission\nINN providers \u2013 365\ndays from date claim\nwas processed/paid.\nONN providers \u2013\nProviders have 90\ndays from the date of\npayment or within 365\ndays from the date of\nservice if additional\namounts are owed to\nthe provider. (Provider\nwas underpaid)\nException: If provider\nhas identified an\noverpayment the 365\nTimely Limit may be\nbypassed if the\noriginal claim was\nIf received within\ntimely filing \u2013\nOverride timely\nfiling by claim-level\noverride Bypass\nClaim Accept Period\nwith EXP OCA and\nSkip to Step 15.\nIf not received\nwithin timely filing \u2013\nSkip to Step 6.\n\u25e6\nreceived within the\nTimely filing.",
+    "source_html": ""
+  },
+  {
+    "number": 6,
+    "question": "Does the claim include proof of timely filing?",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "Yes",
+        "condition_and": "",
+        "action": "Proceed to next step.",
+        "decision": "ALLOW",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "No",
+        "condition_and": "",
+        "action": "Skip to Step 10.",
+        "decision": "BYPASS",
+        "codes": [],
+        "skip_to_step": 10,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "Proceed to next step.",
+    "branch_no": "Skip to Step 10.",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": 10,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "If\u2026 Then\u2026\nYes Proceed to next step.\nNo Skip to Step 10.",
+    "source_html": ""
+  },
+  {
+    "number": 7,
+    "question": "Verify the following information on the POTF:",
+    "intro_text": "Check Member name and/or ID number, DOS matching the claim, Submitted date, Billed amount (if computer-generated activity screen print), Paid/Denied or Adjusted date (as applicable)",
+    "decision_rows": [
+      {
+        "condition_if": "",
+        "condition_and": "",
+        "action": "Verify Member name and/or ID number, DOS matching the claim, Submitted date, Billed amount (if computer-generated activity screen print), Paid/Denied or Adjusted date (as applicable), then proceed to next step.",
+        "decision": "SYSTEM",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "",
+    "branch_no": "",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "Member name and/or ID number\nDOS matching the claim\nSubmitted date\nBilled amount (if computer-generated activity screen print)\nPaid/Denied or Adjusted date (as applicable)\nProceed to next step",
+    "source_html": ""
+  },
+  {
+    "number": 8,
+    "question": "Is the valid POTF an EOB?",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "Yes",
+        "condition_and": "",
+        "action": "Proceed to the next step.",
+        "decision": "ALLOW",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "No",
+        "condition_and": "",
+        "action": "Apply claim-level override \"Bypass Claim Accept Months\" and add a \"Claim note\" with the type of POTF that was received with the claim. Skip to Step 15.",
+        "decision": "BYPASS",
+        "codes": [],
+        "skip_to_step": 15,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "Proceed to the next step.",
+    "branch_no": "Apply claim-level override \"Bypass Claim Accept Months\" and add a \"Claim note\" with the type of POTF that was received with the claim. Skip to Step 15.",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": 15,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "If\u2026 Then\u2026\nYes Proceed to the next step.\nNo Perform the following:\nApply claim-level override \"Bypass Claim Accept Months\" and add a \"Claim note\" with the type of POTF that was received with the claim.\nSkip to Step 15.",
+    "source_html": ""
+  },
+  {
+    "number": 9,
+    "question": "Was the EOB received within 90 days from the other carrier's Paid Date?",
+    "intro_text": "Electronic image: Use received date of the claim with the primary insurance EOB attached (does not reflect date of primary insurance payment). Effective for process date 01/01/2024 and after: Use the other carrier paid date. Paper Claims: If available on the EOB attached, use the date of the EOB from the Primary Payor.",
+    "decision_rows": [
+      {
+        "condition_if": "Yes",
+        "condition_and": "",
+        "action": "Click the Clear COB button and apply the date of the primary EOB payment. By entering the date, this should automatically override the timely filing. If the system does not apply the override; Apply claim-level override \"Bypass Claim Accept Months\". Add a \"Claim note\" with the type of POTF that was received with the claim. Skip to Step 15.",
+        "decision": "BYPASS",
+        "codes": [],
+        "skip_to_step": 15,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "No",
+        "condition_and": "",
+        "action": "Proceed to the next step.",
+        "decision": "ALLOW",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "Click the Clear COB button and apply the date of the primary EOB payment. By entering the date, this should automatically override the timely filing. If the system does not apply the override; Apply claim-level override \"Bypass Claim Accept Months\". Add a \"Claim note\" with the type of POTF that was received with the claim. Skip to Step 15.",
+    "branch_no": "Proceed to the next step.",
+    "skip_to_step_yes": 15,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "Notes:\nElectronic image: Does not reflect the date of the primary insurance\npayment. Use received date of the claim with the primary insurance EOB\nattached.\nEffective for process date 01/01/2024 and after: Use the other carrier paid\ndate. (Refer to COB submission Note in Step 5.)\nPaper Claims: If the date is available on the EOB attached, Use the date of\nthe EOB from the Primary Payor.\nIf\u2026 Then\u2026\nYes\nPerform the following:\nClick the Clear COB button and apply the date of the primary EOB\npayment.\nBy entering the date, this should automatically override the timely\nfiling. If the system does not apply the override; Apply claim-level\noverride \"Bypass Claim Accept Months\".\nAdd a \"Claim note\" with the type of POTF that was received with the\nclaim.\nSkip to Step 15.\nNo Proceed to the next step.",
+    "source_html": ""
+  },
+  {
+    "number": 10,
+    "question": "Search member/provider history to determine whether a claim/line with the same DOS, same procedure code (including modifier, if applicable) and provider was previously received. Is there a matching claim in history?",
+    "intro_text": "Review All lines billed, as there could be lines that were not originally submitted on original claim.",
+    "decision_rows": [
+      {
+        "condition_if": "Yes",
+        "condition_and": "",
+        "action": "Proceed to the next step.",
+        "decision": "ALLOW",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "No claim/line in history",
+        "condition_and": "Freq 7/8 Submission",
+        "action": "Follow OBH Facets Kill-Delete Reroute Process (uhc.com) for instructions on requesting missing/invalid information. Original/Replacement Claim Number is missing/invalid: Use Kill/Delete Reason: IM. Follow manual mail back process for non 837I/837p submission types.",
+        "decision": "STOP",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "New Day claim/line denying for timely filing",
+        "condition_and": "",
+        "action": "Not received within the timely filing limit, allow the system to deny for timely filing. Skip to Step 15.",
+        "decision": "DENY",
+        "codes": [],
+        "skip_to_step": 15,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "Proceed to the next step.",
+    "branch_no": "Follow OBH Facets Kill-Delete Reroute Process (uhc.com) for instructions on requesting missing/invalid information. Original/Replacement Claim Number is missing/invalid: Use Kill/Delete Reason: IM. Follow manual mail back process for non 837I/837p submission types.",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "DOS, same procedure code (including modifier, if applicable) and provider was\npreviously received. Is there a claim in history that matches?\nNote: Review All lines billed, as there could be lines that were not originally\nsubmitted on original claim.\nYes \u2013 Proceed to the next step.\nNo \u2013 Follow the chart below.\nIf\u2026 Then\u2026\nNo claim/line in\nhistory, Freq 7/8\nSubmission\nFollow OBH Facets Kill-Delete Reroute Process (uhc.com) for instructions on requesting missing/invalid\ninformation.\nNotes:\nOriginal/Replacement Claim Number is missing/\ninvalid\nUse Kill/Delete Reason: IM\nFollow manual mail back process for non 837I/837p\nsubmission types. (See step one of P&P link above\nfor info on submission type)\nNew Day claim/line\ndenying for timely\nfiling.\nNot received within the timely filing limit, allow the\nsystem to deny for timely filing.\nSkip to Step 15.",
+    "source_html": ""
+  },
+  {
+    "number": 11,
+    "question": "Note the Original Claim/line Paid Date in history and the current/newest claim received date, then calculate the elapsed days.",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "",
+        "condition_and": "",
+        "action": "Access the Timely Filing Calculator. Enter the original claim paid date in cell A4 (labeled Service Date/Oldest Date) and enter the received date of the current/newest claim in cell B4 (Labeled Received Date/Newest Date) in the calculator to determine the number of days elapsed.",
+        "decision": "SYSTEM",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "",
+    "branch_no": "",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "received date.\nAccess the Timely Filing Calculator.\nEnter the original claim paid date (in cell A4- labeled Service Date/Oldest\nDate) and enter the received date of the current/newest claim (in cell B4\nLabeled Received Date/Newest Date) in the calculator to determine the\nnumber of days elapsed.",
+    "source_html": ""
+  },
+  {
+    "number": 12,
+    "question": "Compare the number of days from the Timely Filing Calculator to the timely filing limit.",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "",
+        "condition_and": "",
+        "action": "Compare the number of days from the Timely Filing Calculator to the timely filing limit.",
+        "decision": "SYSTEM",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "",
+    "branch_no": "",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "limit.",
+    "source_html": ""
+  },
+  {
+    "number": 13,
+    "question": "Has the new claim been resubmitted within the appropriate timely filing limit?",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "Yes",
+        "condition_and": "FREQ 7/8 Submissions",
+        "action": "Apply claim-level override Bypass Claim Accept Months by selecting EX CODE OCA. Continue to OBH Facets Claim Attachment Validation (FREQ 7/8 Manual Process Section for further instruction).",
+        "decision": "BYPASS",
+        "codes": [
+          "OCA"
+        ],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "Yes",
+        "condition_and": "All others",
+        "action": "Proceed to the next step.",
+        "decision": "ALLOW",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "No",
+        "condition_and": "",
+        "action": "Allow the system to deny for timely filing and skip to Step 15 to continue processing the claim. (Note: Adjusters: For physician claims with only some DOS requiring a timely filing override, split the claim to process correctly.)",
+        "decision": "DENY",
+        "codes": [],
+        "skip_to_step": 15,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "Proceed to the next step.",
+    "branch_no": "Allow the system to deny for timely filing and skip to Step 15 to continue processing the claim. (Note: Adjusters: For physician claims with only some DOS requiring a timely filing override, split the claim to process correctly.)",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": 15,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "If\u2026 Then\u2026\nYes\nIf\u2026 Then\u2026\nFREQ 7/8\nSubmissions\nApply claim-level override Bypass Claim Accept\nMonths by selecting EX CODE OCA.\nContinue to OBH Facets Claim Attachment\nValidation (FREQ 7/8 Manual Process Section for\nfurther instruction)\nAll others Proceed to the next step.\nNo Allow the system to deny for timely filing and skip to Step 15 to continue\nprocessing the claim.\n\ud83d\udca1\nAdjusters: For physician claims with only some DOS requiring a timely filing\noverride, split the claim to process correctly.",
+    "source_html": ""
+  },
+  {
+    "number": 14,
+    "question": "Review the original claim to determine if it was processed/denied correctly (e.g., received timely, but not paid correctly).",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "The original claim in history paid. (Review the allowed amount)",
+        "condition_and": "",
+        "action": "Add a note to the WFWM section with the original claim number and what is needed for an adjustment (wrong provider selected, updated charge amounts, etc.). Pend the claim to ADJ queue to be adjusted.",
+        "decision": "PEND",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "The original claim in history denied incorrectly",
+        "condition_and": "",
+        "action": "Process the claim per standard Guidelines.",
+        "decision": "ALLOW",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "The original claim processed/denied correctly",
+        "condition_and": "",
+        "action": "Apply claim-level override Bypass Claim Accept Months by selecting EX CODE OCA. Allow the claim to deny with the same denial reason as original.",
+        "decision": "DENY",
+        "codes": [
+          "OCA"
+        ],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "The original claim denied correctly/ but new information received allows reprocessing",
+        "condition_and": "",
+        "action": "Apply claim-level override Bypass Claim Accept Months by selecting EX CODE OCA. Process the claim per standard Guidelines.",
+        "decision": "ALLOW",
+        "codes": [
+          "OCA"
+        ],
+        "skip_to_step": null,
+        "routing_label": ""
+      },
+      {
+        "condition_if": "Adjuster",
+        "condition_and": "",
+        "action": "Adjust the history claim accordingly. Once the claim in history is paid, process the claim denying with the TF0 disallow by doing the following: Add a \"Claim note\" and apply claim-level override \"Bypass Claim Accept Months\" and deny as a duplicate.",
+        "decision": "REFER",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "",
+    "branch_no": "",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": true,
+    "raw_text": "received timely, but not paid correctly).\nIf\u2026 Then\u2026\nThe original claim in history\npaid. (Review the allowed\namount)\nAdd a note to the WFWM section with the\noriginal claim number and what is needed for\nan adjustment (wrong provider selected,\nupdated charge amounts, etc.).\nPend the claim to ADJ queue to be adjusted.\nThe original claim in history\ndenied incorrectly\nProcess the claim per standard Guidelines.\nThe original claim processed/\ndenied correctly\nApply claim-level override Bypass Claim\nAccept Months by selecting EX CODE OCA.\nAllow the claim to deny with the same denial\nreason as original.\nThe original claim denied\ncorrectly/ but new\ninformation received allows\nreprocessing\nApply claim-level override Bypass Claim\nAccept Months by selecting EX CODE OCA.\nProcess the claim per standard Guidelines.\nAdjuster \u2013 Perform the following:\nAdjust the history claim accordingly.\nOnce the claim in history is paid, process the claim denying with the TF0\ndisallow by doing the following:\nAdd a \"Claim note\" and apply claim-level override \"Bypass Claim Accept\nMonths\" and deny as a duplicate.",
+    "source_html": ""
+  },
+  {
+    "number": 15,
+    "question": "Press (F3) to process the claim.",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "",
+        "condition_and": "",
+        "action": "Press (F3) to process the claim.",
+        "decision": "SYSTEM",
+        "codes": [
+          "F3"
+        ],
+        "skip_to_step": null,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "",
+    "branch_no": "",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": true,
+    "raw_text": "",
+    "source_html": ""
+  },
+  {
+    "number": 16,
+    "question": "Review any other warning and/or error messages.",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "",
+        "condition_and": "",
+        "action": "Review any other warning and/or error messages and resolve as appropriate.",
+        "decision": "SYSTEM",
+        "codes": [],
+        "skip_to_step": null,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "",
+    "branch_no": "",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": false,
+    "raw_text": "",
+    "source_html": ""
+  },
+  {
+    "number": 17,
+    "question": "Press (F4) to save the claim.",
+    "intro_text": "",
+    "decision_rows": [
+      {
+        "condition_if": "",
+        "condition_and": "",
+        "action": "Press (F4) to save the claim.",
+        "decision": "SYSTEM",
+        "codes": [
+          "F4"
+        ],
+        "skip_to_step": null,
+        "routing_label": ""
+      }
+    ],
+    "annotations": [],
+    "branch_yes": "",
+    "branch_no": "",
+    "skip_to_step_yes": null,
+    "skip_to_step_no": null,
+    "referenced_sops": [],
+    "is_terminal": true,
+    "raw_text": "",
+    "source_html": ""
+  }
+]

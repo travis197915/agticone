@@ -64,7 +64,8 @@ from .agents.a02_fetch    import (next_url_picker, depth_limit_checker, http_fet
                                    extension_detector, magic_bytes_detector,
                                    content_hasher, duplicate_checker)
 from .agents.a03_parse_html import (html_decode, html_metadata, html_biz_table,
-                                    html_pre_sections, html_steps, html_decision_tables,
+                                    html_pre_sections, html_steps,
+                                    html_step_inventory, html_decision_tables,
                                     html_compound_tables, html_group_tables,
                                     html_annotations, html_reference_tables,
                                     html_sub_procedures, html_links)
@@ -73,8 +74,16 @@ from .agents.a04_parse_docx import (docx_metadata, docx_headings, docx_paragraph
 from .agents.a05_parse_xlsx import (xlsx_workbook_type, xlsx_sheet_parser,
                                     xlsx_header_detector, xlsx_code_extractor,
                                     xlsx_calculator, xlsx_metadata)
-from .agents.a06_parse_pdf  import (pdf_text_extractor, pdf_metadata, pdf_raw_text_normalizer)
-from .agents.a07_enrich     import (step_question_refiner, decision_row_classifier,
+from .agents.a06_parse_pdf  import (pdf_text_extractor, pdf_metadata, pdf_raw_text_normalizer,
+                                   pdf_step_inventory)
+# Dedicated PDF agent army — runs in its own pdf_enrich stage, never mixed with
+# the HTML step/reconciler path.
+from .agents.a06b_pdf_agentic import (pdf_document_profiler, pdf_step_extractor,
+                                      pdf_question_refiner, pdf_decision_normalizer,
+                                      pdf_code_grounder, pdf_routing_resolver,
+                                      pdf_terminal_marker, pdf_quality_gate)
+from .agents.a07_enrich     import (step_checklist_reconciler,
+                                    step_question_refiner, decision_row_classifier,
                                     rule_semantic_enricher, cross_reference_resolver,
                                     ambiguous_term_resolver, potf_validator,
                                     pre_section_rule_extractor, group_rule_extractor,
@@ -214,7 +223,8 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
     # ── Parse ─────────────────────────────────────────────────────────────────
     g.add_node("html_parse", _stage(
         html_decode, html_metadata, html_biz_table,
-        html_pre_sections, html_steps, html_decision_tables,
+        html_pre_sections, html_steps, html_step_inventory,
+        html_decision_tables,
         html_compound_tables, html_group_tables, html_annotations,
         html_reference_tables, html_sub_procedures, html_links,
         cfg=cfg, stage_name="html_parse",
@@ -230,18 +240,40 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
         cfg=cfg, stage_name="xlsx_parse",
     ))
     g.add_node("pdf_parse", _stage(
-        pdf_text_extractor, pdf_metadata, pdf_raw_text_normalizer,
+        pdf_text_extractor, pdf_metadata, pdf_step_inventory,
+        pdf_raw_text_normalizer,
         cfg=cfg, stage_name="pdf_parse",
     ))
 
     # ── LLM enrichment ────────────────────────────────────────────────────────
     g.add_node("enrich_stage", _stage(
+        step_checklist_reconciler,
         step_question_refiner, decision_row_classifier,
         rule_semantic_enricher, cross_reference_resolver,
         ambiguous_term_resolver, potf_validator,
         pre_section_rule_extractor, group_rule_extractor,
         date_condition_extractor, summary_generator,
         cfg=cfg, stage_name="enrich_stage",
+    ))
+
+    # ── PDF enrichment — DEDICATED PDF AGENT ARMY ─────────────────────────────
+    # PDFs route here instead of enrich_stage so they never touch the HTML
+    # step_inventory / step_checklist_reconciler. The army turns the PDF-private
+    # pdf_inventory into the same high-fidelity ``steps`` an HTML SOP yields,
+    # then the generic (format-agnostic) preamble/group/date/summary agents add
+    # the remaining context before rejoining the shared backbone.
+    g.add_node("pdf_enrich", _stage(
+        pdf_document_profiler,
+        pdf_step_extractor,
+        pdf_question_refiner,
+        pdf_decision_normalizer,
+        pdf_code_grounder,
+        pdf_routing_resolver,
+        pdf_terminal_marker,
+        pdf_quality_gate,
+        pre_section_rule_extractor, group_rule_extractor,
+        date_condition_extractor, summary_generator,
+        cfg=cfg, stage_name="pdf_enrich",
     ))
 
     # ── Context extraction ────────────────────────────────────────────────────
@@ -366,9 +398,13 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
                              "link_stage":"link_stage"})
 
     # Parse → enrich → context → validate → write (sequential)
-    for parse_node in ("html_parse","docx_parse","xlsx_parse","pdf_parse"):
+    # HTML/DOCX/XLSX share the HTML enrich_stage; PDF uses its own pdf_enrich
+    # army so the two flows never mix. Both rejoin at context_stage.
+    for parse_node in ("html_parse","docx_parse","xlsx_parse"):
         g.add_edge(parse_node, "enrich_stage")
+    g.add_edge("pdf_parse",            "pdf_enrich")
     g.add_edge("enrich_stage",         "context_stage")
+    g.add_edge("pdf_enrich",           "context_stage")
     g.add_edge("context_stage",        "validate_stage")
     g.add_edge("validate_stage",       "narrative_stage")
     g.add_edge("narrative_stage",      "graph_synthesis_stage")

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from typing import TYPE_CHECKING, Any
@@ -41,6 +42,19 @@ if TYPE_CHECKING:
     from ..config import PipelineConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _forced_provider() -> str:
+    """Optional single-provider override.
+
+    Set ``LLM_FORCE_PROVIDER=anthropic`` (or ``openai``) to route EVERY LLM
+    call through that provider, ignoring each agent's preferred provider and
+    skipping the cross-provider fallback. Useful when one provider's quota is
+    exhausted. Empty/unset keeps the normal dual-provider behaviour.
+    """
+    val = os.environ.get("LLM_FORCE_PROVIDER", "").strip().lower()
+    return val if val in {"anthropic", "openai"} else ""
+
 
 # ── Provider helpers ──────────────────────────────────────────────────────────
 
@@ -135,6 +149,10 @@ def _llm_call(
     from langchain_core.messages import HumanMessage
     pg_logger = getattr(cfg, "_pg_logger", None)
 
+    forced = _forced_provider()
+    if forced:
+        provider = forced
+
     def _try(make_llm_fn, prov_name, model_name, current_prompt, attempt_label):
         t0 = time.time()
         try:
@@ -171,7 +189,10 @@ def _llm_call(
                 )
             return None, str(exc)
 
-    alt_provider = "openai" if provider == "anthropic" else "anthropic"
+    # When a provider is forced, "fallback" is one extra attempt on the SAME
+    # provider instead of crossing over to the (broken) other one.
+    alt_provider = provider if forced else (
+        "openai" if provider == "anthropic" else "anthropic")
     primary_fn   = _make_anthropic_llm if provider  == "anthropic" else _make_openai_llm
     fallback_fn  = _make_openai_llm   if alt_provider == "openai"  else _make_anthropic_llm
     primary_model  = cfg.anthropic_model if provider     == "anthropic" else cfg.openai_model
@@ -208,6 +229,172 @@ def _llm_call(
 
     logger.error("llm_call [%s]: all attempts failed, returning fallback", agent_name)
     return fallback
+
+
+# ── 0. StepChecklistReconcilerAgent — Anthropic ───────────────────────────────
+# Consumes the deterministic step_inventory context store built by BS4 in
+# a03.html_step_inventory. Every step number on the checklist MUST end up in
+# `steps`. Missing steps are sent (raw cell grid) to the LLM for structured
+# extraction; if the LLM fails, a deterministic row→rule fallback guarantees
+# the step is still materialised. This is what prevents an entire SOP from
+# collapsing into a single "Step 0" node.
+
+_TERMINAL_TOKENS = ("(f3)", "(f4)", "process the claim", "save the claim")
+
+_VALID_DECISIONS = {"DENY", "ALLOW", "BYPASS", "PEND", "WAIVE", "REFER",
+                    "STOP", "SYSTEM", "CONDITIONAL", "OVERRIDE", "NOTE",
+                    "ELIGIBILITY"}
+
+
+def _blank_step(num: int, question: str, raw_text: str) -> dict:
+    return {
+        "number": num, "question": question, "intro_text": "",
+        "decision_rows": [], "annotations": [],
+        "branch_yes": "", "branch_no": "",
+        "skip_to_step_yes": None, "skip_to_step_no": None,
+        "referenced_sops": [],
+        "is_terminal": any(t in raw_text.lower() for t in _TERMINAL_TOKENS),
+        "raw_text": raw_text, "source_html": "",
+    }
+
+
+def _row_to_decision(num: int, cells: list[str]) -> dict | None:
+    from .a03_parse_html import _codes, _guess_decision, _skip_to
+    cells = [c for c in cells if c.strip()]
+    if cells and cells[0].strip() == str(num):
+        cells = cells[1:]
+    if not cells:
+        return None
+    if len(cells) == 1:
+        cond_if, cond_and, action = "", "", cells[0]
+    elif len(cells) == 2:
+        cond_if, cond_and, action = cells[0], "", cells[1]
+    else:
+        cond_if, cond_and, action = cells[0], cells[1], " ".join(cells[2:])
+    joined = " ".join(cells)
+    return {
+        "condition_if": cond_if[:500], "condition_and": cond_and[:500],
+        "action": action[:1000], "decision": _guess_decision(joined),
+        "codes": _codes(joined), "skip_to_step": _skip_to(joined),
+        "routing_label": "",
+    }
+
+
+def _inventory_fallback_step(entry: dict) -> dict:
+    """Deterministic conversion of one inventory entry into a step dict."""
+    num = entry["number"]
+    step = _blank_step(num, entry.get("title", ""), entry.get("raw_text", ""))
+    rows = entry.get("rows", [])
+    # First row that merely restates the title/question is not a rule
+    for i, r in enumerate(rows):
+        cells = r.get("cells", [])
+        if i == 0 and len([c for c in cells if c.strip()
+                           and c.strip() != str(num)]) == 1:
+            continue
+        d = _row_to_decision(num, cells)
+        if d:
+            step["decision_rows"].append(d)
+    return step
+
+
+def step_checklist_reconciler(state: "PipelineState", cfg: "PipelineConfig") -> dict:
+    inventory = state.get("step_inventory") or []
+    if not inventory:
+        return {}
+    steps = list(state.get("steps") or [])
+    have = {s.get("number") for s in steps}
+    missing = [e for e in inventory if e["number"] not in have]
+    if not missing:
+        return {}
+
+    logger.info("step_checklist_reconciler: checklist=%s extracted=%s missing=%s",
+                [e["number"] for e in inventory], sorted(have),
+                [e["number"] for e in missing])
+
+    payload = [{
+        "number": e["number"],
+        "title": (e.get("title") or "")[:200],
+        "rows": [r["cells"] for r in e.get("rows", [])][:40],
+    } for e in missing[:25]]
+
+    prompt = f"""You are converting a healthcare claims SOP step/action table into structured audit steps.
+
+Each input step below was parsed from HTML tables. "rows" is the raw cell grid
+(columns are usually If… / And… / Then…, or Yes/No branches, or a single action).
+
+For EVERY input step return one object — do not skip or merge any step number:
+{{
+  "number": <same step number>,
+  "question": "<the step's question or action, clear active voice>",
+  "is_terminal": true/false  (true only for final process/save actions like F3/F4),
+  "decision_rows": [{{
+     "condition_if":  "<IF condition — '' if the row is an unconditional action>",
+     "condition_and": "<AND condition — '' if none>",
+     "action":        "<THEN action the auditor must take, complete and specific>",
+     "decision":      "DENY|ALLOW|BYPASS|PEND|WAIVE|REFER|STOP|SYSTEM|CONDITIONAL"
+  }}]
+}}
+
+Rules:
+- Header rows (If/And/Then) are not decision rows.
+- A row that just restates the question is not a decision row.
+- Keep every code (EX CODE OCA, F3, W46…) and every timeframe (90 days, 365 days…) verbatim in the action text.
+
+Return a JSON array, one object per step.
+
+Steps:
+{json.dumps(payload, indent=2)}"""
+
+    result = _llm_call(cfg, prompt, [], "step_checklist_reconciler",
+                       provider="anthropic", expected_type=list,
+                       required_keys=["number"], max_tokens=8192)
+
+    by_num: dict[int, dict] = {}
+    if isinstance(result, list):
+        for r in result:
+            try:
+                by_num[int(r.get("number"))] = r
+            except (TypeError, ValueError):
+                continue
+
+    new_steps = []
+    for e in missing:
+        num = e["number"]
+        llm = by_num.get(num)
+        if llm and isinstance(llm.get("decision_rows"), list):
+            step = _blank_step(num, (llm.get("question") or e.get("title", ""))[:500],
+                               e.get("raw_text", ""))
+            if isinstance(llm.get("is_terminal"), bool):
+                step["is_terminal"] = llm["is_terminal"] or step["is_terminal"]
+            from .a03_parse_html import _codes, _guess_decision, _skip_to
+            for row in llm["decision_rows"]:
+                if not isinstance(row, dict):
+                    continue
+                action = str(row.get("action") or "").strip()
+                if not action:
+                    continue
+                decision = str(row.get("decision") or "").upper()
+                if decision not in _VALID_DECISIONS:
+                    decision = _guess_decision(action)
+                step["decision_rows"].append({
+                    "condition_if": str(row.get("condition_if") or "")[:500],
+                    "condition_and": str(row.get("condition_and") or "")[:500],
+                    "action": action[:1000], "decision": decision,
+                    "codes": _codes(action), "skip_to_step": _skip_to(action),
+                    "routing_label": "",
+                })
+            # LLM returned the step but no usable rows → deterministic fallback
+            if not step["decision_rows"]:
+                step = _inventory_fallback_step(e)
+                step["question"] = (llm.get("question") or step["question"])[:500]
+        else:
+            step = _inventory_fallback_step(e)
+        new_steps.append(step)
+
+    merged = sorted(steps + new_steps, key=lambda s: s.get("number", 0))
+    logger.info("step_checklist_reconciler: backfilled %d steps → total %d",
+                len(new_steps), len(merged))
+    return {"steps": merged}
 
 
 # ── 1. StepQuestionRefinerAgent — Anthropic ───────────────────────────────────

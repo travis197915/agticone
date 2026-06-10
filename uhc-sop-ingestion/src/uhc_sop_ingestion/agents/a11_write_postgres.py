@@ -285,8 +285,8 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
         INSERT INTO sop_ingestion_auditstep
             (sop_id, step_number, question, intro_text, is_terminal,
              terminal_action, is_sub_procedure, sub_procedure_name,
-             neo4j_node_id, narrative_context)
-        VALUES (%s, 0, %s, %s, false, '', false, '', '', '')
+             neo4j_node_id, narrative_context, is_out_of_scope, yaml_rule_id)
+        VALUES (%s, 0, %s, %s, false, '', false, '', '', '', false, '')
         ON CONFLICT (sop_id, step_number) DO UPDATE
           SET question = EXCLUDED.question, intro_text = EXCLUDED.intro_text
         RETURNING id;
@@ -312,10 +312,14 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
              action_summary, action_line, action_claim,
              decision_type, goto_step, is_final,
              eob_codes, ex_codes, denial_codes, system_actions, all_codes,
-             neo4j_edge_id)
+             neo4j_edge_id,
+             depth, subrule_id, table_name, aggregation, output_text,
+             tooling_allowed, is_out_of_scope, mongo_subtree_ref,
+             applicable_when)
         VALUES (%s, %s, %s, '', %s, %s, '', '', %s, NULL, false,
                 '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb,
-                '');
+                '',
+                0, '', '', 'LEAF', '', true, false, '', '');
     """
     # Map our LLM-tagged decision types to the schema's allowed CHOICES
     _DTYPE_MAP = {
@@ -365,14 +369,15 @@ def pg_step_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
             (sop_id, step_number, question, intro_text,
              is_terminal, terminal_action,
              is_sub_procedure, sub_procedure_name, neo4j_node_id,
-             narrative_context)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             narrative_context, is_out_of_scope, yaml_rule_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT ON CONSTRAINT unique_auditstep_sop_number
         DO UPDATE SET
             question          = EXCLUDED.question,
             intro_text        = EXCLUDED.intro_text,
             is_terminal       = EXCLUDED.is_terminal,
             terminal_action   = EXCLUDED.terminal_action,
+            is_out_of_scope   = EXCLUDED.is_out_of_scope,
             narrative_context = CASE
                 WHEN EXCLUDED.narrative_context <> ''
                 THEN EXCLUDED.narrative_context
@@ -388,9 +393,13 @@ def pg_step_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
              action_summary, action_line, action_claim,
              decision_type, goto_step, is_final,
              eob_codes, ex_codes, denial_codes, system_actions, all_codes,
-             neo4j_edge_id)
+             neo4j_edge_id,
+             depth, subrule_id, table_name, aggregation, output_text,
+             tooling_allowed, is_out_of_scope, mongo_subtree_ref,
+             applicable_when)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+                %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s,
+                0, '', '', 'LEAF', '', true, %s, '', %s)
         ON CONFLICT DO NOTHING;
     """
 
@@ -409,6 +418,8 @@ def pg_step_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
             _s(step.get("sub_procedure_name", ""), 256),
             "",
             _s(step.get("narrative_context", "")),
+            bool(step.get("is_out_of_scope", False)),
+            _s(step.get("yaml_rule_id", ""), 64),
         ))
         if not rows:
             continue
@@ -450,6 +461,8 @@ def pg_step_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
                 bool(row.get("is_terminal") or row.get("is_final", False)),
                 _j(eob), _j(ex), _j(denial), _j(sys_act), _j(all_c),
                 "",
+                bool(row.get("is_out_of_scope", False)),
+                _s(row.get("applicable_when", "")),
             ))
     return {}
 

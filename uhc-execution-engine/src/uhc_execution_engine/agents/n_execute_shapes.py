@@ -135,6 +135,7 @@ def _mk_result(
         ),
         "navigation": navigation,
         "is_out_of_scope": bool(rule.get("is_out_of_scope")),
+        "manual_oos": bool(rule.get("manual_oos")),
         "goto_step": rule.get("goto_step"),
     }
 
@@ -304,6 +305,11 @@ def execute_shapes(state: ExecutionState) -> dict:
 
     # ── phase 1: preconditions, in order; may DENY/STOP halt ──────────────────
     for rule in preconditions:
+        # Auditor marked this node out of scope on the canvas — exclude its
+        # rules from execution entirely (no LLM call), record as SKIPPED.
+        if rule.get("manual_oos"):
+            _mark_skipped([rule], "manually marked out of scope (excluded from execution)", None)
+            continue
         verdict = _evaluate(rule)
         if verdict["_matched"] and rule.get("decision_type") in _HALT_DECISION_TYPES:
             terminated_at_shape_id = rule.get("shape_id", "")
@@ -410,6 +416,17 @@ def execute_shapes(state: ExecutionState) -> dict:
             verdicts: list[tuple[dict, dict]] = []
             satisfied_applicable = False
             for rule in rules:
+                # Auditor manually excluded this node on the canvas: skip every
+                # rule in place (no LLM call) and continue to the next step. This
+                # is a pure exclusion — it never triggers the SOP "out of scope →
+                # stop auditing" clean-stop, so the rest of the SOP still runs.
+                if rule.get("manual_oos"):
+                    _mark_skipped(
+                        [rule],
+                        "manually marked out of scope (excluded from execution)",
+                        step_no,
+                    )
+                    continue
                 # Blank out-of-scope steps (no rule defined — flagged OOS and
                 # non-final by the importer) are excluded from auditing: skip in
                 # place with NO LLM call and continue to the next step. Terminal

@@ -8,6 +8,8 @@ import logging
 import os
 from pathlib import Path
 
+from django.core.exceptions import ObjectDoesNotExist
+
 log = logging.getLogger(__name__)
 
 _ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
@@ -86,6 +88,8 @@ def execute_ingestion_job(job_id: str) -> dict:
     except Exception as exc:
         log.warning("refresh_llm_totals failed for job %s: %s", job_id, exc)
 
+    _maybe_auto_build_workflow(job)
+
     log.info(
         "Pipeline done  job=%s  processed=%s  errors=%s  llm_calls=%s  tokens_in=%s  tokens_out=%s",
         job_id,
@@ -96,3 +100,30 @@ def execute_ingestion_job(job_id: str) -> dict:
         job.total_tokens_out,
     )
     return {"job_id": job_id, "status": job.status}
+
+
+def _maybe_auto_build_workflow(job) -> None:
+    """Opt-in add-on: build the builder canvas from the ingested SOP(s).
+
+    Only fires when the triggering Workflow set ``metadata.auto_build_canvas``
+    (i.e. the create request passed ``auto_build_from_sop=true``). Best-effort:
+    a failure here is logged and never fails the ingestion job.
+    """
+    # Reverse one-to-one access raises DoesNotExist (not AttributeError) when
+    # no Workflow points at this job, so getattr(..., None) can't be used.
+    try:
+        workflow = job.workflow
+    except ObjectDoesNotExist:
+        return
+    if workflow is None:
+        return
+    if not (workflow.metadata or {}).get("auto_build_canvas"):
+        return
+    try:
+        from builder.sop_autobuild import build_workflow_for_job
+
+        stats = build_workflow_for_job(workflow, job)
+        log.info("auto-build workflow=%s stats=%s", workflow.id, stats)
+    except Exception as exc:
+        log.exception("auto-build failed for job %s / workflow %s: %s",
+                      job.job_id, getattr(workflow, "id", "?"), exc)

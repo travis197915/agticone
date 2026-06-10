@@ -93,6 +93,117 @@ def _hydrate_decision(sop, step, dec, override_condition: str,
     }
 
 
+def _custom_rule_dict(raw: dict, *, shape_id: str, sop_id: int,
+                      step_number: Any, manual_oos: bool) -> dict[str, Any]:
+    """Build one executable rule dict from a canvas-authored custom rule.
+
+    Mirrors the envelope of :func:`_hydrate_decision` so ``execute_shapes`` and
+    the evaluator treat it identically to a SOP rule.
+    """
+    return {
+        "key":               raw.get("key"),
+        "sop_id":            sop_id,
+        "sop_title":         raw.get("sop_title") or "Custom",
+        "source":            "decision",
+        "section_id":        step_number,
+        "section_label":     raw.get("section_label") or "Custom rule",
+        "section_category":  "DECISION",
+        "yaml_rule_id":      "",
+        "subrule_id":        raw.get("subrule_id") or "",
+        "step_question":     "",
+        "section_narrative": raw.get("section_narrative") or "",
+        "condition":         (raw.get("condition") or "").strip(),
+        "action":            (raw.get("action") or "").strip(),
+        "decision_type":     (raw.get("decision_type") or "").strip(),
+        "is_exception":      False,
+        "codes":             list(raw.get("codes") or []),
+        "is_blocking":       False,
+        "step_number":       step_number,
+        "is_out_of_scope":   False,
+        "is_final":          False,
+        "aggregation":       "LEAF",
+        "applicable_when":   "",
+        "goto_step":         None,
+        "binding_id":        "",
+        "shape_id":          shape_id,
+        "references":        [],
+        "excluded_by":       [],
+        "manual_oos":        manual_oos,
+        "is_custom":         True,
+        "depth":             int(raw.get("depth") or 0),
+        "parent_key":        raw.get("parent_key"),
+        "additional_context": (raw.get("additional_context") or "").strip(),
+    }
+
+
+def _materialise_custom_rules(workflow_id: str,
+                              shapes_by_id: dict[str, dict[str, Any]],
+                              decisions_out: list[dict[str, Any]]) -> None:
+    """Append canvas-authored custom rules (from Shape.properties) as
+    executable decision rules, grouped onto their shapes."""
+    from builder.models import Shape
+
+    # Host (sop_id, step_number) per shape, taken from its first SOP decision so
+    # custom rules execute within the same step/cursor as the node's SOP rules.
+    host_by_shape: dict[str, tuple[int, Any]] = {}
+    for sg in shapes_by_id.values():
+        for rd in sg["rules"]:
+            if rd.get("source") == "decision" and rd.get("sop_id"):
+                host_by_shape[sg["shape_id"]] = (rd["sop_id"], rd.get("step_number"))
+                break
+
+    shapes = (
+        Shape.objects
+        .filter(workbench__work_area__workflow_id=workflow_id)
+        .select_related("workbench")
+        .order_by("workbench__order", "order")
+    )
+    synthetic_step = 9000  # park rule-less manual nodes after real steps
+    for shape in shapes:
+        props = shape.properties or {}
+        customs = [
+            r for r in (props.get("sop_rules") or [])
+            if isinstance(r, dict)
+            and (r.get("is_custom") or str(r.get("key") or "").startswith("custom:"))
+        ]
+        if not customs:
+            continue
+        sid = str(shape.id)
+        host = host_by_shape.get(sid)
+        if host:
+            host_sop_id, host_step = host
+        else:
+            host_sop_id = int(props.get("sop_id") or 0)
+            host_step = props.get("step_number")
+            if host_step is None:
+                synthetic_step += 1
+                host_step = synthetic_step
+        manual_oos = bool(props.get("manual_out_of_scope"))
+
+        sg = shapes_by_id.get(sid)
+        if sg is None:
+            wb = shape.workbench
+            sg = {
+                "shape_id":      sid,
+                "shape_label":   shape.label or "",
+                "workbench":     {"name": wb.name or "", "order": wb.order},
+                "shape_order":   shape.order,
+                "rules":         [],
+                "tool_bindings": [],
+            }
+            shapes_by_id[sid] = sg
+
+        for raw in customs:
+            if not raw.get("key"):
+                continue
+            rd = _custom_rule_dict(
+                raw, shape_id=sid, sop_id=host_sop_id,
+                step_number=host_step, manual_oos=manual_oos,
+            )
+            decisions_out.append(rd)
+            sg["rules"].append(rd)
+
+
 def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
     """Return preconditions, decisions, and tool binding lookups for a workflow.
 
@@ -191,6 +302,12 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
         rule_dict["shape_id"] = str(rb.shape_id)
         rule_dict["references"] = list(rb.references_json or [])
         rule_dict["excluded_by"] = list(rb.excluded_by_json or [])
+        # Manual per-node exclusion set by the auditor on the canvas
+        # (``Shape.properties.manual_out_of_scope``). When true, the execution
+        # engine skips EVERY rule on this shape (no LLM call) and continues —
+        # independent of the SOP-derived ``is_out_of_scope`` routing.
+        rule_dict["manual_oos"] = bool(
+            (getattr(rb.shape, "properties", None) or {}).get("manual_out_of_scope"))
         if kind == "pre":
             preconds_out.append(rule_dict)
         else:
@@ -214,6 +331,14 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
             }
             shapes_by_id[shape_id_str] = shape_group
         shape_group["rules"].append(rule_dict)
+
+    # ── Custom rules authored on the canvas (incl. manual sub-rules) ──────────
+    # These live ONLY in ``Shape.properties.sop_rules`` (key ``custom:...``),
+    # never as NodeRuleBinding rows (they have no SOP source). Materialise them
+    # here as self-contained executable rules so the engine evaluates them like
+    # SOP rules. Each inherits the host shape's (sop_id, step_number) so it slots
+    # into that step's cursor and is grouped on the same node.
+    _materialise_custom_rules(workflow_id, shapes_by_id, decisions_out)
 
     # Tool binding dicts + scoping lookups
     def _tool_dict(tb) -> dict[str, Any]:

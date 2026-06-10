@@ -77,6 +77,9 @@ def mongo_parsed_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
                 "metadata": state.get("metadata") or {},
                 "pre_sections": state.get("pre_sections") or [],
                 "steps": state.get("enriched_steps") or state.get("steps") or [],
+                # BS4 step context store + checklist (deterministic ground truth)
+                "step_inventory": state.get("step_inventory") or [],
+                "step_checklist": state.get("step_checklist") or [],
                 "sub_procedures": state.get("sub_procedures") or [],
                 "reference_tables": state.get("reference_tables") or [],
                 "group_rules": state.get("group_rules") or [],

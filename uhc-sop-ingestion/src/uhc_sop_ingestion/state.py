@@ -42,6 +42,15 @@ class PipelineState(TypedDict, total=False):
     metadata: dict              # title, effective_date, revision_date, platform…
     pre_sections: list[dict]    # [{name, order, items, annotations}]
     steps: list[dict]           # [{number, question, decision_rows, …}]
+    # Deterministic BS4 step context store + checklist (a03.html_step_inventory)
+    # — consumed by a07.step_checklist_reconciler so no step is ever dropped.
+    step_inventory: list[dict]  # [{number, title, rows:[{cells}], raw_text}]
+    step_checklist: list[int]   # sorted step numbers found in the document
+    # PDF-PRIVATE context store (a06.pdf_step_inventory) — kept separate from the
+    # HTML step_inventory so the dedicated PDF agent army (a06b_pdf_agentic) never
+    # mixes with the HTML step/reconciler path.
+    pdf_inventory: list[dict]   # [{number, title, rows:[{cells}], raw_text}]
+    pdf_checklist: list[int]    # sorted step numbers detected in the PDF
     sub_procedures: list[dict]
     reference_tables: list[dict]
     group_rules: list[dict]

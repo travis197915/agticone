@@ -9,6 +9,11 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# ── Uploaded SOP documents (ingestion inputs) ────────────────────────────
+sop_uploads/
+OBH_Facets_Timely_Filing.pdf
+c9f37941-1121-46fc-832b-e2b29075a62a_OBH Facets Duplicate Claim Handling_masked.pdf
+
 # ── Editable installs / build artefacts ──────────────────────────────────
 build/
 dist/
