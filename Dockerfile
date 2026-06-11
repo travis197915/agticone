@@ -13,10 +13,9 @@ RUN apt-get update \
 COPY requirements.txt /app/requirements.txt
 COPY uhc-sop-ingestion /app/uhc-sop-ingestion
 COPY uhc-api-agent /app/uhc-api-agent
+COPY uhc-execution-engine /app/uhc-execution-engine
 
-RUN pip install --no-cache-dir -r /app/requirements.txt \
-    && pip install --no-cache-dir -e /app/uhc-sop-ingestion \
-    && pip install --no-cache-dir -e /app/uhc-api-agent
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
