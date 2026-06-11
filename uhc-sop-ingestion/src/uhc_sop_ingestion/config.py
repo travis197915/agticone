@@ -1,10 +1,12 @@
 """Centralised configuration loaded from .env (KEY=VALUE format).
 
 Resolution order:
-  1. Explicit .env file path passed to load_env()
+  1. Explicit .env file path passed to load_env() (if it exists)
   2. .env in current working directory
   3. .env walking up parent directories (finds project root automatically)
   4. Already-set environment variables (docker, CI, etc.)
+
+  If an explicit path is given but missing, steps 2–4 apply instead of raising.
 
 Usage:
     from uhc_sop_ingestion.config import PipelineConfig
@@ -23,8 +25,10 @@ from pathlib import Path
 def load_env(env_path: str | Path | None = None) -> None:
     """Load KEY=VALUE pairs from a .env file into os.environ.
 
-    If env_path is None, searches from cwd upward for the first .env file.
-    Already-set env vars are NOT overridden (dotenv override=False behaviour).
+    If env_path is given and exists, loads that file. Otherwise searches from
+    cwd upward for the first .env file. If none is found, uses already-set
+    environment variables (Docker / CI). Already-set env vars are NOT
+    overridden (dotenv override=False behaviour).
     """
     try:
         from dotenv import load_dotenv
@@ -33,10 +37,9 @@ def load_env(env_path: str | Path | None = None) -> None:
 
     if env_path:
         path = Path(env_path)
-        if not path.exists():
-            raise FileNotFoundError(f".env not found: {path}")
-        load_dotenv(dotenv_path=path, override=False)
-        return
+        if path.exists():
+            load_dotenv(dotenv_path=path, override=False)
+            return
 
     # Walk up from cwd until we find a .env
     search = Path.cwd()

@@ -42,7 +42,9 @@ def execute_ingestion_job(job_id: str) -> dict:
     os.environ["LLM_MODEL"] = job.llm_model
 
     try:
-        pipeline = SopIngestionPipeline(env_path=_ENV_PATH)
+        pipeline = SopIngestionPipeline(
+            env_path=_ENV_PATH if _ENV_PATH.exists() else None
+        )
         final_state = pipeline.run(
             job.seed_url,
             job_id=str(job.job_id),

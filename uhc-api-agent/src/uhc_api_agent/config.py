@@ -18,7 +18,12 @@ from pathlib import Path
 # ── .env loader ───────────────────────────────────────────────────────────────
 
 def load_env(env_path: str | Path | None = None) -> None:
-    """Load KEY=VALUE pairs from a .env file into os.environ (idempotent)."""
+    """Load KEY=VALUE pairs from a .env file into os.environ (idempotent).
+
+    If env_path is given and exists, loads that file. Otherwise searches from
+    cwd upward for the first .env file. If none is found, uses already-set
+    environment variables (Docker / CI).
+    """
     try:
         from dotenv import load_dotenv
     except ImportError as e:
@@ -26,10 +31,9 @@ def load_env(env_path: str | Path | None = None) -> None:
 
     if env_path:
         path = Path(env_path)
-        if not path.exists():
-            raise FileNotFoundError(f".env not found: {path}")
-        load_dotenv(dotenv_path=path, override=False)
-        return
+        if path.exists():
+            load_dotenv(dotenv_path=path, override=False)
+            return
 
     search = Path.cwd()
     for candidate in [search, *search.parents]:

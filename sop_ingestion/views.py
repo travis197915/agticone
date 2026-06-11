@@ -189,7 +189,9 @@ class SyncRunView(APIView):
 
         try:
             from uhc_sop_ingestion.pipeline import SopIngestionPipeline
-            pipeline    = SopIngestionPipeline(env_path=_ENV_PATH)
+            pipeline    = SopIngestionPipeline(
+                env_path=_ENV_PATH if _ENV_PATH.exists() else None
+            )
             final_state = pipeline.run(
                 d["seed_url"],
                 job_id=str(job.job_id),   # <-- must match the DB row created above
