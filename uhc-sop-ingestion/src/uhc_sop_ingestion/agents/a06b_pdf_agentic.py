@@ -51,6 +51,9 @@ _VALID_DECISIONS = {"DENY", "ALLOW", "BYPASS", "PEND", "WAIVE", "REFER",
                     "ELIGIBILITY"}
 _TERMINAL_TOKENS = ("(f3)", "(f4)", "process the claim", "save the claim")
 _STEP_CHUNK = 5          # steps per LLM call — small enough to never truncate
+_INV_MIN = 2             # below this many detected steps, fall back to full-text
+_FULLTEXT_CAP = 48000    # chars of raw_text sent per full-text extraction call
+_FULLTEXT_CHUNK = 16000  # char window when a document exceeds the cap
 _YES = re.compile(r"^\s*(yes|meets criteria|if yes)\b", re.I)
 _NO = re.compile(r"^\s*(no|does not meet|if no)\b", re.I)
 
@@ -218,9 +221,112 @@ Steps:
     return out
 
 
+# ── 2b. Full-text (context) extraction — works for ANY PDF layout ────────────
+# When the deterministic detector finds no clean Step/Action table (scanned
+# tables, multi-column flattening, prose procedures, non-sequential numbering),
+# we hand the WHOLE document text to the LLM and let it reconstruct the
+# procedure in context. This is the path that makes "ingest any PDF" hold.
+
+def _fulltext_windows(raw_text: str) -> list[str]:
+    raw = (raw_text or "").strip()
+    if not raw:
+        return []
+    if len(raw) <= _FULLTEXT_CAP:
+        return [raw]
+    # Page markers (inserted by the parser as "\n") give natural break points;
+    # fall back to fixed char windows so a huge doc is never truncated away.
+    windows: list[str] = []
+    start = 0
+    while start < len(raw):
+        windows.append(raw[start:start + _FULLTEXT_CHUNK])
+        start += _FULLTEXT_CHUNK
+    return windows
+
+
+def _extract_fulltext_steps(cfg, raw_text: str) -> list[dict]:
+    """Reconstruct ordered audit steps from the full document text via the LLM."""
+    windows = _fulltext_windows(raw_text)
+    if not windows:
+        return []
+
+    by_num: dict[int, dict] = {}
+    multi = len(windows) > 1
+    for wi, window in enumerate(windows):
+        part = (f"\n\nThis is part {wi + 1} of {len(windows)} of the document; "
+                "continue the same step numbering." if multi else "")
+        prompt = f"""You are a senior claims auditor. Convert this healthcare claims SOP
+(extracted from a PDF — the layout may be messy, columns/tables may be flattened
+into prose) into the ordered list of PROCEDURE steps an auditor follows.
+
+Extract ONLY the actionable procedure (the "Step / Action" flow). IGNORE
+revision history, approver tables, code-description glossaries and navigation
+chrome. Use the document's own step numbers when present; otherwise number the
+steps sequentially in the order they must be performed.{part}
+
+Return a JSON array, one object per step, in order:
+{{
+  "number": <step number>,
+  "question": "<the step's instruction/question in clear active voice>",
+  "intro_text": "<optional one-line context, else ''>",
+  "is_terminal": true|false,  (true only for final process/save actions, e.g. F3/F4)
+  "decision_rows": [{{
+     "condition_if":  "<IF condition; '' for an unconditional action>",
+     "condition_and": "<AND condition; '' if none>",
+     "action":        "<THEN action — complete and specific>",
+     "decision":      "DENY|ALLOW|BYPASS|PEND|WAIVE|REFER|STOP|SYSTEM|CONDITIONAL",
+     "skip_to_step":  <step number to jump to, or null>
+  }}]
+}}
+
+Rules:
+- Reconstruct If / And / Then (or Yes/No) branches into separate decision_rows.
+- Preserve every code (EX CODE OCA, W46/47, E51/F51, EOB/denial codes…) and
+  timeframe verbatim inside the action text.
+- Capture "Skip to Step N" / "Proceed to Step N" as skip_to_step.
+- A step with no conditional branching still gets one decision_row describing
+  its action.
+
+DOCUMENT TEXT:
+{window}"""
+        res = _llm_call(cfg, prompt, [], "pdf_fulltext_extractor",
+                        provider="anthropic", expected_type=list,
+                        required_keys=["number"], max_tokens=8192)
+        if not isinstance(res, list):
+            continue
+        for r in res:
+            if not isinstance(r, dict):
+                continue
+            try:
+                num = int(r.get("number"))
+            except (TypeError, ValueError):
+                continue
+            # Merge across windows: keep the entry with the most decision rows.
+            prev = by_num.get(num)
+            if prev is None or len(r.get("decision_rows") or []) > len(
+                    prev.get("decision_rows") or []):
+                by_num[num] = r
+
+    steps: list[dict] = []
+    for num in sorted(by_num):
+        step = _clean_rows_from_llm(num, by_num[num], "")
+        if not step["question"]:
+            step["question"] = f"Step {num}"
+        steps.append(step)
+    logger.info("pdf_fulltext_extractor: built %d steps from %d window(s)",
+                len(steps), len(windows))
+    return steps
+
+
 def pdf_step_extractor(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     inv = state.get("pdf_inventory") or []
-    if not inv:
+    if (state.get("doc_format") or "").upper() != "PDF":
+        return {}
+    # Contextual fallback: no clean step table (or too few) → read the whole
+    # document. This is what lets the army ingest ANY PDF layout.
+    if len(inv) < _INV_MIN:
+        steps = _extract_fulltext_steps(cfg, state.get("raw_text") or "")
+        if steps:
+            return {"steps": steps}
         return {}
     outline = [{"number": e["number"], "title": (e.get("title") or "")[:120]}
                for e in inv]
