@@ -5067,3 +5067,7 @@ LINE 1: ...son", "confidence", "reasoning", "decision_type", "verdict",...
 2026-06-08 11:27:11 INFO uhc_execution_engine.agents.n07_persist_respond persist_and_respond run=78169797-e1e1-4936-a51e-027b18748c8b claim=25XJ67616200 status=COMPLETED decision=ALLOW evals=147 tools=163 codes=[]
 2026-06-08 11:27:11 INFO uhc_execution_engine.batch batch=5348efa5-0ba6-417b-8c23-2af3e75c65b5 claim=25XJ67616200 run=78169797-e1e1-4936-a51e-027b18748c8b status=COMPLETED decision=ALLOW counted_as=completed
 2026-06-08 11:27:11 INFO execution_app.worker.batch_runner batch_runner done batch=5348efa5-0ba6-417b-8c23-2af3e75c65b5
+2026-06-11 11:51:33 INFO execution_app.views batch-events: client disconnected batch=9feb9263-ffed-4dbe-91f6-f52af8d60079
+2026-06-11 12:00:14 INFO execution_app.views batch-events: client disconnected batch=9feb9263-ffed-4dbe-91f6-f52af8d60079
+2026-06-11 12:24:15 INFO execution_app.views batch-events: client disconnected batch=11e4ade5-f682-4b0c-949e-a20f6f1546a3
+2026-06-11 12:24:18 INFO execution_app.views batch-events: client disconnected batch=11e4ade5-f682-4b0c-949e-a20f6f1546a3

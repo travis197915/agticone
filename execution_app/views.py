@@ -2,8 +2,10 @@
 
 POST /api/execute/workflows/<workflow_id>/run-batch/         multipart upload (sync)
 POST /api/execute/workflows/<workflow_id>/run-batch-async/   multipart upload (async + SSE)
+GET  /api/execute/batches/latest/                            most recent batch (shared DB)
 GET  /api/execute/batches/<batch_id>/                        prior batch result
 GET  /api/execute/batches/<batch_id>/events/                 SSE stream of live batch events
+GET  /api/execute/runs/                                      all processed claims (paginated)
 GET  /api/execute/runs/<run_id>/                             single-claim audit trail
 GET  /api/execute/runs/<run_id>/nodes/                       per-canvas-node rollup
 """
@@ -21,6 +23,7 @@ from time import monotonic as _monotonic
 from typing import Any, Iterator
 
 from django.conf import settings
+from django.db.models import Avg, DurationField, ExpressionWrapper, F, Q
 from django.http import StreamingHttpResponse
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser
@@ -33,8 +36,9 @@ from rest_framework.views import APIView
 from . import trace_builder
 from .models import BatchExecutionRun, RuleExecutionRun
 from .serializers import (BatchExecutionRunSerializer,
-                          RuleExecutionRunSerializer)
-from .trace_builder import CLEAN, DEFECT, INCONCLUSIVE, _DEFECT_DECISIONS
+                          RuleExecutionRunSerializer, serialize_run_summary)
+from .trace_builder import (CLEAN, DEFECT, INCONCLUSIVE, _CLEAN_DECISIONS,
+                            _DEFECT_DECISIONS)
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +303,410 @@ def _serialize_agent(
     }
 
 
+def _serialize_evaluation(ev: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "orderIndex": ev["order_index"],
+        "ruleKey": ev["rule_key"],
+        "ruleSource": ev["rule_source"],
+        "condition": ev["condition"],
+        "action": ev["action"],
+        "matched": ev["matched"],
+        "decisionType": ev["decision_type"],
+        "confidence": ev["confidence"],
+        "reasoning": ev["reasoning"],
+        "codes": list(ev.get("codes") or []),
+        "llmProvider": ev.get("llm_provider") or "",
+        "llmMs": ev.get("llm_ms") or 0,
+    }
+
+
+def _serialize_agent_detail(
+    node: dict[str, Any],
+    run: RuleExecutionRun,
+    trace_by_shape: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    payload = _serialize_agent(node, run, trace_by_shape)
+    payload["evaluations"] = [_serialize_evaluation(ev) for ev in node["evaluations"]]
+    return payload
+
+
+def _serialize_agent_light(
+    node: dict[str, Any],
+    run: RuleExecutionRun,
+) -> dict[str, Any]:
+    """Agent card payload without loading trace_json for per-shape status."""
+    invocations = node["tool_invocations"]
+    begin_ts = invocations[0]["called_at"] if invocations else run.started_at
+    end_ts = invocations[-1]["called_at"] if invocations else (run.finished_at or run.started_at)
+    duration_sec = max(0, int((end_ts - begin_ts).total_seconds()))
+    steps = []
+    for idx, inv in enumerate(invocations, start=1):
+        details = f"Called {inv['tool_name']} for claim {run.claim_id}"
+        if inv.get("error"):
+            details = f"{details}. Error: {inv['error']}"
+        steps.append({
+            "id": f"s{idx}",
+            "name": inv["tool_name"],
+            "status": "completed" if inv["ok"] else "failed",
+            "duration": _format_duration(inv["duration_ms"]),
+            "details": details,
+        })
+    process_summary = []
+    for evaluation in node["evaluations"]:
+        reasoning = (evaluation.get("reasoning") or "").strip()
+        if reasoning:
+            process_summary.append(reasoning)
+    status = _agent_status_light(node) if "matched_decisions" in node else _agent_status(node)
+    return {
+        "id": node["shape_id"],
+        "agentName": node["shape_label"] or node["shape_id"],
+        "status": status,
+        "beginTime": _format_clock(begin_ts),
+        "endTime": _format_clock(end_ts),
+        "durationSec": duration_sec,
+        "processSummary": process_summary[:10],
+        "steps": steps,
+    }
+
+
+def _serialize_agent_detail_light(
+    node: dict[str, Any],
+    run: RuleExecutionRun,
+) -> dict[str, Any]:
+    payload = _serialize_agent_light(node, run)
+    payload["evaluations"] = [_serialize_evaluation(ev) for ev in node["evaluations"]]
+    return payload
+
+
+def _serialize_agent_summary(
+    node: dict[str, Any],
+    run: RuleExecutionRun,
+    trace_by_shape: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    process_summary = []
+    for evaluation in node["evaluations"]:
+        reasoning = (evaluation.get("reasoning") or "").strip()
+        if reasoning:
+            process_summary.append(reasoning)
+    return {
+        "id": node["shape_id"],
+        "agentName": node["shape_label"] or node["shape_id"],
+        "status": _agent_status(node, trace_by_shape),
+        "processSummary": process_summary[:10],
+    }
+
+
+def _parse_run_lookup_uuids(
+    request: Request,
+) -> tuple[uuid.UUID | None, uuid.UUID | None, Response | None]:
+    run_id_param = (request.query_params.get("run_id") or "").strip()
+    batch_id_param = (request.query_params.get("batch_id") or "").strip()
+    run_uuid: uuid.UUID | None = None
+    batch_uuid: uuid.UUID | None = None
+    if run_id_param:
+        try:
+            run_uuid = uuid.UUID(run_id_param)
+        except ValueError:
+            return None, None, _relay_error(
+                "Malformed run_id query parameter",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                details={"run_id": run_id_param},
+            )
+    if batch_id_param:
+        try:
+            batch_uuid = uuid.UUID(batch_id_param)
+        except ValueError:
+            return None, None, _relay_error(
+                "Malformed batch_id query parameter",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                details={"batch_id": batch_id_param},
+            )
+    return run_uuid, batch_uuid, None
+
+
+def _load_run_for_claim(
+    claim_id: str,
+    run_uuid: uuid.UUID | None,
+    batch_uuid: uuid.UUID | None,
+    *,
+    lightweight: bool = False,
+) -> tuple[RuleExecutionRun | None, Response | None]:
+    try:
+        base = RuleExecutionRun.objects.select_related("workflow", "batch")
+        if not lightweight:
+            base = base.prefetch_related(
+                "evaluations__rule_binding__shape",
+                "tool_invocations__tool_binding__shape",
+            )
+        if run_uuid is not None:
+            run = base.get(id=run_uuid)
+        else:
+            queryset = base.filter(claim_id=claim_id)
+            if batch_uuid is not None:
+                queryset = queryset.filter(batch_id=batch_uuid)
+            run = queryset.order_by("-started_at").first()
+            if run is None:
+                return None, _relay_error(
+                    f"No run found for claim {claim_id}",
+                    status_code=status.HTTP_404_NOT_FOUND,
+                )
+    except RuleExecutionRun.DoesNotExist:
+        return None, _relay_error(
+            f"No run found for claim {claim_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    except Exception as exc:
+        logger.exception("claim run lookup failed claim_id=%s", claim_id)
+        return None, _relay_error(
+            "Unexpected error while loading claim run",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            details={"message": str(exc)},
+        )
+    return run, None
+
+
+def _claim_run_context(
+    run: RuleExecutionRun,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Any, dict[str, str]]:
+    nodes, outer_tools = _build_node_rollup(run)
+    from .models import ClaimTrace
+    trace = ClaimTrace.objects.filter(run=run).first()
+    trace_by_shape = _trace_status_by_shape(trace)
+    return nodes, outer_tools, trace, trace_by_shape
+
+
+def _claim_status_light(run: RuleExecutionRun, trace=None) -> str:
+    """Fast claim status for the summary tab — no trace_json walk or node rollup."""
+    if run.status == "RUNNING":
+        return INCONCLUSIVE
+    if run.status in {"FAILED", "FETCH_FAILED"}:
+        return INCONCLUSIVE
+    if run.status == "TERMINATED_EARLY":
+        return DEFECT
+    decision = trace_builder.normalize_decision(run.final_decision_type)
+    if decision:
+        return decision
+    if trace is not None and trace.final_status:
+        return trace_builder.normalize_status(trace.final_status)
+    return INCONCLUSIVE
+
+
+def _build_summary_rollup(
+    run: RuleExecutionRun,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Lightweight rollup for GET /claims/<id>/summary/ — reasoning + status only."""
+    nodes: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+    evals = (
+        run.evaluations
+        .select_related("rule_binding__shape")
+        .only(
+            "order_index",
+            "reasoning",
+            "matched",
+            "decision_type",
+            "skipped",
+            "rule_key",
+            "rule_binding_id",
+            "rule_binding__shape_id",
+            "rule_binding__shape__label",
+        )
+        .order_by("order_index")
+    )
+    for ev in evals:
+        rb = ev.rule_binding
+        if rb is not None:
+            shape_id = str(rb.shape_id)
+            shape_label = (rb.shape.label or "") if rb.shape else ""
+        else:
+            shape_id = f"orphaned:{ev.rule_key}"
+            shape_label = ""
+        slot = nodes.get(shape_id)
+        if slot is None:
+            slot = {
+                "shape_id": shape_id,
+                "shape_label": shape_label,
+                "reasonings": [],
+                "matched_decisions": [],
+                "terminated_here": False,
+            }
+            nodes[shape_id] = slot
+        reasoning = (ev.reasoning or "").strip()
+        if reasoning:
+            slot["reasonings"].append(reasoning)
+        if ev.matched and not getattr(ev, "skipped", False):
+            dt = (ev.decision_type or "").upper()
+            if dt and dt not in slot["matched_decisions"]:
+                slot["matched_decisions"].append(dt)
+
+    if run.status == "TERMINATED_EARLY":
+        for slot in nodes.values():
+            if any(d in _DEFECT_DECISIONS for d in slot["matched_decisions"]):
+                slot["terminated_here"] = True
+                break
+
+    outer_tools = [
+        {
+            "tool_name": inv.tool_name,
+            "phase": inv.phase,
+            "ok": inv.ok,
+            "duration_ms": inv.duration_ms,
+        }
+        for inv in (
+            run.tool_invocations
+            .filter(Q(tool_binding__isnull=True) | Q(phase__in=("FETCH", "PARSE")))
+            .only("tool_name", "phase", "ok", "duration_ms")
+            .order_by("called_at")
+        )
+    ]
+    return list(nodes.values()), outer_tools
+
+
+def _agent_status_light(node: dict[str, Any]) -> str:
+    if node.get("terminated_here") or any(
+        d in _DEFECT_DECISIONS for d in node.get("matched_decisions", [])
+    ):
+        return DEFECT
+    if node.get("matched_decisions"):
+        return CLEAN
+    return INCONCLUSIVE
+
+
+def _build_agents_rollup(
+    run: RuleExecutionRun,
+) -> list[dict[str, Any]]:
+    """Per-node rollup for the agents tab — skips outer tools and trace_json."""
+    nodes: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+    def _node_slot(shape_id: str, shape_label: str) -> dict[str, Any]:
+        slot = nodes.get(shape_id)
+        if slot is None:
+            slot = {
+                "shape_id": shape_id,
+                "shape_label": shape_label,
+                "evaluations": [],
+                "tool_invocations": [],
+                "matched_decisions": [],
+                "terminated_here": False,
+            }
+            nodes[shape_id] = slot
+        elif shape_label and not slot["shape_label"]:
+            slot["shape_label"] = shape_label
+        return slot
+
+    for ev in (
+        run.evaluations
+        .select_related("rule_binding__shape")
+        .order_by("order_index")
+    ):
+        rb = ev.rule_binding
+        if rb is not None:
+            shape_id = str(rb.shape_id)
+            shape_label = (rb.shape.label or "") if rb.shape else ""
+        else:
+            shape_id = f"orphaned:{ev.rule_key}"
+            shape_label = ""
+        slot = _node_slot(shape_id, shape_label)
+        slot["evaluations"].append({
+            "order_index": ev.order_index,
+            "rule_key": ev.rule_key,
+            "rule_source": ev.rule_source,
+            "condition": ev.condition,
+            "action": ev.action,
+            "matched": ev.matched,
+            "skipped": getattr(ev, "skipped", False),
+            "skip_reason": getattr(ev, "skip_reason", ""),
+            "confidence": ev.confidence,
+            "reasoning": ev.reasoning,
+            "decision_type": ev.decision_type,
+            "codes": list(ev.codes or []),
+            "llm_provider": ev.llm_provider,
+            "llm_ms": ev.llm_ms,
+        })
+        if ev.matched and not getattr(ev, "skipped", False):
+            dt = (ev.decision_type or "").upper()
+            if dt and dt not in slot["matched_decisions"]:
+                slot["matched_decisions"].append(dt)
+
+    for inv in (
+        run.tool_invocations
+        .select_related("tool_binding__shape")
+        .exclude(Q(tool_binding__isnull=True) | Q(phase__in=("FETCH", "PARSE")))
+        .order_by("called_at")
+    ):
+        tb = inv.tool_binding
+        if tb is None:
+            continue
+        shape_id = str(tb.shape_id)
+        shape_label = (tb.shape.label or "") if tb.shape else ""
+        slot = _node_slot(shape_id, shape_label)
+        slot["tool_invocations"].append({
+            "tool_name": inv.tool_name,
+            "phase": inv.phase,
+            "ok": inv.ok,
+            "duration_ms": inv.duration_ms,
+            "error": inv.error,
+            "called_at": inv.called_at,
+        })
+
+    if run.status == "TERMINATED_EARLY":
+        for slot in nodes.values():
+            if any(d in _DEFECT_DECISIONS for d in slot["matched_decisions"]):
+                slot["terminated_here"] = True
+                break
+
+    return list(nodes.values())
+
+
+def _serialize_agent_summary_light(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": node["shape_id"],
+        "agentName": node["shape_label"] or node["shape_id"],
+        "status": _agent_status_light(node),
+        "processSummary": node["reasonings"][:10],
+    }
+
+
+def _run_header_payload_light(run: RuleExecutionRun, trace=None) -> dict[str, Any]:
+    return {
+        "claimId": run.claim_id,
+        "runId": str(run.id),
+        "batchId": str(run.batch_id) if run.batch_id else None,
+        "workflowId": str(run.workflow_id),
+        "claimStatus": _claim_status_light(run, trace),
+        "runStatus": run.status,
+        "errorMessage": run.error_message or "",
+        "finalDecisionType": run.final_decision_type or "",
+        "appliedCodes": list(run.applied_codes or []),
+        "narrative": run.narrative or "",
+        "processingTimeMin": _processing_time_min(run),
+        "startedAt": _iso_utc(run.started_at),
+        "finishedAt": _iso_utc(run.finished_at),
+    }
+
+
+def _run_header_payload(
+    run: RuleExecutionRun,
+    nodes: list[dict[str, Any]],
+    trace,
+) -> dict[str, Any]:
+    return {
+        "claimId": run.claim_id,
+        "runId": str(run.id),
+        "batchId": str(run.batch_id) if run.batch_id else None,
+        "workflowId": str(run.workflow_id),
+        "claimStatus": _claim_status(run, nodes, trace),
+        "runStatus": run.status,
+        "errorMessage": run.error_message or "",
+        "finalDecisionType": run.final_decision_type or "",
+        "appliedCodes": list(run.applied_codes or []),
+        "narrative": run.narrative or "",
+        "processingTimeMin": _processing_time_min(run),
+        "startedAt": _iso_utc(run.started_at),
+        "finishedAt": _iso_utc(run.finished_at),
+    }
+
+
 _TERMINAL_BATCH_STATUSES = {"COMPLETED", "PARTIAL", "FAILED"}
 
 
@@ -449,6 +857,24 @@ class RunBatchView(APIView):
             time.sleep(self._POLL_INTERVAL_SEC)
 
 
+class BatchLatestView(APIView):
+    """GET /api/execute/batches/latest/ — most recent batch from shared DB."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, _request: Request) -> Response:
+        batch = (
+            BatchExecutionRun.objects
+            .prefetch_related("runs")
+            .order_by("-started_at")
+            .first()
+        )
+        if batch is None:
+            return Response({"detail": "no batches"},
+                            status=status.HTTP_404_NOT_FOUND)
+        return Response(BatchExecutionRunSerializer(batch).data)
+
+
 class BatchDetailView(APIView):
     permission_classes = [AllowAny]
 
@@ -459,6 +885,105 @@ class BatchDetailView(APIView):
             return Response({"detail": "not found"},
                             status=status.HTTP_404_NOT_FOUND)
         return Response(BatchExecutionRunSerializer(batch).data)
+
+
+def _parse_yyyy_mm_dd(value: str) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _filter_run_list_queryset(request: Request, qs):
+    """Apply list-view filters from query params (claim id, status, date range)."""
+    claim_id = (request.query_params.get("claim_id") or "").strip()
+    if claim_id:
+        qs = qs.filter(claim_id__icontains=claim_id)
+
+    claim_status = (request.query_params.get("claim_status") or "").strip().upper()
+    if claim_status == CLEAN:
+        qs = qs.filter(final_decision_type__in=list(_CLEAN_DECISIONS))
+    elif claim_status == DEFECT:
+        qs = qs.filter(
+            Q(status="TERMINATED_EARLY")
+            | Q(final_decision_type__in=list(_DEFECT_DECISIONS))
+        )
+    elif claim_status == INCONCLUSIVE:
+        qs = qs.filter(
+            Q(status__in=["RUNNING", "FAILED", "FETCH_FAILED"])
+            | Q(final_decision_type__iexact="INCONCLUSIVE")
+            | Q(final_decision_type="")
+        )
+
+    from_date = _parse_yyyy_mm_dd(request.query_params.get("from_date", ""))
+    if from_date is not None:
+        qs = qs.filter(finished_at__gte=from_date)
+
+    to_date = _parse_yyyy_mm_dd(request.query_params.get("to_date", ""))
+    if to_date is not None:
+        # inclusive end-of-day
+        end = to_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        qs = qs.filter(finished_at__lte=end)
+
+    return qs
+
+
+def _avg_processing_time_min(qs) -> float:
+    agg = (
+        qs.filter(finished_at__isnull=False, started_at__isnull=False)
+        .aggregate(
+            avg_duration=Avg(
+                ExpressionWrapper(
+                    F("finished_at") - F("started_at"),
+                    output_field=DurationField(),
+                )
+            )
+        )
+    )
+    avg = agg.get("avg_duration")
+    if avg is None:
+        return 0.0
+    return round(avg.total_seconds() / 60.0, 1)
+
+
+class RunListView(APIView):
+    """GET /api/execute/runs/ — all processed claims across every batch."""
+
+    permission_classes = [AllowAny]
+    _DEFAULT_LIMIT = 25
+    _MAX_LIMIT = 200
+
+    def get(self, request: Request) -> Response:
+        try:
+            limit = int(request.query_params.get("limit", self._DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            limit = self._DEFAULT_LIMIT
+        try:
+            offset = int(request.query_params.get("offset", 0))
+        except (TypeError, ValueError):
+            offset = 0
+
+        limit = max(1, min(limit, self._MAX_LIMIT))
+        offset = max(0, offset)
+
+        qs = (
+            RuleExecutionRun.objects
+            .select_related("trace")
+            .order_by("-started_at")
+        )
+        qs = _filter_run_list_queryset(request, qs)
+        total = qs.count()
+        runs = qs[offset: offset + limit]
+        return Response({
+            "count": total,
+            "limit": limit,
+            "offset": offset,
+            "avg_processing_time_min": _avg_processing_time_min(qs),
+            "results": [serialize_run_summary(r) for r in runs],
+        })
 
 
 class RunDetailView(APIView):
@@ -514,112 +1039,106 @@ class RunNodesView(APIView):
         })
 
 
-class ClaimProcessingView(APIView):
-    """GET /api/claims/<claim_id>/processing/ aggregated claim processing snapshot."""
+class ClaimSummaryView(APIView):
+    """GET /api/claims/<claim_id>/summary/ — header + outer tools + summaries."""
+
     permission_classes = [AllowAny]
 
-    def get(self, _request: Request, claim_id: str) -> Response:
-        run_id_param = (_request.query_params.get("run_id") or "").strip()
-        batch_id_param = (_request.query_params.get("batch_id") or "").strip()
-
-        run_uuid: uuid.UUID | None = None
-        batch_uuid: uuid.UUID | None = None
-        if run_id_param:
-            try:
-                run_uuid = uuid.UUID(run_id_param)
-            except ValueError:
-                return _relay_error(
-                    "Malformed run_id query parameter",
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    details={"run_id": run_id_param},
-                )
-        if batch_id_param:
-            try:
-                batch_uuid = uuid.UUID(batch_id_param)
-            except ValueError:
-                return _relay_error(
-                    "Malformed batch_id query parameter",
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    details={"batch_id": batch_id_param},
-                )
-
-        try:
-            if run_uuid is not None:
-                run = (RuleExecutionRun.objects
-                       .select_related("workflow", "batch")
-                       .prefetch_related(
-                           "evaluations__rule_binding__shape",
-                           "tool_invocations__tool_binding__shape",
-                       )
-                       .get(id=run_uuid))
-            else:
-                queryset = (RuleExecutionRun.objects
-                            .select_related("workflow", "batch")
-                            .prefetch_related(
-                                "evaluations__rule_binding__shape",
-                                "tool_invocations__tool_binding__shape",
-                            )
-                            .filter(claim_id=claim_id))
-                if batch_uuid is not None:
-                    queryset = queryset.filter(batch_id=batch_uuid)
-                run = queryset.order_by("-started_at").first()
-                if run is None:
-                    return _relay_error(
-                        f"No run found for claim {claim_id}",
-                        status_code=status.HTTP_404_NOT_FOUND,
-                    )
-        except RuleExecutionRun.DoesNotExist:
-            return _relay_error(
-                f"No run found for claim {claim_id}",
-                status_code=status.HTTP_404_NOT_FOUND,
-            )
-        except Exception as exc:
-            logger.exception("claim-processing failed claim_id=%s", claim_id)
-            return _relay_error(
-                "Unexpected error while loading claim processing",
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                details={"message": str(exc)},
-            )
-
-        nodes, outer_tools = _build_node_rollup(run)
-
-        # Trace drives the canonical 3-state status so the claim header, the
-        # agent chips and the Explainability tab all agree. Best-effort: a
-        # missing/old trace just falls back to the node + decision derivation.
+    def get(self, request: Request, claim_id: str) -> Response:
         from .models import ClaimTrace
-        trace = ClaimTrace.objects.filter(run=run).first()
-        trace_by_shape = _trace_status_by_shape(trace)
 
-        # LLM-call telemetry — sourced from sop_ingestion.LLMCallLog where
-        # _log_llm_call inserts one row per attempt, stamped with
-        # execution_run_id by the ContextVar set in RuleEnginePipeline.run.
-        # Survives a RuleEvaluation persist failure because LLMCallLog
-        # rows are written inline by the LLM helper, not inside n07's
-        # atomic block.
+        run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
+        if err is not None:
+            return err
+        run, err = _load_run_for_claim(
+            claim_id, run_uuid, batch_uuid, lightweight=True,
+        )
+        if err is not None:
+            return err
+        assert run is not None
+
+        trace = (
+            ClaimTrace.objects
+            .filter(run_id=run.id)
+            .only("final_status")
+            .first()
+        )
+        nodes, outer_tools = _build_summary_rollup(run)
+        payload = {
+            **_run_header_payload_light(run, trace),
+            "agents": [_serialize_agent_summary_light(node) for node in nodes],
+            "outerToolInvocations": [
+                {
+                    "phase": inv["phase"],
+                    "tool": inv["tool_name"],
+                    "status": "completed" if inv["ok"] else "failed",
+                    "durationMs": inv["duration_ms"],
+                }
+                for inv in outer_tools
+            ],
+            "reviewStatus": None,
+            "feedback": None,
+        }
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class ClaimAgentsView(APIView):
+    """GET /api/claims/<claim_id>/agents/ — per-node execution + evaluations."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request: Request, claim_id: str) -> Response:
+        from .models import ClaimTrace
+
+        run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
+        if err is not None:
+            return err
+        run, err = _load_run_for_claim(
+            claim_id, run_uuid, batch_uuid, lightweight=True,
+        )
+        if err is not None:
+            return err
+        assert run is not None
+
+        trace = (
+            ClaimTrace.objects
+            .filter(run_id=run.id)
+            .only("final_status")
+            .first()
+        )
+        nodes = _build_agents_rollup(run)
+        payload = {
+            **_run_header_payload_light(run, trace),
+            "agents": [
+                _serialize_agent_detail_light(node, run) for node in nodes
+            ],
+        }
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class ClaimProcessingView(APIView):
+    """GET /api/claims/<claim_id>/processing/ — legacy full snapshot (all tabs)."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request: Request, claim_id: str) -> Response:
+        run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
+        if err is not None:
+            return err
+        run, err = _load_run_for_claim(claim_id, run_uuid, batch_uuid)
+        if err is not None:
+            return err
+        assert run is not None
+
+        nodes, outer_tools, trace, trace_by_shape = _claim_run_context(run)
+
         from sop_ingestion.models import LLMCallLog
         llm_calls = list(
             LLMCallLog.objects.filter(execution_run_id=run.id).order_by("id")
         )
 
         payload = {
-            "claimId": run.claim_id,
-            "runId": str(run.id),
-            "batchId": str(run.batch_id) if run.batch_id else None,
-            "workflowId": str(run.workflow_id),
-            "claimStatus": _claim_status(run, nodes, trace),
-            # Engine-level run state — useful when claimStatus=DEFECT and the
-            # SPA needs to render why. `runStatus` is the raw RuleExecutionRun
-            # state (FAILED / FETCH_FAILED / TERMINATED_EARLY / COMPLETED /
-            # RUNNING); `errorMessage` carries the n07 recovery-handler
-            # message when a persist or fetch step crashed, otherwise empty.
-            "runStatus": run.status,
-            "errorMessage": run.error_message or "",
-            "finalDecisionType": run.final_decision_type or "",
-            "appliedCodes": list(run.applied_codes or []),
-            "narrative": run.narrative or "",
-            "processingTimeMin": _processing_time_min(run),
-            "startedAt": _iso_utc(run.started_at),
-            "finishedAt": _iso_utc(run.finished_at),
+            **_run_header_payload(run, nodes, trace),
             "agents": [_serialize_agent(node, run, trace_by_shape) for node in nodes],
             "outerToolInvocations": [
                 {
@@ -652,6 +1171,28 @@ class ClaimProcessingView(APIView):
         return Response(payload, status=status.HTTP_200_OK)
 
 
+def _load_claim_trace_record(
+    claim_id: str,
+    run_uuid: uuid.UUID | None,
+    batch_uuid: uuid.UUID | None,
+    *,
+    fields: tuple[str, ...],
+):
+    from .models import ClaimTrace
+
+    if run_uuid is not None:
+        return (
+            ClaimTrace.objects
+            .filter(run_id=run_uuid)
+            .only(*fields)
+            .first()
+        )
+    qs = ClaimTrace.objects.filter(claim_id=claim_id).only(*fields)
+    if batch_uuid is not None:
+        qs = qs.filter(run__batch_id=batch_uuid)
+    return qs.order_by("-created_at").first()
+
+
 class ClaimTraceView(APIView):
     """GET /api/claims/<claim_id>/trace/ and /explainability/.
 
@@ -666,37 +1207,18 @@ class ClaimTraceView(APIView):
     def get(self, request: Request, claim_id: str) -> Response:
         from django.http import JsonResponse
 
-        from .models import ClaimTrace
+        run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
+        if err is not None:
+            return err
 
-        run_id_param = (request.query_params.get("run_id") or "").strip()
-        batch_id_param = (request.query_params.get("batch_id") or "").strip()
         download = (request.query_params.get("download") or "").strip() in {"1", "true", "yes"}
-
-        run_uuid: uuid.UUID | None = None
-        batch_uuid: uuid.UUID | None = None
-        if run_id_param:
-            try:
-                run_uuid = uuid.UUID(run_id_param)
-            except ValueError:
-                return _relay_error("Malformed run_id query parameter",
-                                    status_code=status.HTTP_400_BAD_REQUEST,
-                                    details={"run_id": run_id_param})
-        if batch_id_param:
-            try:
-                batch_uuid = uuid.UUID(batch_id_param)
-            except ValueError:
-                return _relay_error("Malformed batch_id query parameter",
-                                    status_code=status.HTTP_400_BAD_REQUEST,
-                                    details={"batch_id": batch_id_param})
-
-        qs = ClaimTrace.objects.select_related("run")
-        if run_uuid is not None:
-            trace = qs.filter(run_id=run_uuid).first()
-        else:
-            qs = qs.filter(claim_id=claim_id)
-            if batch_uuid is not None:
-                qs = qs.filter(run__batch_id=batch_uuid)
-            trace = qs.order_by("-created_at").first()
+        json_field = "explainability_json" if self.kind == "explainability" else "trace_json"
+        trace = _load_claim_trace_record(
+            claim_id,
+            run_uuid,
+            batch_uuid,
+            fields=("claim_id", json_field),
+        )
 
         if trace is None:
             return _relay_error(
@@ -704,8 +1226,7 @@ class ClaimTraceView(APIView):
                 status_code=status.HTTP_404_NOT_FOUND,
             )
 
-        data = trace.explainability_json if self.kind == "explainability" else trace.trace_json
-        data = data or []
+        data = getattr(trace, json_field) or []
 
         if download:
             resp = JsonResponse(data, safe=False, json_dumps_params={"indent": 2})

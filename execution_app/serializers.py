@@ -8,6 +8,44 @@ from .models import (BatchExecutionRun, RuleEvaluation, RuleExecutionRun,
                       ToolInvocationRecord)
 
 
+def _processing_time_min(run: RuleExecutionRun) -> float:
+    if run.started_at and run.finished_at:
+        seconds = (run.finished_at - run.started_at).total_seconds()
+        return round(seconds / 60, 1)
+    return 0.0
+
+
+def _format_time(ts) -> str:
+    if ts is None:
+        return ""
+    return ts.strftime("%I:%M:%S %p")
+
+
+def serialize_run_summary(run: RuleExecutionRun) -> dict:
+    """Lightweight row for batch detail and the all-runs list."""
+    return {
+        "id": str(run.id),
+        "run_id": str(run.id),
+        "batch_id": str(run.batch_id) if run.batch_id else "",
+        "claim_id": run.claim_id,
+        "status": run.status,
+        "run_status": run.status,
+        "claim_status": claim_audit_status(run),
+        "final_decision_type": run.final_decision_type,
+        "applied_codes": run.applied_codes,
+        "error_message": run.error_message,
+        "started_at": _format_time(run.started_at),
+        "started_at_date": (
+            run.started_at.strftime("%Y-%m-%d") if run.started_at else ""
+        ),
+        "finished_at": _format_time(run.finished_at),
+        "finished_at_date": (
+            run.finished_at.strftime("%Y-%m-%d") if run.finished_at else ""
+        ),
+        "processing_time_min": _processing_time_min(run),
+    }
+
+
 def claim_audit_status(run: RuleExecutionRun) -> str:
     """Canonical 3-state claim status (CLEAN / DEFECT / INCONCLUSIVE).
 
@@ -77,12 +115,7 @@ class BatchExecutionRunSerializer(serializers.ModelSerializer):
     def get_runs(self, obj):
         # select_related('trace') so claim_audit_status doesn't fan out into a
         # per-run query for the reverse OneToOne.
-        return [{
-            "id": str(r.id),
-            "claim_id": r.claim_id,
-            "status": r.status,
-            "claim_status": claim_audit_status(r),
-            "final_decision_type": r.final_decision_type,
-            "applied_codes": r.applied_codes,
-            "error_message": r.error_message,
-        } for r in obj.runs.select_related("trace").all()]
+        return [
+            serialize_run_summary(r)
+            for r in obj.runs.select_related("trace").all()
+        ]

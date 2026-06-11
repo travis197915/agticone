@@ -6,11 +6,16 @@ from __future__ import annotations
 
 from django.urls import path
 
-from .views import ClaimProcessingView, ClaimTraceView
+from .views import (ClaimAgentsView, ClaimProcessingView, ClaimSummaryView,
+                     ClaimTraceView)
 
 app_name = "execution_claims"
 
 urlpatterns = [
+    path("<str:claim_id>/summary/",
+         ClaimSummaryView.as_view(), name="claim-summary"),
+    path("<str:claim_id>/agents/",
+         ClaimAgentsView.as_view(), name="claim-agents"),
     path("<str:claim_id>/processing/",
          ClaimProcessingView.as_view(), name="claim-processing"),
     path("<str:claim_id>/trace/",
