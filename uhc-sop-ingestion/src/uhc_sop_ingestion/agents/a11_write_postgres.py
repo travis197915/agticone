@@ -16,6 +16,7 @@ Writes parsed SOP content to the claims-audit-oriented schema:
 Every function follows the LangGraph agent signature: (state, cfg) -> dict | None.
 Uses raw psycopg2 with autocommit so writes are immediately visible.
 """
+
 from __future__ import annotations
 
 import json
@@ -38,10 +39,13 @@ def _ir_persist_enabled() -> bool:
     pass so the two never fight over the same rows."""
     return os.environ.get("SOP_IR_PERSIST", "").strip().lower() in {"1", "true", "yes"}
 
+
 # ── psycopg2 connection helper ────────────────────────────────────────────────
+
 
 def _conn(cfg: "PipelineConfig"):
     import psycopg2
+
     c = psycopg2.connect(cfg.pg_dsn)
     c.autocommit = True
     return c
@@ -61,7 +65,9 @@ def _exec(cfg: "PipelineConfig", sql: str, params: tuple) -> list:
         log.warning("pg write error: %s", exc)
         return []
 
+
 # ── serialization helpers ─────────────────────────────────────────────────────
+
 
 def _strip_nul(obj: Any) -> Any:
     """Recursively strip NUL (\\x00) bytes from any str inside obj.
@@ -102,40 +108,58 @@ def _i(v: Any):
 
 # ── code classification ────────────────────────────────────────────────────────
 
+
 def _classify_code(code: str) -> str:
     """Pattern-based code type classifier used as a fallback when the LLM hasn't classified."""
     c = code.strip().upper()
-    if re.match(r'^[EFW]\d{2}$', c):             return "EOB"
-    if re.match(r'^\d{3}$', c):                   return "EX"
-    if c in {"CDD", "CDS", "CDA"}:                return "DENIAL"
-    if re.match(r'^F[3-9]$', c):                  return "SYSTEM_ACT"
-    if re.match(r'^\d{2}$', c):                   return "POS"
-    if re.match(r'^\d{4}$', c):                   return "REVENUE"
-    if re.match(r'^[A-Z]\d{4}$|^\d{5}$', c):     return "CPT"
+    if re.match(r"^[EFW]\d{2}$", c):
+        return "EOB"
+    if re.match(r"^\d{3}$", c):
+        return "EX"
+    if c in {"CDD", "CDS", "CDA"}:
+        return "DENIAL"
+    if re.match(r"^F[3-9]$", c):
+        return "SYSTEM_ACT"
+    if re.match(r"^\d{2}$", c):
+        return "POS"
+    if re.match(r"^\d{4}$", c):
+        return "REVENUE"
+    if re.match(r"^[A-Z]\d{4}$|^\d{5}$", c):
+        return "CPT"
     return "UNKNOWN"
 
 
 def _classify_decision(action_text: str, denial: list, eob: list) -> str:
     t = (action_text or "").upper()
-    if denial or "CDD" in t:          return "DENY"
-    if "DENY" in t or "DENIAL" in t:  return "DENY"
-    if "BYPASS" in t or "OVERRIDE" in t: return "BYPASS"
-    if "PEND" in t:                   return "PEND"
-    if "ALLOW" in t or ("PROCESS" in t and "F3" in t): return "ALLOW"
-    if "WAIVE" in t:                  return "WAIVE"
-    if "STOP" in t or "DO NOT" in t:  return "STOP"
+    if denial or "CDD" in t:
+        return "DENY"
+    if "DENY" in t or "DENIAL" in t:
+        return "DENY"
+    if "BYPASS" in t or "OVERRIDE" in t:
+        return "BYPASS"
+    if "PEND" in t:
+        return "PEND"
+    if "ALLOW" in t or ("PROCESS" in t and "F3" in t):
+        return "ALLOW"
+    if "WAIVE" in t:
+        return "WAIVE"
+    if "STOP" in t or "DO NOT" in t:
+        return "STOP"
     return "CONDITIONAL"
 
 
 def _merge_codes(*lists) -> list:
     seen, result = set(), []
     for lst in lists:
-        for c in (lst or []):
+        for c in lst or []:
             if c not in seen:
-                seen.add(c); result.append(c)
+                seen.add(c)
+                result.append(c)
     return result
 
+
 # ── write agents ───────────────────────────────────────────────────────────────
+
 
 def pg_sop_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     """
@@ -143,11 +167,11 @@ def pg_sop_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     Returns {"sop_db_id": <int>} so all child writers can reference it.
     A human claims auditor opens this record first.
     """
-    meta     = state.get("metadata") or {}
-    steps    = state.get("steps") or []
+    meta = state.get("metadata") or {}
+    steps = state.get("steps") or []
     pre_secs = state.get("pre_sections") or []
-    codes    = state.get("detected_codes") or []
-    dec_cnt  = sum(len(s.get("decision_rows") or s.get("rows") or []) for s in steps)
+    codes = state.get("detected_codes") or []
+    dec_cnt = sum(len(s.get("decision_rows") or s.get("rows") or []) for s in steps)
 
     sql = """
         INSERT INTO sop_ingestion_auditsop (
@@ -185,32 +209,36 @@ def pg_sop_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
             updated_at         = NOW()
         RETURNING id;
     """
-    rows = _exec(cfg, sql, (
-        state.get("job_id", ""),
-        _s(state.get("current_url", ""), 2048),
-        _s(state.get("content_hash", "x"), 64),
-        _s(meta.get("doc_format", "HTML"), 8),
-        _s(meta.get("sop_id", ""), 256),
-        _s(meta.get("title", ""), 4096),
-        _s(meta.get("purpose", ""), 4096),
-        _s(state.get("llm_summary", meta.get("llm_summary", "")), 8192),
-        _s(state.get("sop_narrative", "")),
-        _s(meta.get("platform", ""), 256),
-        _j(meta.get("lob", [])),
-        _j(meta.get("audience", [])),
-        _s(meta.get("state_div", ""), 256),
-        _s(meta.get("product", ""), 256),
-        _s(meta.get("effective_date", ""), 32),
-        _s(meta.get("revision_date", ""), 32),
-        _i(state.get("current_depth", 0)) or 0,
-        _s(state.get("current_parent_url", ""), 2048),
-        len(steps),
-        dec_cnt,
-        len(codes),
-        len(pre_secs),
-        _s(state.get("raw_text", ""))[:500_000],
-        _j(state.get("parse_warnings", [])),
-    ))
+    rows = _exec(
+        cfg,
+        sql,
+        (
+            state.get("job_id", ""),
+            _s(state.get("current_url", ""), 2048),
+            _s(state.get("content_hash", "x"), 64),
+            _s(meta.get("doc_format", "HTML"), 8),
+            _s(meta.get("sop_id", ""), 256),
+            _s(meta.get("title", ""), 4096),
+            _s(meta.get("purpose", ""), 4096),
+            _s(state.get("llm_summary", meta.get("llm_summary", "")), 8192),
+            _s(state.get("sop_narrative", "")),
+            _s(meta.get("platform", ""), 256),
+            _j(meta.get("lob", [])),
+            _j(meta.get("audience", [])),
+            _s(meta.get("state_div", ""), 256),
+            _s(meta.get("product", ""), 256),
+            _s(meta.get("effective_date", ""), 32),
+            _s(meta.get("revision_date", ""), 32),
+            _i(state.get("current_depth", 0)) or 0,
+            _s(state.get("current_parent_url", ""), 2048),
+            len(steps),
+            dec_cnt,
+            len(codes),
+            len(pre_secs),
+            _s(state.get("raw_text", ""))[:500_000],
+            _j(state.get("parse_warnings", [])),
+        ),
+    )
 
     if rows:
         sop_id = rows[0][0]
@@ -233,10 +261,16 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
         return {}
 
     CATEGORY_MAP = {
-        "platform": "PLATFORM", "audience": "AUDIENCE",
-        "line": "LOB", "lob": "LOB", "business": "LOB",
-        "eligib": "ELIGIBILITY", "coverage": "COVERAGE",
-        "exception": "EXCEPTION", "exclusion": "EXCEPTION", "override": "EXCEPTION",
+        "platform": "PLATFORM",
+        "audience": "AUDIENCE",
+        "line": "LOB",
+        "lob": "LOB",
+        "business": "LOB",
+        "eligib": "ELIGIBILITY",
+        "coverage": "COVERAGE",
+        "exception": "EXCEPTION",
+        "exclusion": "EXCEPTION",
+        "override": "EXCEPTION",
     }
 
     def _cat(label: str) -> str:
@@ -257,17 +291,18 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
     exception_decisions: list[dict] = []
 
     for idx, ps in enumerate(state.get("pre_sections") or []):
-        name  = _s(ps.get("name", ""), 512)
+        name = _s(ps.get("name", ""), 512)
         items = ps.get("items", [])
         content = "\n".join(
-            (i.get("text", str(i)) if isinstance(i, dict) else str(i))
-            for i in items
+            (i.get("text", str(i)) if isinstance(i, dict) else str(i)) for i in items
         )
         # Fix: the extractor writes to llm_rules, not rules/annotations
-        llm_rules = ps.get("llm_rules") or ps.get("rules") or ps.get("annotations") or []
-        _exec(cfg, pc_sql, (
-            sop_id, idx, _cat(name), name, content, _j(llm_rules), False
-        ))
+        llm_rules = (
+            ps.get("llm_rules") or ps.get("rules") or ps.get("annotations") or []
+        )
+        _exec(
+            cfg, pc_sql, (sop_id, idx, _cat(name), name, content, _j(llm_rules), False)
+        )
 
         # Collect rules that belong in the decision tree
         section_label = name
@@ -276,15 +311,21 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
                 continue
             dtype = (rule.get("decision_type") or "NOTE").upper()
             is_exc = rule.get("is_exception") or dtype in (
-                "DENY", "ALLOW", "BYPASS", "OVERRIDE", "ELIGIBILITY"
+                "DENY",
+                "ALLOW",
+                "BYPASS",
+                "OVERRIDE",
+                "ELIGIBILITY",
             )
             if is_exc:
-                exception_decisions.append({
-                    "section":   section_label,
-                    "condition": rule.get("condition", ""),
-                    "action":    rule.get("action", ""),
-                    "dtype":     dtype,
-                })
+                exception_decisions.append(
+                    {
+                        "section": section_label,
+                        "condition": rule.get("condition", ""),
+                        "action": rule.get("action", ""),
+                        "dtype": dtype,
+                    }
+                )
 
     if not exception_decisions:
         return {}
@@ -300,19 +341,24 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
           SET question = EXCLUDED.question, intro_text = EXCLUDED.intro_text
         RETURNING id;
     """
-    rows = _exec(cfg, step0_sql, (
-        sop_id,
-        "Pre-Step Exceptions & Override Rules",
-        "Check these exception conditions BEFORE entering Step 1. "
-        "If any condition matches, the standard steps may not apply.",
-    ))
+    rows = _exec(
+        cfg,
+        step0_sql,
+        (
+            sop_id,
+            "Pre-Step Exceptions & Override Rules",
+            "Check these exception conditions BEFORE entering Step 1. "
+            "If any condition matches, the standard steps may not apply.",
+        ),
+    )
     if not rows:
         return {}
     step0_id = rows[0][0]
 
     # Clear any old Step-0 decisions before re-writing (idempotent on re-ingest)
-    _exec(cfg, "DELETE FROM sop_ingestion_auditdecision WHERE step_id = %s;",
-          (step0_id,))
+    _exec(
+        cfg, "DELETE FROM sop_ingestion_auditdecision WHERE step_id = %s;", (step0_id,)
+    )
 
     # ── Write each exception rule as an AuditDecision ─────────────────────────
     dec_sql = """
@@ -332,31 +378,49 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
     """
     # Map our LLM-tagged decision types to the schema's allowed CHOICES
     _DTYPE_MAP = {
-        "DENY": "DENY", "ALLOW": "ALLOW", "BYPASS": "BYPASS",
-        "PEND": "PEND", "REFER": "REFER", "SYSTEM": "SYSTEM",
-        "STOP": "STOP", "WAIVE": "WAIVE", "OVERRIDE": "BYPASS",
-        "ELIGIBILITY": "CONDITIONAL", "NOTE": "CONDITIONAL",
+        "DENY": "DENY",
+        "ALLOW": "ALLOW",
+        "BYPASS": "BYPASS",
+        "PEND": "PEND",
+        "REFER": "REFER",
+        "SYSTEM": "SYSTEM",
+        "STOP": "STOP",
+        "WAIVE": "WAIVE",
+        "OVERRIDE": "BYPASS",
+        "ELIGIBILITY": "CONDITIONAL",
+        "NOTE": "CONDITIONAL",
     }
     for i, rule in enumerate(exception_decisions):
         mapped = _DTYPE_MAP.get(rule["dtype"], "CONDITIONAL")
-        _exec(cfg, dec_sql, (
-            step0_id, i,
-            _s(rule["condition"], 1000),
-            _s(rule["action"], 2000),
-            _s(f"[{rule['section']}] {rule['action']}", 500)[:500],
-            mapped,
-        ))
+        _exec(
+            cfg,
+            dec_sql,
+            (
+                step0_id,
+                i,
+                _s(rule["condition"], 1000),
+                _s(rule["action"], 2000),
+                _s(f"[{rule['section']}] {rule['action']}", 500)[:500],
+                mapped,
+            ),
+        )
 
     # Update step_count on the AuditSop to include Step 0
-    _exec(cfg, """
+    _exec(
+        cfg,
+        """
         UPDATE sop_ingestion_auditsop
         SET step_count = step_count + 1,
             decision_count = decision_count + %s
         WHERE id = %s
-    """, (len(exception_decisions), sop_id))
+    """,
+        (len(exception_decisions), sop_id),
+    )
 
-    log.info("pg_precondition_writer: wrote Step 0 with %d exception rules",
-             len(exception_decisions))
+    log.info(
+        "pg_precondition_writer: wrote Step 0 with %d exception rules",
+        len(exception_decisions),
+    )
     return {}
 
 
@@ -375,11 +439,23 @@ def pg_step_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     # flat pass entirely — persist_ir (post-run, Django ORM) writes the same
     # rows with full routing fidelity (nesting, aggregation, goto, OOS).
     if _ir_persist_enabled():
-        log.info("pg_step_writer: SOP_IR_PERSIST on — deferring step/decision "
-                 "rows to sop_ir.persist.persist_ir")
+        log.info(
+            "pg_step_writer: SOP_IR_PERSIST on — deferring step/decision "
+            "rows to sop_ir.persist.persist_ir"
+        )
         return {}
 
-    VALID_DECISIONS = {"DENY","ALLOW","BYPASS","PEND","REFER","SYSTEM","STOP","WAIVE","CONDITIONAL"}
+    VALID_DECISIONS = {
+        "DENY",
+        "ALLOW",
+        "BYPASS",
+        "PEND",
+        "REFER",
+        "SYSTEM",
+        "STOP",
+        "WAIVE",
+        "CONDITIONAL",
+    }
 
     step_sql = """
         INSERT INTO sop_ingestion_auditstep
@@ -420,24 +496,29 @@ def pg_step_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
         ON CONFLICT DO NOTHING;
     """
 
-    for step in (state.get("steps") or []):
+    for step in state.get("steps") or []:
         step_num = _i(step.get("step_number") or step.get("number"))
         if step_num is None:
             continue
 
-        rows = _exec(cfg, step_sql, (
-            sop_id, step_num,
-            _s(step.get("question", step.get("title", ""))),
-            _s(step.get("intro_text", step.get("note", ""))),
-            bool(step.get("is_terminal", False)),
-            _s(step.get("terminal_action", step.get("action", "")), 64),
-            bool(step.get("is_sub_procedure", False)),
-            _s(step.get("sub_procedure_name", ""), 256),
-            "",
-            _s(step.get("narrative_context", "")),
-            bool(step.get("is_out_of_scope", False)),
-            _s(step.get("yaml_rule_id", ""), 64),
-        ))
+        rows = _exec(
+            cfg,
+            step_sql,
+            (
+                sop_id,
+                step_num,
+                _s(step.get("question", step.get("title", ""))),
+                _s(step.get("intro_text", step.get("note", ""))),
+                bool(step.get("is_terminal", False)),
+                _s(step.get("terminal_action", step.get("action", "")), 64),
+                bool(step.get("is_sub_procedure", False)),
+                _s(step.get("sub_procedure_name", ""), 256),
+                "",
+                _s(step.get("narrative_context", "")),
+                bool(step.get("is_out_of_scope", False)),
+                _s(step.get("yaml_rule_id", ""), 64),
+            ),
+        )
         if not rows:
             continue
         step_db_id = rows[0][0]
@@ -445,42 +526,57 @@ def pg_step_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
         # Parser uses "decision_rows" key; fallback to "rows" for compatibility
         decision_rows = step.get("decision_rows") or step.get("rows") or []
         for ridx, row in enumerate(decision_rows):
-            eob     = row.get("eob_codes") or []
-            ex      = row.get("ex_codes") or []
-            denial  = row.get("denial_codes") or []
+            eob = row.get("eob_codes") or []
+            ex = row.get("ex_codes") or []
+            denial = row.get("denial_codes") or []
             sys_act = row.get("system_actions") or []
 
             # Fallback: classify codes from flat "codes" list
             if not (eob or ex or denial or sys_act):
-                for c in (row.get("codes") or []):
+                for c in row.get("codes") or []:
                     ct = _classify_code(c)
-                    if ct == "EOB":          eob.append(c)
-                    elif ct == "EX":         ex.append(c)
-                    elif ct == "DENIAL":     denial.append(c)
-                    elif ct == "SYSTEM_ACT": sys_act.append(c)
+                    if ct == "EOB":
+                        eob.append(c)
+                    elif ct == "EX":
+                        ex.append(c)
+                    elif ct == "DENIAL":
+                        denial.append(c)
+                    elif ct == "SYSTEM_ACT":
+                        sys_act.append(c)
 
-            all_c  = _merge_codes(eob, ex, denial, sys_act)
-            dtype  = _s(row.get("decision") or row.get("decision_type") or "", 16).upper()
+            all_c = _merge_codes(eob, ex, denial, sys_act)
+            dtype = _s(
+                row.get("decision") or row.get("decision_type") or "", 16
+            ).upper()
             if dtype not in VALID_DECISIONS:
                 action = _s(row.get("action") or row.get("then") or "")
-                dtype  = _classify_decision(action, denial, eob)
+                dtype = _classify_decision(action, denial, eob)
 
-            _exec(cfg, dec_sql, (
-                step_db_id, ridx,
-                _s(row.get("condition_if", row.get("if", ""))),
-                _s(row.get("condition_and", row.get("and", ""))),
-                _s(row.get("action", row.get("then", ""))),
-                _s(row.get("action_summary", "")),
-                _s(row.get("action_line", "")),
-                _s(row.get("action_claim", "")),
-                dtype,
-                _i(row.get("skip_to_step") or row.get("goto_step")),
-                bool(row.get("is_terminal") or row.get("is_final", False)),
-                _j(eob), _j(ex), _j(denial), _j(sys_act), _j(all_c),
-                "",
-                bool(row.get("is_out_of_scope", False)),
-                _s(row.get("applicable_when", "")),
-            ))
+            _exec(
+                cfg,
+                dec_sql,
+                (
+                    step_db_id,
+                    ridx,
+                    _s(row.get("condition_if", row.get("if", ""))),
+                    _s(row.get("condition_and", row.get("and", ""))),
+                    _s(row.get("action", row.get("then", ""))),
+                    _s(row.get("action_summary", "")),
+                    _s(row.get("action_line", "")),
+                    _s(row.get("action_claim", "")),
+                    dtype,
+                    _i(row.get("skip_to_step") or row.get("goto_step")),
+                    bool(row.get("is_terminal") or row.get("is_final", False)),
+                    _j(eob),
+                    _j(ex),
+                    _j(denial),
+                    _j(sys_act),
+                    _j(all_c),
+                    "",
+                    bool(row.get("is_out_of_scope", False)),
+                    _s(row.get("applicable_when", "")),
+                ),
+            )
     return {}
 
 
@@ -503,25 +599,31 @@ def pg_group_limit_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict
                 %s::jsonb, %s::jsonb, %s)
         ON CONFLICT DO NOTHING;
     """
-    for gr in (state.get("group_rules") or []):
-        calc = _s(gr.get("calculation_from") or gr.get("calculation_basis") or "DOS", 32).upper()
+    for gr in state.get("group_rules") or []:
+        calc = _s(
+            gr.get("calculation_from") or gr.get("calculation_basis") or "DOS", 32
+        ).upper()
         if calc not in {"DOS", "PAID_DATE", "EOB_DATE"}:
             calc = "DOS"
-        _exec(cfg, sql, (
-            sop_id,
-            _s(gr.get("group_name") or gr.get("name") or "UNKNOWN", 256),
-            _i(gr.get("inn_days")),
-            _i(gr.get("oon_days")),
-            _i(gr.get("limit_days")),
-            _i(gr.get("limit_months")),
-            _i(gr.get("limit_years")),
-            calc,
-            _s(gr.get("network_type", "BOTH"), 8),
-            bool(gr.get("member_submitted_only", False)),
-            _j(gr.get("exceptions") or []),
-            _j(gr.get("special_notes") or []),
-            _s(gr.get("raw_text", "")),
-        ))
+        _exec(
+            cfg,
+            sql,
+            (
+                sop_id,
+                _s(gr.get("group_name") or gr.get("name") or "UNKNOWN", 256),
+                _i(gr.get("inn_days")),
+                _i(gr.get("oon_days")),
+                _i(gr.get("limit_days")),
+                _i(gr.get("limit_months")),
+                _i(gr.get("limit_years")),
+                calc,
+                _s(gr.get("network_type", "BOTH"), 8),
+                bool(gr.get("member_submitted_only", False)),
+                _j(gr.get("exceptions") or []),
+                _j(gr.get("special_notes") or []),
+                _s(gr.get("raw_text", "")),
+            ),
+        )
     return {}
 
 
@@ -535,8 +637,19 @@ def pg_code_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     if not sop_id:
         return {}
 
-    VALID_TYPES = {"EOB","EX","DENIAL","SYSTEM_ACT","POS","REVENUE",
-                   "BILL_TYPE","MODIFIER","FREQUENCY","CPT","UNKNOWN"}
+    VALID_TYPES = {
+        "EOB",
+        "EX",
+        "DENIAL",
+        "SYSTEM_ACT",
+        "POS",
+        "REVENUE",
+        "BILL_TYPE",
+        "MODIFIER",
+        "FREQUENCY",
+        "CPT",
+        "UNKNOWN",
+    }
     sql = """
         INSERT INTO sop_ingestion_auditcode
             (sop_id, code_value, code_type, description,
@@ -544,21 +657,27 @@ def pg_code_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT ON CONSTRAINT unique_auditcode DO NOTHING;
     """
-    for c in (state.get("detected_codes") or []):
+    for c in state.get("detected_codes") or []:
         val = _s(c.get("raw_value") or c.get("code") or c.get("value") or "", 64)
         if not val:
             continue
         ctype = _s(c.get("code_system") or c.get("code_type") or "", 16).upper()
         if ctype not in VALID_TYPES:
             ctype = _classify_code(val)
-        _exec(cfg, sql, (
-            sop_id, val, ctype,
-            _s(c.get("description", "")),
-            _s(c.get("context_snippet") or c.get("context") or ""),
-            _i(c.get("source_step")),
-            _s(c.get("source_field", ""), 256),
-            float(c.get("confidence", 1.0)),
-        ))
+        _exec(
+            cfg,
+            sql,
+            (
+                sop_id,
+                val,
+                ctype,
+                _s(c.get("description", "")),
+                _s(c.get("context_snippet") or c.get("context") or ""),
+                _i(c.get("source_step")),
+                _s(c.get("source_field", ""), 256),
+                float(c.get("confidence", 1.0)),
+            ),
+        )
     return {}
 
 
@@ -574,15 +693,19 @@ def pg_date_condition_writer(state: "PipelineState", cfg: "PipelineConfig") -> d
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING;
     """
-    for dc in (state.get("detected_date_conditions") or []):
-        _exec(cfg, sql, (
-            sop_id,
-            _s(dc.get("date_from", ""), 32),
-            _s(dc.get("date_to", ""), 32),
-            _s(dc.get("effective_date", ""), 32),
-            _s(dc.get("context") or dc.get("context_text") or ""),
-            _s(dc.get("source_field") or dc.get("applies_to") or "", 256),
-        ))
+    for dc in state.get("detected_date_conditions") or []:
+        _exec(
+            cfg,
+            sql,
+            (
+                sop_id,
+                _s(dc.get("date_from", ""), 32),
+                _s(dc.get("date_to", ""), 32),
+                _s(dc.get("effective_date", ""), 32),
+                _s(dc.get("context") or dc.get("context_text") or ""),
+                _s(dc.get("source_field") or dc.get("applies_to") or "", 256),
+            ),
+        )
     return {}
 
 
@@ -595,24 +718,37 @@ def pg_annotation_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     if not sop_id:
         return {}
 
-    VALID = {"NOTE","ALERT","EXCEPTION","TIP","WARNING","HIGHLIGHT"}
+    VALID = {"NOTE", "ALERT", "EXCEPTION", "TIP", "WARNING", "HIGHLIGHT"}
     sql = """
         INSERT INTO sop_ingestion_auditannotation
             (sop_id, step_id, annotation_type, content_text, is_claim_impact)
         VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING;
     """
-    IMPACT_KEYWORDS = {"DENY","BYPASS","CODE","PEND","OVERRIDE","E51","F51","346"}
+    IMPACT_KEYWORDS = {
+        "DENY",
+        "BYPASS",
+        "CODE",
+        "PEND",
+        "OVERRIDE",
+        "E51",
+        "F51",
+        "346",
+    }
 
-    for ann in (state.get("annotations") or []):
+    for ann in state.get("annotations") or []:
         atype = _s(ann.get("type") or ann.get("annotation_type") or "NOTE", 16).upper()
         if atype not in VALID:
             atype = "NOTE"
-        content = _s(ann.get("text") or ann.get("content") or ann.get("content_text") or "")
+        content = _s(
+            ann.get("text") or ann.get("content") or ann.get("content_text") or ""
+        )
         if not content:
             continue
-        impact = bool(ann.get("is_claim_impact") or
-                      any(k in content.upper() for k in IMPACT_KEYWORDS))
+        impact = bool(
+            ann.get("is_claim_impact")
+            or any(k in content.upper() for k in IMPACT_KEYWORDS)
+        )
         _exec(cfg, sql, (sop_id, None, atype, content, impact))
     return {}
 
@@ -629,10 +765,10 @@ def pg_reference_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING;
     """
-    for lnk in (state.get("links") or []):
-        href     = _s(lnk.get("href") or lnk.get("url") or "")
-        text     = _s(lnk.get("link_text") or lnk.get("text") or "")
-        ltype    = _s(lnk.get("link_type") or "UNRESOLVED", 32)
+    for lnk in state.get("links") or []:
+        href = _s(lnk.get("href") or lnk.get("url") or "")
+        text = _s(lnk.get("link_text") or lnk.get("text") or "")
+        ltype = _s(lnk.get("link_type") or "UNRESOLVED", 32)
         resolved = bool(lnk.get("resolved_url") or lnk.get("status") == "OK")
         _exec(cfg, sql, (sop_id, None, text, href, ltype, resolved))
     return {}
@@ -653,6 +789,7 @@ def pg_job_updater(state: "PipelineState", cfg: "PipelineConfig") -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # pg_graph_writer  — materialise the SOP knowledge graph as nodes & edges
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def pg_graph_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     """Persist the canonical SOP knowledge graph into AuditGraphNode/AuditGraphEdge.
@@ -675,25 +812,37 @@ def pg_graph_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     source = "agentic_llm"
     if not nodes:
         from uhc_sop_ingestion.graph_builder import build_audit_graph
+
         nodes, edges = build_audit_graph(state)
         source = "deterministic_fallback"
-        log.info("pg_graph_writer: no agentic graph in state — used deterministic builder")
+        log.info(
+            "pg_graph_writer: no agentic graph in state — used deterministic builder"
+        )
 
     if not nodes:
         log.info("pg_graph_writer: no nodes from any source — skipping")
         return {}
 
     from collections import Counter as _Counter
+
     type_counts = _Counter(n.get("type", "?") for n in nodes)
     log.info("pg_graph_writer[%s]: producing %s", source, dict(type_counts))
 
     # Clear any previous graph rows for this SOP so re-ingest is clean.
-    _exec(cfg, """
+    _exec(
+        cfg,
+        """
         DELETE FROM sop_ingestion_auditgraphedge WHERE sop_id = %s;
-    """, (sop_id,))
-    _exec(cfg, """
+    """,
+        (sop_id,),
+    )
+    _exec(
+        cfg,
+        """
         DELETE FROM sop_ingestion_auditgraphnode WHERE sop_id = %s;
-    """, (sop_id,))
+    """,
+        (sop_id,),
+    )
 
     # Insert nodes; build a node_key → primary_key map for edges.
     key_to_id: dict[str, int] = {}
@@ -705,16 +854,20 @@ def pg_graph_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
         RETURNING id;
     """
     for n in nodes:
-        rows = _exec(cfg, node_sql, (
-            sop_id,
-            _s(n["key"], 128),
-            _s(n["type"], 24),
-            _s(n["label"], 255),
-            _j(n.get("details", {})),
-            _s(n.get("ref_table", ""), 64),
-            _i(n.get("ref_id")),
-            int(n.get("order", 0) or 0),
-        ))
+        rows = _exec(
+            cfg,
+            node_sql,
+            (
+                sop_id,
+                _s(n["key"], 128),
+                _s(n["type"], 24),
+                _s(n["label"], 255),
+                _j(n.get("details", {})),
+                _s(n.get("ref_table", ""), 64),
+                _i(n.get("ref_id")),
+                int(n.get("order", 0) or 0),
+            ),
+        )
         if rows:
             key_to_id[n["key"]] = rows[0][0]
 
@@ -731,14 +884,27 @@ def pg_graph_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
         if not (src and tgt):
             skipped += 1
             continue
-        _exec(cfg, edge_sql, (
-            sop_id, src, tgt,
-            _s(e["rel"], 24), _s(e.get("label", ""), 255),
-            _j(e.get("details", {})),
-        ))
+        _exec(
+            cfg,
+            edge_sql,
+            (
+                sop_id,
+                src,
+                tgt,
+                _s(e["rel"], 24),
+                _s(e.get("label", ""), 255),
+                _j(e.get("details", {})),
+            ),
+        )
 
-    log.info("pg_graph_writer[%s]: wrote %d nodes, %d edges (skipped %d) for sop %s",
-             source, len(nodes), len(edges) - skipped, skipped, sop_id)
+    log.info(
+        "pg_graph_writer[%s]: wrote %d nodes, %d edges (skipped %d) for sop %s",
+        source,
+        len(nodes),
+        len(edges) - skipped,
+        skipped,
+        sop_id,
+    )
     # NOTE: do NOT overwrite state["audit_graph_nodes/edges"] (those are the
     # actual node/edge lists from the synthesis stage). Return persistence
     # stats under distinct keys for any downstream consumers.
