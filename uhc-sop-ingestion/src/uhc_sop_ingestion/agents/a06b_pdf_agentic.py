@@ -502,35 +502,108 @@ def pdf_terminal_marker(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     return {"steps": out}
 
 
+# ── Row-level completeness reconciliation ────────────────────────────────────
+# pdf_quality_gate guarantees no STEP is dropped; this guarantees no detected
+# table ROW within a step is dropped. The LLM step extractor can silently emit
+# fewer decision_rows than the deterministic detector found (run-to-run
+# variance), so we cross-check each step's rows against the deterministic
+# 1:1-with-table rows and BACKFILL any the LLM did not represent. A row is
+# "represented" when an existing LLM row shares enough significant tokens with
+# it — so we re-add genuinely dropped rows without spamming near-duplicates.
+
+_WORD = re.compile(r"[a-z0-9]+")
+_ROW_COVERAGE_THRESHOLD = 0.55
+
+
+def _sig_tokens(text: str) -> set[str]:
+    return {t for t in _WORD.findall((text or "").lower()) if len(t) > 3}
+
+
+def _row_text(row: dict) -> str:
+    return (f"{row.get('condition_if','')} {row.get('condition_and','')} "
+            f"{row.get('action','')}")
+
+
+def _row_is_covered(det_row: dict, existing_rows: list[dict]) -> bool:
+    want = _sig_tokens(_row_text(det_row))
+    if not want:
+        return True  # no meaningful content to lose
+    for r in existing_rows:
+        have = _sig_tokens(_row_text(r))
+        if have and len(want & have) / len(want) >= _ROW_COVERAGE_THRESHOLD:
+            return True
+    return False
+
+
+def _reconcile_step_rows(step: dict, entry: dict) -> int:
+    """Append any detected table row the LLM dropped. Returns #rows added.
+
+    Mutates ``step['decision_rows']`` in place — newly appended rows also count
+    toward coverage for subsequent detected rows, so duplicates are not added."""
+    det_rows = _fallback_step(entry).get("decision_rows") or []
+    rows = step.setdefault("decision_rows", [])
+    added = 0
+    for d in det_rows:
+        if not _row_is_covered(d, rows):
+            rows.append(d)
+            added += 1
+    return added
+
+
 # ── 8. PDFQualityGateAgent — deterministic completeness guarantee ─────────────
 
 def pdf_quality_gate(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     inv = state.get("pdf_inventory") or []
     if not inv or (state.get("doc_format") or "").upper() != "PDF":
         return {}
-    steps = list(state.get("steps") or [])
+    # Copy steps + their row lists so reconciliation never mutates shared state.
+    steps = [dict(s) for s in (state.get("steps") or [])]
+    for s in steps:
+        s["decision_rows"] = list(s.get("decision_rows") or [])
     have = {s.get("number") for s in steps}
     missing = [e for e in inv if e["number"] not in have]
     # validation_warnings is an additive accumulator → return ONLY new entries.
     new_warnings: list[str] = []
+    changed = False
     if missing:
         # Materialise any step the extractor dropped so the canvas is complete.
         for e in missing:
             steps.append(_fallback_step(e))
         steps.sort(key=lambda s: s.get("number", 0))
+        changed = True
         new_warnings.append(
             f"pdf_quality_gate: recovered {len(missing)} missing step(s): "
             f"{[e['number'] for e in missing]}")
+
+    # Row-level completeness: backfill any detected table row the LLM dropped.
+    inv_by_num = {e["number"]: e for e in inv}
+    total_added = 0
+    shortfall_steps: list[int] = []
+    for s in steps:
+        entry = inv_by_num.get(s.get("number"))
+        if not entry:
+            continue
+        added = _reconcile_step_rows(s, entry)
+        if added:
+            total_added += added
+            shortfall_steps.append(s.get("number"))
+    if total_added:
+        changed = True
+        new_warnings.append(
+            f"pdf_quality_gate: backfilled {total_added} dropped decision row(s) "
+            f"on step(s) {shortfall_steps}")
+
     empties = [s["number"] for s in steps
                if not s.get("decision_rows") and not s.get("is_terminal")]
     if empties:
         new_warnings.append(
             f"pdf_quality_gate: steps with no rules (non-terminal): {empties}")
-    logger.info("pdf_quality_gate: %d steps, %d recovered, %d empty-non-terminal",
-                len(steps), len(missing), len(empties))
+    logger.info("pdf_quality_gate: %d steps, %d step(s) recovered, "
+                "%d row(s) backfilled, %d empty-non-terminal",
+                len(steps), len(missing), total_added, len(empties))
     result: dict[str, Any] = {}
     if new_warnings:
         result["validation_warnings"] = new_warnings
-    if missing:
+    if changed:
         result["steps"] = steps
     return result

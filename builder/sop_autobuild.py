@@ -75,7 +75,11 @@ def _split_decisions(decisions: list) -> list[tuple[str, list]]:
     """Decompose a step's decision rows into (group_label, rows) buckets.
 
     * multiple section groups → one bucket per section (order preserved);
-    * one/no group but more than ``_MAX_RULES_PER_NODE`` rows → numbered parts;
+    * a NESTED decision table (any row at depth > 0) → a single bucket in
+      document order so every parent stays glued to its sub-rules (Step 7's
+      "If/And/Then" table is one node with its hierarchy intact, mirroring the
+      YAML template where the step is one rule with nested ``sub_rules``);
+    * a FLAT list longer than ``_MAX_RULES_PER_NODE`` → numbered parts;
     * otherwise a single bucket.
     """
     groups: dict[str, list] = {}
@@ -91,6 +95,12 @@ def _split_decisions(decisions: list) -> list[tuple[str, list]]:
         return [(g, groups[g]) for g in order]
 
     rows = decisions
+    # A nested table must never be sliced: chunking by N tears parents away
+    # from their children. Keep the whole tree as one node, ordered by the
+    # step-global ``row_index`` (parent immediately followed by its children).
+    if any(getattr(d, "depth", 0) for d in rows):
+        return [("", sorted(rows, key=lambda d: (d.row_index, d.id)))]
+
     if len(rows) > _MAX_RULES_PER_NODE:
         chunks = [rows[i:i + _MAX_RULES_PER_NODE]
                   for i in range(0, len(rows), _MAX_RULES_PER_NODE)]
@@ -210,7 +220,11 @@ def build_workflow_from_sop(workflow, sop: AuditSop, *, area: WorkArea,
     source_ref = sop.url or ""
     bench = Workbench.objects.create(
         work_area=area,
-        name=f"{col + 1}. {title}" + (f"  ·  {source_ref}" if source_ref else ""),
+        # Cap at the column's varchar(255). Frontend uploads cite a long
+        # ``file://…/sop_uploads/<uuid>_<filename>`` source_ref that can push
+        # the composed name past 255 and abort the whole canvas build.
+        name=(f"{col + 1}. {title}"
+              + (f"  ·  {source_ref}" if source_ref else ""))[:255],
         order=col,
         node_key=slugify(title)[:128],
         kind="SOP",

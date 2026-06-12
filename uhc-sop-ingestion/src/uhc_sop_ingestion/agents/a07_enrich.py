@@ -64,6 +64,10 @@ def _make_openai_llm(cfg, max_tokens: int = 4096):
         model=cfg.openai_model,
         api_key=cfg.openai_api_key,
         max_tokens=max_tokens,
+        # Deterministic extraction: same SOP → same rules every run. Removes the
+        # run-to-run row-count variance that lets a rule appear in one run and
+        # vanish in another.
+        temperature=0,
         model_kwargs={"response_format": {"type": "json_object"}},
     )
 
@@ -74,6 +78,7 @@ def _make_anthropic_llm(cfg, max_tokens: int = 4096):
         model=cfg.anthropic_model,
         api_key=cfg.anthropic_api_key,
         max_tokens=max_tokens,
+        temperature=0,   # deterministic extraction (see _make_openai_llm)
     )
 
 
@@ -91,6 +96,90 @@ def _strip_markdown(text: str) -> str:
 def _parse_json(text: str) -> Any:
     """Parse JSON, stripping markdown fences first."""
     return json.loads(_strip_markdown(text))
+
+
+def _salvage_json_array(text: str) -> list | None:
+    """Best-effort recovery of complete objects from a TRUNCATED JSON array.
+
+    LLM responses that hit the output-token cap get cut off mid-string, so
+    ``json.loads`` raises and we would otherwise lose the entire batch. This
+    walks the leading ``[`` and decodes as many complete top-level objects as
+    possible, discarding only the final partial one. Returns the recovered list
+    (possibly empty) or ``None`` when the payload is not array-shaped.
+    """
+    s = _strip_markdown(text)
+    start = s.find("[")
+    if start == -1:
+        return None
+    decoder = json.JSONDecoder()
+    objs: list = []
+    i, n = start + 1, len(s)
+    while i < n:
+        while i < n and s[i] in " \t\r\n,":
+            i += 1
+        if i >= n or s[i] == "]":
+            break
+        try:
+            obj, end = decoder.raw_decode(s, i)
+        except json.JSONDecodeError:
+            break  # truncated / malformed from here on — keep what we have
+        objs.append(obj)
+        i = end
+    return objs
+
+
+def _salvage_json_object(text: str) -> dict | None:
+    """Best-effort recovery of a dict whose array/scalar values were TRUNCATED.
+
+    Walks the top-level object members (depth 1 only) and decodes each
+    ``"key": value`` pair, salvaging array values element-by-element. Stops at
+    the first member that is itself cut off — keeping everything decoded so far.
+    Covers the ``{"nodes": [...], "edges": [...]}`` graph-synthesis payloads
+    (a16) that hit the token cap mid-array.
+    """
+    s = _strip_markdown(text)
+    start = s.find("{")
+    if start == -1:
+        return None
+    decoder = json.JSONDecoder()
+    out: dict = {}
+    i, n = start + 1, len(s)
+    while i < n:
+        while i < n and s[i] in " \t\r\n,":
+            i += 1
+        if i >= n or s[i] == "}":
+            break
+        if s[i] != '"':
+            break  # not a key — malformed from here
+        try:
+            key, end = decoder.raw_decode(s, i)
+        except json.JSONDecodeError:
+            break
+        i = end
+        while i < n and s[i] in " \t\r\n":
+            i += 1
+        if i >= n or s[i] != ":":
+            break
+        i += 1
+        while i < n and s[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            break
+        if s[i] == "[":
+            out[key] = _salvage_json_array(s[i:]) or []
+            try:                      # advance past a complete array if possible
+                _, end = decoder.raw_decode(s, i)
+                i = end
+            except json.JSONDecodeError:
+                break                 # array was the truncated tail — done
+        else:
+            try:
+                val, end = decoder.raw_decode(s, i)
+            except json.JSONDecodeError:
+                break                 # scalar/object value truncated — done
+            out[key] = val
+            i = end
+    return out or None
 
 
 def _token_usage(resp) -> tuple[int, int]:
@@ -167,7 +256,37 @@ def _llm_call(
                     prompt_tokens=inp, completion_tokens=out,
                     duration_ms=ms, success=True,
                 )
-            data = _parse_json(resp.content)
+            try:
+                data = _parse_json(resp.content)
+            except json.JSONDecodeError as je:
+                # Output likely truncated at the token cap. Salvage the complete
+                # portion (list elements, or a dict's decoded members) rather
+                # than discarding the whole batch (caller still retries too).
+                if expected_type is list:
+                    salvaged = _salvage_json_array(resp.content)
+                elif expected_type is dict:
+                    salvaged = _salvage_json_object(resp.content)
+                    # Truncation often cuts off a LATER collection key (e.g.
+                    # "edges" after "nodes" in graph-synthesis payloads). When
+                    # the recovered dict already holds list-shaped required
+                    # keys, keep that partial payload and backfill the missing
+                    # collection keys with [] — otherwise the valuable recovered
+                    # nodes would be discarded over a missing trailing array.
+                    if (salvaged and required_keys
+                            and any(k in salvaged for k in required_keys)
+                            and all(isinstance(salvaged[k], list)
+                                    for k in required_keys if k in salvaged)):
+                        for k in required_keys:
+                            salvaged.setdefault(k, [])
+                else:
+                    salvaged = None
+                if not salvaged:
+                    raise
+                logger.warning(
+                    "llm_call [%s/%s]: salvaged %d objects from truncated JSON (%s)",
+                    agent_name, attempt_label, len(salvaged), je,
+                )
+                data = salvaged
             # OpenAI json_object mode always returns a dict — unwrap if we
             # expected a list (e.g. {"rules": [...]}) → [...]
             data = _unwrap_if_needed(data, expected_type)
@@ -622,22 +741,40 @@ def pre_section_rule_extractor(state: "PipelineState", cfg: "PipelineConfig") ->
     if not pre:
         return {}
 
-    # Build full-text view of each pre-section — no character truncation on
-    # the content itself so we capture every rule in blocks like
-    # "Duplicate Exceptions" which can be > 2 000 chars.
+    # Per-section input budget. Large preamble blocks (cross-billing intros,
+    # provider-exclusion lists, "Duplicate Exceptions") must not be input-
+    # truncated, so this is generous.
+    PER_SECTION_CHARS = 12000
     section_texts = []
     for s in pre[:15]:
         raw_text = " ".join(
             (i.get("text", str(i)) if isinstance(i, dict) else str(i))
             for i in s.get("items", [])
         )
-        # Limit per-section to 3000 chars to fit in one LLM context
         section_texts.append({
             "name": s.get("name", ""),
-            "text": raw_text[:3000],
+            "text": raw_text[:PER_SECTION_CHARS],
         })
 
-    prompt = f"""You are reading a healthcare claims SOP as a senior claims auditor.
+    # Batch sections so each LLM call's OUTPUT stays well under the token cap.
+    # A single all-sections call truncated mid-array on big SOPs (the JSON was
+    # cut off at ~13 KB → unrecoverable on every retry). Splitting by an input
+    # char budget bounds the response size; a long section becomes its own batch.
+    BATCH_CHAR_BUDGET = 5000
+    batches: list[list[dict]] = []
+    cur: list[dict] = []
+    cur_len = 0
+    for sec in section_texts:
+        slen = len(sec["text"]) + len(sec["name"])
+        if cur and cur_len + slen > BATCH_CHAR_BUDGET:
+            batches.append(cur)
+            cur, cur_len = [], 0
+        cur.append(sec)
+        cur_len += slen
+    if cur:
+        batches.append(cur)
+
+    _PROMPT_HEAD = """You are reading a healthcare claims SOP as a senior claims auditor.
 
 The sections below appear BEFORE the numbered decision-tree steps. They contain:
 • Eligibility/applicability rules (who this SOP covers)
@@ -651,23 +788,30 @@ For EACH distinct, actionable rule you find:
 3. Flag is_exception=true if the rule says "exclude", "do not apply", "bypass", or overrides normal steps.
 
 Return a JSON array — one object per rule:
-[{{
+[{
   "section": "<exact section name from input>",
   "condition": "<complete IF condition — be specific, include codes/values>",
   "action": "<complete THEN action — what the auditor must do>",
   "decision_type": "DENY|ALLOW|BYPASS|OVERRIDE|ELIGIBILITY|REFER|NOTE",
   "is_exception": true/false
-}}]
+}]
 
 Only return the JSON array. No prose. Extract every individual rule — do not combine them.
 
 Sections:
-{json.dumps(section_texts, indent=2)}"""
+"""
 
-    result = _llm_call(cfg, prompt, [], "pre_section_rule_extractor",
-                       provider="openai", expected_type=list,
-                       required_keys=["section", "condition", "action"])
-    if not isinstance(result, list):
+    result: list = []
+    for batch in batches:
+        prompt = _PROMPT_HEAD + json.dumps(batch, indent=2)
+        part = _llm_call(cfg, prompt, [], "pre_section_rule_extractor",
+                         provider="openai", expected_type=list,
+                         required_keys=["section", "condition", "action"],
+                         max_tokens=8192)
+        if isinstance(part, list):
+            result.extend(part)
+
+    if not result:
         return {}
 
     pre2 = [dict(s) for s in pre]

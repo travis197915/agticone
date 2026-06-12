@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +29,14 @@ if TYPE_CHECKING:
     from uhc_sop_ingestion.config import PipelineConfig
 
 log = logging.getLogger(__name__)
+
+
+def _ir_persist_enabled() -> bool:
+    """When SOP_IR_PERSIST is on, the canonical-IR gate (sop_ir.persist.persist_ir,
+    invoked post-run from pipeline_runner) is the AUTHORITATIVE writer for
+    AuditStep/AuditDecision. The flat writer below then skips its step/decision
+    pass so the two never fight over the same rows."""
+    return os.environ.get("SOP_IR_PERSIST", "").strip().lower() in {"1", "true", "yes"}
 
 # ── psycopg2 connection helper ────────────────────────────────────────────────
 
@@ -360,6 +369,14 @@ def pg_step_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     """
     sop_id = state.get("sop_db_id")
     if not sop_id:
+        return {}
+
+    # When the canonical-IR persist gate owns step/decision writing, skip the
+    # flat pass entirely — persist_ir (post-run, Django ORM) writes the same
+    # rows with full routing fidelity (nesting, aggregation, goto, OOS).
+    if _ir_persist_enabled():
+        log.info("pg_step_writer: SOP_IR_PERSIST on — deferring step/decision "
+                 "rows to sop_ir.persist.persist_ir")
         return {}
 
     VALID_DECISIONS = {"DENY","ALLOW","BYPASS","PEND","REFER","SYSTEM","STOP","WAIVE","CONDITIONAL"}

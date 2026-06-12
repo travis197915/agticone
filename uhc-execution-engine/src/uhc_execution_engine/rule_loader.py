@@ -90,6 +90,13 @@ def _hydrate_decision(sop, step, dec, override_condition: str,
         "aggregation":       dec.aggregation or "LEAF",
         "applicable_when":   (getattr(dec, "applicable_when", "") or "").strip(),
         "goto_step":         dec.goto_step,
+        # ── Hierarchy metadata so the canvas/inspector can render nested
+        # sub-rules (a parent row at depth 0 + its depth>0 children) instead of
+        # a flat list. ``row_index`` is the step-global document order.
+        "depth":             dec.depth,
+        "row_index":         dec.row_index,
+        "parent_subrule_id": (dec.parent.subrule_id if dec.parent_id else ""),
+        "parent_row_index":  (dec.parent.row_index if dec.parent_id else None),
     }
 
 

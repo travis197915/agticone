@@ -70,8 +70,8 @@ def execute_ingestion_job(job_id: str) -> dict:
                     "doc_format": doc.get("doc_format", ""),
                     "depth": doc.get("depth", 0),
                     "status": doc.get("status", "OK"),
-                    "neo4j_sop_id": doc.get("neo4j_sop_id", ""),
-                    "pg_sop_id": doc.get("pg_sop_id", ""),
+                    "neo4j_sop_id": str(doc.get("neo4j_sop_id", "") or "")[:512],
+                    "pg_sop_id": str(doc.get("pg_sop_id", "") or "")[:512],
                     "steps_count": doc.get("steps_count", 0),
                     "rules_count": doc.get("rules_count", 0),
                     "codes_count": doc.get("codes_count", 0),
@@ -90,6 +90,10 @@ def execute_ingestion_job(job_id: str) -> dict:
     except Exception as exc:
         log.warning("refresh_llm_totals failed for job %s: %s", job_id, exc)
 
+    # Canonical-IR authoritative write (flag-gated). Runs BEFORE auto-build so
+    # the builder sees the routing-complete projection.
+    _maybe_persist_ir(job, final_state)
+
     _maybe_auto_build_workflow(job)
 
     log.info(
@@ -102,6 +106,77 @@ def execute_ingestion_job(job_id: str) -> dict:
         job.total_tokens_out,
     )
     return {"job_id": job_id, "status": job.status}
+
+
+def _ir_persist_enabled() -> bool:
+    return os.environ.get("SOP_IR_PERSIST", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _maybe_persist_ir(job, final_state: dict) -> None:
+    """Write the canonical IR (state["sop_ir"]) into the relational audit schema
+    via the shared ``persist_ir`` gate — the SAME gate the YAML importer uses.
+
+    Flag-gated by ``SOP_IR_PERSIST``. When on, the flat ``pg_step_writer`` has
+    already deferred its step/decision pass (see a11_write_postgres), so this is
+    the authoritative writer: it rebuilds steps >= 1 with full routing fidelity
+    (nesting, aggregation, goto_step, applicable_when, OOS) while preserving the
+    synthetic Step 0 (pre-step exceptions) the pipeline wrote.
+
+    Best-effort: a failure here is logged and never fails the ingestion job.
+    """
+    if not _ir_persist_enabled():
+        return
+
+    try:
+        from sop_ir.persist import persist_ir
+        from sop_ir.schema import SopIR
+
+        from .models import AuditSop
+    except Exception as exc:
+        log.exception("persist_ir imports failed for job %s: %s", job.job_id, exc)
+        return
+
+    # Per-document IR (multi-doc crawls). Fall back to the single last-doc IR
+    # for states produced before the accumulator existed.
+    entries = final_state.get("sop_ir_documents") or []
+    if not entries and final_state.get("sop_ir"):
+        entries = [{
+            "content_hash": final_state.get("content_hash", ""),
+            "ir": final_state.get("sop_ir"),
+            "source": final_state.get("sop_ir_source", "agentic_ingestion"),
+            "validation": final_state.get("sop_ir_validation"),
+            "sop_db_id": final_state.get("sop_db_id"),
+        }]
+    if not entries:
+        log.info("persist_ir skipped: no sop_ir in final state")
+        return
+
+    for entry in entries:
+        ir_data = entry.get("ir")
+        if not ir_data:
+            continue
+        try:
+            sop = None
+            chash = entry.get("content_hash")
+            if chash:
+                sop = AuditSop.objects.filter(job=job, content_hash=chash).first()
+            if sop is None and entry.get("sop_db_id"):
+                sop = AuditSop.objects.filter(pk=entry["sop_db_id"]).first()
+            if sop is None:
+                log.warning("persist_ir: no AuditSop for job=%s content_hash=%s",
+                            job.job_id, chash)
+                continue
+            ir = SopIR.model_validate(ir_data)
+            stats = persist_ir(
+                sop, ir, job=job,
+                source=entry.get("source", "agentic_ingestion"),
+                validation=entry.get("validation"),
+                preserve_step_numbers={0},
+            )
+            log.info("persist_ir: sop=%s wrote %s", sop.id, stats)
+        except Exception as exc:
+            log.exception("persist_ir failed for job %s / content_hash %s: %s",
+                          job.job_id, entry.get("content_hash"), exc)
 
 
 def _maybe_auto_build_workflow(job) -> None:

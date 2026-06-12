@@ -99,8 +99,8 @@ class IngestedDocument(models.Model):
     doc_format   = models.CharField(max_length=8)
     depth        = models.PositiveSmallIntegerField(default=0)
     status       = models.CharField(max_length=16, default="OK")
-    neo4j_sop_id = models.CharField(max_length=128, blank=True)
-    pg_sop_id    = models.CharField(max_length=128, blank=True)
+    neo4j_sop_id = models.CharField(max_length=512, blank=True)
+    pg_sop_id    = models.CharField(max_length=512, blank=True)
     steps_count  = models.PositiveIntegerField(default=0)
     rules_count  = models.PositiveIntegerField(default=0)
     codes_count  = models.PositiveIntegerField(default=0)
@@ -717,3 +717,53 @@ class SopExclusion(models.Model):
 
     def __str__(self) -> str:  # pragma: no cover - debug aid
         return f"{self.target_kind}:{self.target_key} (sop={self.sop_id})"
+
+
+class SopIRDocument(models.Model):
+    """Authoritative canonical-IR record for a SOP.
+
+    The canonical SOP IR (``sop_ir.schema.SopIR``) is the one shape both
+    ingestion doors produce. This row is the *control-plane* head: it records
+    which IR version is live for a SOP, the validation verdict, and a pointer
+    (``mongo_ref``) to the lossless nested IR JSON archived in MongoDB
+    (collection ``sop_ir_documents``). The relational ``AuditStep`` /
+    ``AuditDecision`` rows are the *projection* of this IR written by
+    ``sop_ir.persist.persist_ir`` — this row tells you the projection's
+    provenance and whether it passed routing validation.
+
+    Source values: ``yaml_import`` (hand-authored), ``deterministic_draft`` /
+    ``llm_routing_enriched`` (HTML/PDF pipeline).
+    """
+    STATUS_CHOICES = [
+        ("OK",        "Validated"),
+        ("FLAGGED",   "Validated with routing issues"),
+        ("UNCHECKED", "Persisted without validation"),
+    ]
+    sop          = models.ForeignKey(AuditSop, on_delete=models.CASCADE,
+                                     related_name="ir_documents")
+    job          = models.ForeignKey(IngestionJob, on_delete=models.SET_NULL,
+                                     null=True, blank=True,
+                                     related_name="ir_documents")
+    ir_version   = models.PositiveIntegerField(default=1)
+    content_hash = models.CharField(max_length=64, db_index=True, blank=True, default="")
+    # Pointer into MongoDB sop_ir_documents collection ("{sop_id}:{ir_version}").
+    mongo_ref    = models.CharField(max_length=128, blank=True, default="")
+    source       = models.CharField(max_length=32, blank=True, default="")
+    validation_status = models.CharField(max_length=16, choices=STATUS_CHOICES,
+                                         default="UNCHECKED")
+    validation_errors = models.JSONField(default=list, blank=True)
+    rule_count   = models.PositiveIntegerField(default=0)
+    step_count   = models.PositiveIntegerField(default=0)
+    decision_count = models.PositiveIntegerField(default=0)
+    created_at   = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering        = ["-created_at"]
+        verbose_name    = "SOP IR Document"
+        unique_together = [("sop", "ir_version")]
+        indexes = [
+            models.Index(fields=["sop", "-ir_version"]),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover - debug aid
+        return f"IR v{self.ir_version} sop={self.sop_id} [{self.validation_status}]"

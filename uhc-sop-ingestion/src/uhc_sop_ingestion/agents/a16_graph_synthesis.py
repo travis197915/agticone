@@ -480,6 +480,35 @@ def agent_pre_section_synthesizer(state: "PipelineState",
             "text":     text,
         })
 
+    # Batch sections so each call's nodes+edges output stays well under the
+    # token cap. A single 15-section call truncates mid-array on rule-dense
+    # SOPs (the "Schema mismatch: expected dict with keys ['nodes','edges']"
+    # warning); small batches keep every PRE_RULE.
+    _PS_BATCH = 4
+    all_nodes: list[dict] = []
+    all_edges: list[dict] = []
+    for bstart in range(0, len(sections), _PS_BATCH):
+        chunk = sections[bstart:bstart + _PS_BATCH]
+        result = _synthesize_pre_section_batch(cfg, chunk, bstart // _PS_BATCH + 1)
+        if isinstance(result, dict):
+            all_nodes.extend(result.get("nodes", []) or [])
+            all_edges.extend(result.get("edges", []) or [])
+
+    payload = {"nodes": all_nodes, "edges": all_edges}
+    if all_nodes:
+        ctx_write(cfg, job_id, "pre_sections", payload)
+        ctx_audit_trail(cfg, job_id, "agent_pre_section_synthesizer", "OK",
+                        f"{len(all_nodes)} nodes, {len(all_edges)} edges "
+                        f"across {(len(sections) + _PS_BATCH - 1) // _PS_BATCH} "
+                        f"batch(es)")
+    else:
+        ctx_audit_trail(cfg, job_id, "agent_pre_section_synthesizer", "FALLBACK")
+    return {}
+
+
+def _synthesize_pre_section_batch(cfg: "PipelineConfig", chunk: list[dict],
+                                  batch_no: int) -> dict:
+    """LLM call for one batch of pre-sections → {"nodes":[...], "edges":[...]}."""
     prompt = f"""You are a senior claims auditor building the SOP knowledge graph
 the way an auditor would read the document top-down.
 
@@ -520,25 +549,18 @@ YOUR TASK:
 
 Return STRICT JSON: {{"nodes":[...], "edges":[...]}}
 
-Sections:
-{json.dumps(sections, indent=2)}
+Sections (batch {batch_no}):
+{json.dumps(chunk, indent=2)}
 """
 
     result = _llm_call(cfg, prompt, fallback={"nodes": [], "edges": []},
-                       agent_name="agent_pre_section_synthesizer",
+                       agent_name=f"agent_pre_section_synthesizer_b{batch_no}",
                        provider="anthropic",
                        expected_type=dict,
                        required_keys=["nodes", "edges"],
                        stage="graph_synthesis_stage",
                        max_tokens=8192)
-    if isinstance(result, dict):
-        ctx_write(cfg, job_id, "pre_sections", result)
-        ctx_audit_trail(cfg, job_id, "agent_pre_section_synthesizer", "OK",
-                        f"{len(result.get('nodes', []))} nodes, "
-                        f"{len(result.get('edges', []))} edges")
-    else:
-        ctx_audit_trail(cfg, job_id, "agent_pre_section_synthesizer", "FALLBACK")
-    return {}
+    return result if isinstance(result, dict) else {"nodes": [], "edges": []}
 
 
 # ──────────────────────────────────────────────────────────────────────────────

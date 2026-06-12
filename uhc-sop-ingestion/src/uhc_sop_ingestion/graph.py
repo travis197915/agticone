@@ -128,6 +128,7 @@ from .agents.a16_graph_synthesis import (agent_document_profiler,
                                          agent_graph_assembler)
 from .agents.a17_narrative   import (sop_overview_narrator,
                                      step_narrative_writer)
+from .agents.a18_ir_synthesis import (ir_maker, ir_checker)
 
 
 def _bind(fn, cfg: PipelineConfig):
@@ -321,6 +322,17 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
         cfg=cfg, stage_name="graph_synthesis_stage",
     ))
 
+    # ── Canonical IR synthesis (maker + checker, Redis sop:ir blackboard) ────
+    # Synthesizes the same routing-complete IR a hand-authored YAML produces, so
+    # an ingested SOP routes identically in the engine and appears as a workflow
+    # in the builder UI. Emits state["sop_ir"] (pure data); the authoritative
+    # relational write happens in pipeline_runner via the shared persist_ir gate.
+    g.add_node("ir_synthesis_stage", _stage(
+        ir_maker,
+        ir_checker,
+        cfg=cfg, stage_name="ir_synthesis_stage",
+    ))
+
     # ── Write — Neo4j ─────────────────────────────────────────────────────────
     # html_dom_writer runs LAST in the stage so the HtmlBlock subgraph
     # is in place by the time neo4j_graph_writer tries to MERGE the
@@ -408,7 +420,8 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
     g.add_edge("context_stage",        "validate_stage")
     g.add_edge("validate_stage",       "narrative_stage")
     g.add_edge("narrative_stage",      "graph_synthesis_stage")
-    g.add_edge("graph_synthesis_stage", "write_neo4j")
+    g.add_edge("graph_synthesis_stage", "ir_synthesis_stage")
+    g.add_edge("ir_synthesis_stage",   "write_neo4j")
     g.add_edge("write_neo4j",    "write_postgres")
     g.add_edge("write_postgres", "write_mongo")
     g.add_edge("write_mongo",    "write_redis")

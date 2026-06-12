@@ -85,6 +85,19 @@ class PipelineState(TypedDict, total=False):
     audit_graph_persisted_edges: int
     audit_graph_source: str         # "agentic_llm" | "deterministic_fallback"
 
+    # ── Canonical IR synthesis outputs (a18_ir_synthesis) ────────────────────
+    # The routing-complete SopIR (pure JSON data — same shape as the YAML SOPs).
+    # Consumed by pipeline_runner -> sop_ir.persist.persist_ir (the shared write
+    # gate). sop_ir_source records whether routing came from the deterministic
+    # draft or the LLM enricher; sop_ir_validation holds the checker verdict.
+    sop_ir: dict
+    sop_ir_source: str
+    sop_ir_validation: dict
+    # One entry per processed document so multi-doc crawls persist every SOP's
+    # IR (not just the last). Each: {content_hash, url, ir, source, validation}.
+    # Keyed by content_hash so pipeline_runner can match it to its AuditSop row.
+    sop_ir_documents: Annotated[list[dict], operator.add]
+
     # ── Write outputs ─────────────────────────────────────────────────────────
     neo4j_sop_id: str
     sop_db_id: Optional[int]      # PK of AuditSop row — passed to all child writers
