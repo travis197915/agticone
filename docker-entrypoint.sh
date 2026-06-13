@@ -2,7 +2,7 @@
 set -eu
 
 APP_PORT="${APP_PORT:-8000}"
-CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-100}"
+CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-3}"
 CELERY_QUEUES="${CELERY_QUEUES:-job_queue,celery}"
 
 echo "[entrypoint] starting Django on 0.0.0.0:${APP_PORT}"
