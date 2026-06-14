@@ -114,6 +114,13 @@ class PipelineConfig:
     max_depth: int
     max_docs: int
 
+    # PDF perception (native-PDF vision door).
+    # NOTE: the binding limit is OUTPUT tokens, not the 32MB input cap — dense
+    # SOP pages produce verbose per-page JSON, so keep slices SMALL so a slice's
+    # perception never truncates. 4 pages/slice fits comfortably in 16k output.
+    pdf_slice_pages: int = 4     # pages per Claude document slice
+    pdf_slice_overlap: int = 1   # page overlap so boundary tables are seen whole
+
     # ── Computed connection strings ───────────────────────────────────────────
 
     @property
@@ -202,6 +209,9 @@ class PipelineConfig:
             # Pipeline
             max_depth=_env_int("MAX_DEPTH", 4),
             max_docs=_env_int("MAX_DOCS", 200),
+            # PDF perception
+            pdf_slice_pages=_env_int("PDF_SLICE_PAGES", 4),
+            pdf_slice_overlap=_env_int("PDF_SLICE_OVERLAP", 1),
         )
 
 

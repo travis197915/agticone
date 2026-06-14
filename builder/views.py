@@ -70,7 +70,7 @@ def _text_to_basic_html(text: str) -> str:
         is_bullet = lines and all(re.match(r"^[\u2022\u2023\-*]\s*", ln) for ln in lines)
         if is_bullet:
             items = [
-                f"<li>{_html.escape(re.sub(r'^[\u2022\u2023\\-*]\\s*', '', ln))}</li>"
+                f"<li>{_html.escape(re.sub(r'^[\u2022\u2023\-*]\s*', '', ln))}</li>"
                 for ln in lines
             ]
             out.append("<ul>" + "".join(items) + "</ul>")
@@ -193,7 +193,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         validated = serializer.validated_data
         sop_urls       = validated.pop("sop_urls", None)
         runtime_agents = validated.pop("runtime_agents", None)
-        auto_build     = validated.pop("auto_build_from_sop", False)
+        auto_build     = validated.pop("auto_build_from_sop", True)
 
         workflow = serializer.save(
             slug=_unique_workflow_slug(validated["name"]),
@@ -225,8 +225,54 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         workflow = self.get_object()
         if request.method == "PUT":
             WorkflowGraphWriter(workflow).save(request.data)
-            workflow.refresh_from_db()
-        return Response(WorkflowGraphSerializer(workflow).data)
+        # Reload with the nested graph prefetched (shape definitions + rule/tool
+        # bindings) so serialization is a handful of queries instead of an N+1
+        # per shape, and precompute the workflow-wide out-of-scope rule set once.
+        workflow = self._graph_prefetched(workflow.pk)
+        all_shapes = [
+            sh
+            for wa in workflow.work_areas.all()
+            for wb in wa.workbenches.all()
+            for sh in wb.shapes.all()
+        ]
+        context = self.get_serializer_context()
+        try:
+            from .bindings_sync import out_of_scope_keys_for_shapes
+            context["oos_keys"] = out_of_scope_keys_for_shapes(all_shapes)
+        except Exception:
+            context["oos_keys"] = None
+        return Response(WorkflowGraphSerializer(workflow, context=context).data)
+
+    @staticmethod
+    def _graph_prefetched(pk):
+        """Fetch a workflow with its full nested graph prefetched for read.
+
+        select_related on each shape's definition + Prefetch of the rule/tool
+        bindings (with their own select_related) collapses the per-shape
+        definition/binding queries into a fixed, small number.
+        """
+        from django.db.models import Prefetch
+
+        shapes_qs = Shape.objects.select_related("definition").order_by("order")
+        try:
+            from agent_tools.models import NodeRuleBinding, NodeToolBinding
+            shapes_qs = shapes_qs.prefetch_related(
+                Prefetch("rule_bindings",
+                         queryset=NodeRuleBinding.objects.order_by("ordering")),
+                Prefetch("tool_bindings",
+                         queryset=NodeToolBinding.objects
+                         .select_related("tool", "rule_binding")
+                         .order_by("ordering")),
+            )
+        except Exception:
+            pass
+        return (
+            Workflow.objects
+            .prefetch_related(
+                Prefetch("work_areas__workbenches__shapes", queryset=shapes_qs),
+            )
+            .get(pk=pk)
+        )
 
     # ── Auto-build progress (polled by the SPA loading screen) ──────────────
 
@@ -917,13 +963,20 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         """
         wf = self.get_object()
         sop_urls = request.data.get("sop_urls") or []
-        if sop_urls and request.data.get("auto_build_from_sop"):
+        want_auto_build = bool(request.data.get("auto_build_from_sop"))
+        already_auto_built = bool((wf.metadata or {}).get("auto_build_canvas"))
+        if sop_urls and (want_auto_build or already_auto_built):
             meta = dict(wf.metadata or {})
-            if not meta.get("auto_build_canvas"):
-                meta["auto_build_canvas"] = True
-                meta.setdefault("source_sop", sop_urls[0])
-                wf.metadata = meta
-                wf.save(update_fields=["metadata", "updated_at"])
+            meta["auto_build_canvas"] = True
+            meta.setdefault("source_sop", sop_urls[0])
+            # A fresh ingestion is starting on an existing workflow. Clear the
+            # terminal flags so build_status reports queued→ingesting→building
+            # →done again and the SPA re-shows the live progress (SSE) screen
+            # instead of staying "done" from the previous build.
+            meta["auto_build_complete"] = False
+            meta["needs_tools"] = False
+            wf.metadata = meta
+            wf.save(update_fields=["metadata", "updated_at"])
         result = attach_to_workflow(
             wf,
             sop_urls=sop_urls,
@@ -934,25 +987,13 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             "dispatched": result,
         }, status=status.HTTP_202_ACCEPTED)
 
-    @action(detail=False, methods=["post"], url_path="sop_upload",
-            parser_classes=[MultiPartParser, FormParser])
-    def sop_upload(self, request):
-        """Upload a local SOP document (PDF/DOCX/XLSX/HTML) for ingestion.
+    @staticmethod
+    def _store_sop_upload(upload):
+        """Validate + persist an uploaded SOP file to the upload dir.
 
-        Multipart form field ``file``. The file is stashed on the server and a
-        ``file://`` seed URL is returned. The SPA then passes that URL inside
-        ``sop_urls`` to create/attach exactly like an HTML link — the ingestion
-        pipeline's local-file fetcher reads it and runs the same parse →
-        enrich → auto-build flow. PDFs decompose into one node per Step/Action
-        row just like HTML SOPs.
-
-        Returns ``{ url, name, size }``.
+        Returns ``{url, name, size}`` on success, or a DRF ``Response`` (4xx/5xx)
+        describing the failure. Shared by ``sop_upload`` and ``create_from_upload``.
         """
-        upload = request.FILES.get("file")
-        if upload is None:
-            return Response({"detail": "file (multipart) is required"},
-                            status=status.HTTP_400_BAD_REQUEST)
-
         name = upload.name or "document.pdf"
         ext = os.path.splitext(name)[1].lower()
         if ext not in _SOP_UPLOAD_EXTENSIONS:
@@ -976,11 +1017,80 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             return Response({"detail": f"failed to store upload: {exc}"},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        return Response({
-            "url":  f"file://{dest}",
-            "name": name,
-            "size": dest.stat().st_size,
-        }, status=status.HTTP_201_CREATED)
+        return {"url": f"file://{dest}", "name": name, "size": dest.stat().st_size}
+
+    @action(detail=False, methods=["post"], url_path="sop_upload",
+            parser_classes=[MultiPartParser, FormParser])
+    def sop_upload(self, request):
+        """Upload a local SOP document (PDF/DOCX/XLSX/HTML) for ingestion.
+
+        Multipart form field ``file``. The file is stashed on the server and a
+        ``file://`` seed URL is returned. The SPA then passes that URL inside
+        ``sop_urls`` to create/attach exactly like an HTML link — the ingestion
+        pipeline's local-file fetcher reads it and runs the same parse →
+        enrich → auto-build flow. PDFs decompose into one node per Step/Action
+        row just like HTML SOPs.
+
+        Returns ``{ url, name, size }``.
+        """
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response({"detail": "file (multipart) is required"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        stored = self._store_sop_upload(upload)
+        if isinstance(stored, Response):
+            return stored
+        return Response(stored, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"], url_path="create_from_upload",
+            parser_classes=[MultiPartParser, FormParser])
+    def create_from_upload(self, request):
+        """One-shot: upload a SOP file AND create an auto-built workflow.
+
+        This is the seamless drag-drop path: a single multipart request stores
+        the document, creates a Workflow flagged for canvas auto-build, and
+        dispatches ingestion. The SPA immediately polls ``build_status`` /
+        streams ``build_stream`` with the returned workflow id and lands on a
+        fully-built canvas (one node per Step/Action row, nested rules hydrated).
+
+        Multipart fields:
+          ``file``  (required) — SOP document (PDF/DOCX/XLSX/HTML)
+          ``name``  (optional) — workflow name; defaults to the file stem
+          ``auto_build_from_sop`` (optional) — set ``false`` to ingest + link
+            only (no canvas). Defaults true.
+
+        Returns the created ``WorkflowSerializer`` payload (HTTP 201).
+        """
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response({"detail": "file (multipart) is required"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        stored = self._store_sop_upload(upload)
+        if isinstance(stored, Response):
+            return stored
+
+        file_url = stored["url"]
+        raw_name = (request.data.get("name") or "").strip()
+        name = raw_name or os.path.splitext(stored["name"])[0] or "Untitled SOP"
+        auto_build = str(
+            request.data.get("auto_build_from_sop", "true")
+        ).strip().lower() not in {"0", "false", "no", "off"}
+
+        user = request.user
+        metadata = {"source_sop": file_url}
+        if auto_build:
+            metadata["auto_build_canvas"] = True
+
+        workflow = Workflow.objects.create(
+            name=name,
+            slug=_unique_workflow_slug(name),
+            owner_id=getattr(user, "id", ""),
+            owner_email=getattr(user, "email", ""),
+            metadata=metadata,
+        )
+        attach_to_workflow(workflow, sop_urls=[file_url], runtime_agents=[])
+        return Response(WorkflowSerializer(workflow).data,
+                        status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"])
     def duplicate(self, request, pk=None):

@@ -55,7 +55,8 @@ def _plan_rule(rule: RuleNode, ridx: int) -> dict:
         intro_bits.append("Output (Met/Not-Met):\n" + output)
     intro_text = "\n\n".join(intro_bits)
 
-    step_oos = is_out_of_scope(description, conditions, actions, output)
+    step_oos = bool(getattr(rule, "is_out_of_scope", False)) or \
+        is_out_of_scope(description, conditions, actions, output)
     # A "blank" step has no real evaluation criteria. When out of scope it must
     # be SKIPPED and the audit must CONTINUE (non-final), not treated as a
     # terminal exclusion that halts the path.
@@ -131,7 +132,8 @@ def _plan_subrule(sr: Subrule, idx: int, depth: int, parent_oos: bool) -> dict:
     output = sr.output
     sub = sr.subrules
 
-    own_oos = is_out_of_scope(description, conditions, actions, output)
+    own_oos = bool(getattr(sr, "is_out_of_scope", False)) or \
+        is_out_of_scope(description, conditions, actions, output)
     oos = own_oos or parent_oos
 
     condition_if = description or (conditions[0] if conditions else "")

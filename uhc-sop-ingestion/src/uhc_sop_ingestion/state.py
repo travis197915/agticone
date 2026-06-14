@@ -46,11 +46,13 @@ class PipelineState(TypedDict, total=False):
     # — consumed by a07.step_checklist_reconciler so no step is ever dropped.
     step_inventory: list[dict]  # [{number, title, rows:[{cells}], raw_text}]
     step_checklist: list[int]   # sorted step numbers found in the document
-    # PDF-PRIVATE context store (a06.pdf_step_inventory) — kept separate from the
-    # HTML step_inventory so the dedicated PDF agent army (a06b_pdf_agentic) never
-    # mixes with the HTML step/reconciler path.
-    pdf_inventory: list[dict]   # [{number, title, rows:[{cells}], raw_text}]
-    pdf_checklist: list[int]    # sorted step numbers detected in the PDF
+    # PDF VISION DOOR (a06c/a06d/a06e) — native-PDF perception + graph-first
+    # contextualization. Heavy payloads (page perception, entities, relations)
+    # live on the Redis blackboard (sop:pdf:{job_id}:*), Mongo (raw audit trail)
+    # and Neo4j (context graph); state carries only light references below.
+    pdf_page_count: int             # merged page count after perception
+    pdf_slice_count: int            # number of native-PDF slices sent to Claude
+    pdf_context_graph_id: str       # "{job_id}:{content_hash}" of the Neo4j graph
     sub_procedures: list[dict]
     reference_tables: list[dict]
     group_rules: list[dict]

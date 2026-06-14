@@ -36,8 +36,16 @@ def _ir_persist_enabled() -> bool:
     """When SOP_IR_PERSIST is on, the canonical-IR gate (sop_ir.persist.persist_ir,
     invoked post-run from pipeline_runner) is the AUTHORITATIVE writer for
     AuditStep/AuditDecision. The flat writer below then skips its step/decision
-    pass so the two never fight over the same rows."""
-    return os.environ.get("SOP_IR_PERSIST", "").strip().lower() in {"1", "true", "yes"}
+    pass so the two never fight over the same rows.
+
+    Default ON: the nested-routing IR is the seamless high-fidelity path. An
+    operator opts out only by setting SOP_IR_PERSIST to a falsy value
+    (0/false/no/off). Must stay in lockstep with
+    sop_ingestion.pipeline_runner._ir_persist_enabled."""
+    raw = os.environ.get("SOP_IR_PERSIST")
+    if raw is None or raw.strip() == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 # ── psycopg2 connection helper ────────────────────────────────────────────────

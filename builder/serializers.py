@@ -133,13 +133,16 @@ class WorkflowSerializer(serializers.ModelSerializer):
         help_text="Static-rule SOP URLs (http/https) or file:// upload refs "
                   "to ingest and link to this workflow.",
     )
-    # Opt-in add-on: when true, the canvas (shapes + rule bindings) is built
-    # automatically from the ingested SOP once ingestion completes. Tool calls
-    # are left empty for the user to attach. Default false keeps the existing
-    # behaviour (ingest + link only) byte-for-byte.
+    # Seamless default: when true (now the default), the canvas (shapes + rule
+    # bindings) is built automatically from the ingested SOP once ingestion
+    # completes. Tool calls are left empty for the user to attach. Pass
+    # ``auto_build_from_sop=false`` explicitly to ingest + link only (no canvas).
+    # Only takes effect when ``sop_urls`` are supplied, so SOP-less workflows are
+    # unaffected.
     auto_build_from_sop = serializers.BooleanField(
-        required=False, write_only=True, default=False,
-        help_text="Auto-build the workflow canvas from the ingested SOP(s).",
+        required=False, write_only=True, default=True,
+        help_text="Auto-build the workflow canvas from the ingested SOP(s). "
+                  "Default true; set false to ingest + link only.",
     )
     runtime_agents = RuntimeAgentSerializer(
         many=True, required=False, write_only=True,
@@ -212,7 +215,10 @@ class _NestedShapeSerializer(serializers.ModelSerializer):
         data = super().to_representation(obj)
         try:
             from .bindings_sync import hydrate_properties_with_bindings
-            data["properties"] = hydrate_properties_with_bindings(obj)
+            # A workflow-level OOS set, precomputed once by the graph view, is
+            # passed through serializer context to skip the per-shape OOS query.
+            oos_keys = self.context.get("oos_keys") if self.context else None
+            data["properties"] = hydrate_properties_with_bindings(obj, oos_keys=oos_keys)
         except Exception:
             pass
         return data

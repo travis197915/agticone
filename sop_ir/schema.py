@@ -84,6 +84,10 @@ class Subrule(BaseModel):
     # child, persist_ir forces the parent's children to APPLICABLE_ONLY.
     applicable_when: str = ""
     tooling_allowed: bool = True
+    # True when the SOP marks this row out of scope / "stop further auditing".
+    # plan.py ORs this with the text heuristic, so an explicitly-flagged row is
+    # honored even when its action text was paraphrased and lost the phrase.
+    is_out_of_scope: bool = False
     urls: List[str] = Field(default_factory=list)
     # Optional structured routing hint; persist_ir falls back to parsing the
     # action/output text via normalize.extract_goto when this is absent.
@@ -116,6 +120,8 @@ class RuleNode(BaseModel):
     references: List[str] = Field(default_factory=list)
     urls: List[str] = Field(default_factory=list)
     tooling_allowed: bool = True
+    # True when the SOP marks this whole step out of scope for auditing.
+    is_out_of_scope: bool = False
     # Explicit child-group routing (e.g. "applicable_only", "any_clean").
     aggregation_rule: Optional[str] = None
     navigation: Optional[Navigation] = None

@@ -89,6 +89,27 @@ def extract_bindings_from_properties(shape) -> None:
     raw_rules = props.get("sop_rules") or []
     raw_tools = props.get("tool_calls") or []
 
+    # Durable per-rule manual out-of-scope set. The auditor can toggle OOS on an
+    # individual rule / sub-rule / sub-sub-rule (each is a distinct decision row
+    # with a unique ``key``), via ``sop_rules[i].manual_out_of_scope``. The
+    # NodeRuleBinding table has no per-row OOS column, so we persist the set of
+    # flagged rule_keys on the shape itself — it survives the binding round-trip
+    # and drives both hydration (badge) and execution (skip). The per-entry flag
+    # is the single source of truth; we recompute the list from it on every save.
+    manual_oos_keys = sorted({
+        str(r.get("key"))
+        for r in raw_rules
+        if isinstance(r, dict) and r.get("key") and r.get("manual_out_of_scope")
+    })
+    if (props.get("manual_oos_rule_keys") or []) != manual_oos_keys:
+        props["manual_oos_rule_keys"] = manual_oos_keys
+        shape.properties = props
+        try:
+            shape.save(update_fields=["properties"])
+        except Exception as exc:
+            logger.warning("agent_tools: could not persist manual_oos_rule_keys "
+                           "(shape=%s): %s", shape.id, exc)
+
     NodeRuleBinding.objects.filter(shape=shape).delete()
     rule_binding_by_key: dict[str, Any] = {}
     for idx, rule in enumerate(raw_rules):
@@ -156,6 +177,22 @@ def extract_bindings_from_properties(shape) -> None:
 # ── Read path: binding tables → properties ──────────────────────────────────
 
 
+def out_of_scope_keys_for_shapes(shapes) -> set[str]:
+    """Resolve the out-of-scope rule_keys for many shapes in ONE query.
+
+    Collects every bound rule_key across ``shapes`` (using prefetched
+    ``rule_bindings`` when available) and resolves them all together, so the
+    graph serializer can compute OOS once instead of once per shape.
+    """
+    keys: list[str] = []
+    for shape in shapes:
+        try:
+            keys.extend(r.rule_key for r in shape.rule_bindings.all())
+        except Exception:
+            continue
+    return _rule_keys_out_of_scope(keys)
+
+
 def _rule_keys_out_of_scope(rule_keys) -> set[str]:
     """Return the subset of ``rule_keys`` whose SOP step/decision is out of scope.
 
@@ -163,6 +200,10 @@ def _rule_keys_out_of_scope(rule_keys) -> set[str]:
     OOS is true when either the AuditStep or its AuditDecision is flagged
     ``is_out_of_scope`` (mirrors ``rule_loader._hydrate_decision``).
     Preconditions (``pre:...``) are never out of scope.
+
+    Resolved in a SINGLE batched query (no N+1): every relevant decision is
+    fetched once and matched in memory. This is the hot path during graph GET/
+    PUT hydration — one query per call instead of one per rule key.
     """
     oos: set[str] = set()
     try:
@@ -170,40 +211,56 @@ def _rule_keys_out_of_scope(rule_keys) -> set[str]:
     except Exception:
         return oos
 
+    parsed: dict[tuple[int, int, int], str] = {}
+    sop_ids: set[int] = set()
+    step_nos: set[int] = set()
     for key in rule_keys:
         m = re.match(r"^step:(\d+):(\d+):(\d+)$", key or "")
         if not m:
             continue
         sop_id, step_no, row_index = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        try:
-            dec = (
-                AuditDecision.objects
-                .select_related("step")
-                .filter(
-                    step__sop_id=sop_id,
-                    step__step_number=step_no,
-                    row_index=row_index,
-                )
-                .first()
-            )
-        except Exception:
-            dec = None
-        if dec is not None and (dec.is_out_of_scope or dec.step.is_out_of_scope):
+        parsed[(sop_id, step_no, row_index)] = key
+        sop_ids.add(sop_id)
+        step_nos.add(step_no)
+    if not parsed:
+        return oos
+
+    try:
+        rows = (
+            AuditDecision.objects
+            .filter(step__sop_id__in=sop_ids, step__step_number__in=step_nos)
+            .values_list("step__sop_id", "step__step_number", "row_index",
+                         "is_out_of_scope", "step__is_out_of_scope")
+        )
+    except Exception:
+        return oos
+
+    for sop_id, step_no, row_index, dec_oos, step_oos in rows:
+        key = parsed.get((sop_id, step_no, row_index))
+        if key and (dec_oos or step_oos):
             oos.add(key)
     return oos
 
 
-def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
-    """Return shape.properties augmented with sop_rules + tool_calls from DB."""
+def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) -> dict[str, Any]:
+    """Return shape.properties augmented with sop_rules + tool_calls from DB.
+
+    ``oos_keys`` (optional) lets a caller pass a pre-resolved set of out-of-scope
+    rule_keys for the WHOLE workflow so the per-shape OOS query is skipped — this
+    is the hot path for graph GET/PUT, where computing it once and reusing it
+    avoids one AuditDecision query per shape. When omitted it is resolved here so
+    single-shape callers keep working unchanged.
+    """
     props = dict(shape.properties or {})
     Tool, NodeRuleBinding, NodeToolBinding = _safe_import_agent_tools()
     if NodeRuleBinding is None or NodeToolBinding is None:
         return props
 
+    # Use the related manager (not a fresh filter) so a prefetched queryset on
+    # the shape is reused instead of issuing a query; sort in Python to keep the
+    # prefetch cache intact. Falls back to a query when not prefetched.
     try:
-        rule_rows = list(
-            NodeRuleBinding.objects.filter(shape=shape).order_by("ordering")
-        )
+        rule_rows = sorted(shape.rule_bindings.all(), key=lambda r: r.ordering)
     except Exception:
         rule_rows = []
 
@@ -219,10 +276,16 @@ def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
             r["key"]: r for r in raw_rules if r.get("key")
         }
         bound_by_key = {row.rule_key: row for row in rule_rows}
-        oos_keys = _rule_keys_out_of_scope(list(bound_by_key))
+        if oos_keys is None:
+            oos_keys = _rule_keys_out_of_scope(list(bound_by_key))
+        # Auditor's per-rule manual OOS toggles (rules / sub-rules / sub-sub-
+        # rules), persisted on write. Re-emitted per entry so the toggle state
+        # round-trips, and OR'd into the effective ``is_out_of_scope``.
+        manual_keys = set(props.get("manual_oos_rule_keys") or [])
 
         def _binding_entry(row) -> dict:
             entry = dict(raw_by_key.get(row.rule_key) or {})
+            is_manual = row.rule_key in manual_keys
             # Authoritative fields from the binding row always win.
             entry.update({
                 "id":             str(row.id),
@@ -234,7 +297,8 @@ def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
                 "excluded_by":    row.excluded_by_json or [],
                 "html_reference": row.html_reference_json or {},
                 "ordering":       row.ordering,
-                "is_out_of_scope": row.rule_key in oos_keys,
+                "manual_out_of_scope": is_manual,
+                "is_out_of_scope": (row.rule_key in oos_keys) or is_manual,
             })
             return entry
 
@@ -249,9 +313,13 @@ def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
                 merged.append(_binding_entry(row))
                 seen_bound.add(key)
             else:
-                # Unbound rule = custom (no SOP). Keep it exactly as authored.
+                # Unbound rule = custom (no SOP). Keep it exactly as authored,
+                # but still honor a manual OOS toggle on it.
                 entry = dict(raw)
                 entry["is_custom"] = bool(raw.get("is_custom")) or key.startswith("custom:")
+                is_manual = key in manual_keys
+                entry["manual_out_of_scope"] = is_manual
+                entry["is_out_of_scope"] = bool(entry.get("is_out_of_scope")) or is_manual
                 merged.append(entry)
         # Defensive: surface any binding rows the raw list didn't mention.
         for row in rule_rows:
@@ -265,12 +333,14 @@ def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
         props["sop_rules"] = merged
 
         # Shape-level rollup so the canvas can flag the node without having to
-        # inspect every rule. ``is_out_of_scope`` is true only when EVERY rule
-        # is an out-of-scope (clean-exclusion) rule; ``oos_rule_count`` /
-        # ``rule_count`` let the UI mark partially-OOS nodes too.
-        props["oos_rule_count"] = len(oos_keys)
+        # inspect every rule. Effective OOS now includes SOP-derived rows, manual
+        # per-rule toggles, and custom rules. ``is_out_of_scope`` is true only
+        # when EVERY rule is out of scope; ``oos_rule_count`` / ``rule_count``
+        # let the UI mark partially-OOS nodes too.
+        effective_oos = sum(1 for e in merged if e.get("is_out_of_scope"))
+        props["oos_rule_count"] = effective_oos
         props["rule_count"] = len(merged)
-        props["is_out_of_scope"] = bool(oos_keys) and len(oos_keys) == len(merged)
+        props["is_out_of_scope"] = len(merged) > 0 and effective_oos == len(merged)
 
     # ── Manual per-node override (auditor-set on the canvas) ──────────────────
     # ``manual_out_of_scope`` is a user toggle that excludes the WHOLE node from
@@ -284,12 +354,7 @@ def hydrate_properties_with_bindings(shape) -> dict[str, Any]:
         props["is_out_of_scope"] = True
 
     try:
-        tool_rows = list(
-            NodeToolBinding.objects
-            .filter(shape=shape)
-            .select_related("tool", "rule_binding")
-            .order_by("ordering")
-        )
+        tool_rows = sorted(shape.tool_bindings.all(), key=lambda r: r.ordering)
     except Exception:
         tool_rows = []
 

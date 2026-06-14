@@ -109,7 +109,16 @@ def execute_ingestion_job(job_id: str) -> dict:
 
 
 def _ir_persist_enabled() -> bool:
-    return os.environ.get("SOP_IR_PERSIST", "").strip().lower() in {"1", "true", "yes"}
+    """Canonical-IR persistence is ON by default (seamless high-fidelity path).
+
+    The nested-routing IR (state["sop_ir"]) is the authoritative projection, so
+    we route through ``persist_ir`` unless an operator explicitly opts out with
+    ``SOP_IR_PERSIST`` set to a falsy value (``0``/``false``/``no``/``off``).
+    """
+    raw = os.environ.get("SOP_IR_PERSIST")
+    if raw is None or raw.strip() == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _maybe_persist_ir(job, final_state: dict) -> None:

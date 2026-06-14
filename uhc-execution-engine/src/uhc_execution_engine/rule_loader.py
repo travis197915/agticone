@@ -186,6 +186,7 @@ def _materialise_custom_rules(workflow_id: str,
                 synthetic_step += 1
                 host_step = synthetic_step
         manual_oos = bool(props.get("manual_out_of_scope"))
+        manual_oos_keys = set(props.get("manual_oos_rule_keys") or [])
 
         sg = shapes_by_id.get(sid)
         if sg is None:
@@ -205,7 +206,10 @@ def _materialise_custom_rules(workflow_id: str,
                 continue
             rd = _custom_rule_dict(
                 raw, shape_id=sid, sop_id=host_sop_id,
-                step_number=host_step, manual_oos=manual_oos,
+                step_number=host_step,
+                manual_oos=manual_oos
+                or raw.get("key") in manual_oos_keys
+                or bool(raw.get("manual_out_of_scope")),
             )
             decisions_out.append(rd)
             sg["rules"].append(rd)
@@ -309,12 +313,18 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
         rule_dict["shape_id"] = str(rb.shape_id)
         rule_dict["references"] = list(rb.references_json or [])
         rule_dict["excluded_by"] = list(rb.excluded_by_json or [])
-        # Manual per-node exclusion set by the auditor on the canvas
-        # (``Shape.properties.manual_out_of_scope``). When true, the execution
-        # engine skips EVERY rule on this shape (no LLM call) and continues —
-        # independent of the SOP-derived ``is_out_of_scope`` routing.
-        rule_dict["manual_oos"] = bool(
-            (getattr(rb.shape, "properties", None) or {}).get("manual_out_of_scope"))
+        # Manual out-of-scope exclusion set by the auditor on the canvas. Two
+        # granularities, both honored (the engine skips the affected rule(s)
+        # with no LLM call, independent of SOP-derived routing):
+        #   • whole node  — ``Shape.properties.manual_out_of_scope`` (every rule)
+        #   • per rule     — ``Shape.properties.manual_oos_rule_keys`` contains
+        #     this rule's key (covers rules / sub-rules / sub-sub-rules, since
+        #     each decision row at any depth has a unique rule_key).
+        _shape_props = getattr(rb.shape, "properties", None) or {}
+        rule_dict["manual_oos"] = (
+            bool(_shape_props.get("manual_out_of_scope"))
+            or rb.rule_key in set(_shape_props.get("manual_oos_rule_keys") or [])
+        )
         if kind == "pre":
             preconds_out.append(rule_dict)
         else:

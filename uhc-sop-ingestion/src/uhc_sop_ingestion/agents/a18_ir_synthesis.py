@@ -126,6 +126,42 @@ def _row_codes(row: dict) -> dict:
     }
 
 
+# ── recursive decision-row → Subrule mapper ──────────────────────────────────
+def _row_to_subrule(parent_id: str, row: dict, ridx: int) -> dict:
+    """Map one decision row into a SopIR ``Subrule`` dict, RECURSING into nested
+    children so sub-sub-rules survive into the Pydantic IR.
+
+    Nested children are read from ``row["subrules"]`` or ``row["children"]``
+    (the keys the new PDF/HTML synthesis emits). Field names mirror exactly what
+    ``build_draft_ir`` historically read so HTML and PDF drafts stay identical.
+    """
+    cond_if = _txt(row.get("condition_if", row.get("if", "")))
+    cond_and = _txt(row.get("condition_and", row.get("and", "")))
+    action = _txt(row.get("action", row.get("then", "")))
+    goto = _int_or_none(row.get("skip_to_step") or row.get("goto_step"))
+    nav = {"op": "goto", "step_number": goto} if goto is not None else None
+    subrule_id = _txt(row.get("subrule_id", "")) or f"{parent_id}-{ridx + 1:03d}"
+
+    children_raw = row.get("subrules") or row.get("children") or []
+    children: list[dict] = []
+    for cidx, child in enumerate(children_raw):
+        if isinstance(child, dict):
+            children.append(_row_to_subrule(subrule_id, child, cidx))
+
+    return {
+        "subrule_id": subrule_id,
+        "table_name": _txt(row.get("table_name", "")),
+        "description": cond_if,
+        "conditions": [c for c in [cond_and] if c],
+        "actions": [a for a in [action] if a],
+        "output": _txt(row.get("output_text", "")),
+        "applicable_when": _txt(row.get("applicable_when", "")),
+        "is_out_of_scope": bool(row.get("is_out_of_scope")),
+        "navigation": nav,
+        "subrules": children,
+    }
+
+
 # ── deterministic draft ───────────────────────────────────────────────────────
 def build_draft_ir(state: "PipelineState") -> dict:
     """Build a SopIR-shaped dict from enriched steps. Always succeeds.
@@ -159,22 +195,7 @@ def build_draft_ir(state: "PipelineState") -> dict:
         for ridx, row in enumerate(decision_rows):
             if not isinstance(row, dict):
                 continue
-            cond_if = _txt(row.get("condition_if", row.get("if", "")))
-            cond_and = _txt(row.get("condition_and", row.get("and", "")))
-            action = _txt(row.get("action", row.get("then", "")))
-            goto = _int_or_none(row.get("skip_to_step") or row.get("goto_step"))
-            nav = {"op": "goto", "step_number": goto} if goto is not None else None
-            subrules.append({
-                "subrule_id": _txt(row.get("subrule_id", "")) or f"{rule_id}-{ridx + 1:03d}",
-                "table_name": _txt(row.get("table_name", "")),
-                "description": cond_if,
-                "conditions": [c for c in [cond_and] if c],
-                "actions": [a for a in [action] if a],
-                "output": _txt(row.get("output_text", "")),
-                "applicable_when": _txt(row.get("applicable_when", "")),
-                "navigation": nav,
-                "subrules": [],
-            })
+            subrules.append(_row_to_subrule(rule_id, row, ridx))
 
         # Carry step-level conditions/actions verbatim when the enricher
         # provides them (improves leaf-rule fidelity); otherwise fall back to
@@ -195,6 +216,7 @@ def build_draft_ir(state: "PipelineState") -> dict:
             "references": [],
             "urls": [],
             "tooling_allowed": True,
+            "is_out_of_scope": bool(s.get("is_out_of_scope")),
             "aggregation_rule": None,
             "navigation": None,
             "subrules": subrules,
@@ -408,15 +430,33 @@ Step {rule.get('rule_id')} rows:
 def _apply_structure(rule: dict, tree: list) -> tuple[int, int]:
     """Rebuild ``rule['subrules']`` as a nested tree by reference.
 
-    Guarantees completeness: every original subrule appears exactly once. Any id
-    the LLM omitted (or referenced more than once / unknown) is re-attached flat
-    at the top level so NOTHING is ever dropped. Verbatim content is copied from
-    the original rows by id — the tree only supplies structure.
-    Returns (original_leaf_count, placed_count)."""
+    Guarantees completeness: every original subrule (at ANY depth) appears
+    exactly once. Any id the LLM omitted (or referenced more than once /
+    unknown) is re-attached so NOTHING is ever dropped. Verbatim content is
+    copied from the original rows by id — the tree only supplies structure.
+
+    Non-destructive: when the tree references a row that ALREADY has nested
+    children (the new PDF/HTML synthesis emits pre-nested rows), those children
+    are preserved and merged with any the tree adds, rather than overwritten.
+    Returns (original_subrule_count, placed_count)."""
     flat = rule.get("subrules") or []
-    by_id = {sr.get("subrule_id", ""): sr for sr in flat}
+
+    # Index EVERY original id (recursively) so refs resolve at any depth and the
+    # completeness pass below can recover a dropped grandchild, not just a row.
+    def _index(subs: list, acc: dict) -> dict:
+        for sr in subs or []:
+            if isinstance(sr, dict):
+                acc[sr.get("subrule_id", "")] = sr
+                _index(sr.get("subrules") or [], acc)
+        return acc
+
+    by_id = _index(flat, {})
     used: set[str] = set()
     gcount = [0]
+
+    def _mark_all(sr: dict) -> None:
+        for cid in _collect_subrule_ids([sr]):
+            used.add(cid)
 
     def build(node):
         if not isinstance(node, dict):
@@ -426,7 +466,19 @@ def _apply_structure(rule: dict, tree: list) -> tuple[int, int]:
         if ref and ref in by_id and ref not in used:
             used.add(ref)
             base = by_id[ref]
-            base["subrules"] = [b for b in (build(c) for c in children) if b]
+            original_children = base.get("subrules") or []
+            built = [b for b in (build(c) for c in children) if b]
+            built_ids = set(_collect_subrule_ids(built))
+            # Preserve pre-existing children the tree didn't re-place, so an
+            # already-nested row never loses its descendants.
+            for oc in original_children:
+                if not isinstance(oc, dict):
+                    continue
+                ocid = oc.get("subrule_id", "")
+                if ocid not in used and ocid not in built_ids:
+                    built.append(oc)
+                    _mark_all(oc)
+            base["subrules"] = built
             return base
         if not ref:  # synthetic group header
             kids = [b for b in (build(c) for c in children) if b]
@@ -448,16 +500,18 @@ def _apply_structure(rule: dict, tree: list) -> tuple[int, int]:
 
     new_subrules = [b for b in (build(n) for n in (tree or [])) if b]
 
-    # Completeness: re-attach any original row the tree did not place. Never drop.
+    # Completeness: re-attach any original top-level row the tree did not place,
+    # keeping its existing subtree intact. _mark_all then claims its descendants
+    # so a preserved grandchild is never re-attached a second time.
     for sr in flat:
         sid = sr.get("subrule_id", "")
         if sid not in used:
             sr["subrules"] = sr.get("subrules") or []
             new_subrules.append(sr)
-            used.add(sid)
+            _mark_all(sr)
 
     rule["subrules"] = new_subrules
-    return len(flat), len(used)
+    return len(by_id), len(used)
 
 
 def _restructure_draft(state, cfg, draft: dict) -> int:
@@ -468,6 +522,12 @@ def _restructure_draft(state, cfg, draft: dict) -> int:
     for r in draft.get("rules") or []:
         flat = r.get("subrules") or []
         if len(flat) < 4:
+            continue
+        # The new PDF/HTML synthesis already emits correctly-nested decision
+        # rows. The LLM structurer is a FLAT→nested reconstructor that only sees
+        # top-level rows, so running it on already-nested input would re-nest by
+        # top-level id and discard the existing hierarchy. Leave it untouched.
+        if any(isinstance(sr, dict) and sr.get("subrules") for sr in flat):
             continue
         original_ids = set(_collect_subrule_ids(flat))
         try:

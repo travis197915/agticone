@@ -350,6 +350,168 @@ def _llm_call(
     return fallback
 
 
+# ── Native-PDF (vision) call path ─────────────────────────────────────────────
+# Anthropic-only variant of `_llm_call` that sends the ACTUAL PDF bytes to Claude
+# as `document` content blocks so the model "sees" the real page layout, tables,
+# redaction boxes and footnotes — exactly like the Claude chat UI. There is no
+# OpenAI fallback here because GPT-4o's API ingests images, not native PDFs; the
+# perception layer's deterministic page list is the safety net instead.
+
+def _make_anthropic_vision_llm(cfg, max_tokens: int = 8192):
+    """A higher-token ChatAnthropic for document perception (pages are dense)."""
+    from langchain_anthropic import ChatAnthropic
+    return ChatAnthropic(
+        model=cfg.anthropic_model,
+        api_key=cfg.anthropic_api_key,
+        max_tokens=max_tokens,
+        temperature=0,
+    )
+
+
+def _pdf_content_blocks(prompt: str, pdf_b64_list: list[str]) -> list[dict]:
+    """Build a langchain Anthropic multimodal message body.
+
+    One `document` block per base64 PDF slice, followed by the text prompt so the
+    instruction comes after the evidence the model just read.
+    """
+    blocks: list[dict] = []
+    for b64 in pdf_b64_list:
+        if not b64:
+            continue
+        blocks.append({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": b64,
+            },
+        })
+    blocks.append({"type": "text", "text": prompt})
+    return blocks
+
+
+def _llm_call_pdf(
+    cfg,
+    prompt: str,
+    pdf_b64_list: list[str],
+    fallback: Any,
+    agent_name: str,
+    expected_type: type = dict,
+    required_keys: list[str] | None = None,
+    stage: str = "pdf_perceive",
+    max_retries: int = 2,
+    max_tokens: int = 8192,
+) -> Any:
+    """Native-PDF Claude call with the same guardrails as `_llm_call`.
+
+    Sends `pdf_b64_list` (one or more base64 PDF slices) plus `prompt` to Claude,
+    then runs the identical parse → salvage → schema-validate → retry path. Every
+    attempt is logged to Postgres via cfg._pg_logger. Returns `fallback` on total
+    failure so the perception layer always has a deterministic floor.
+    """
+    from langchain_core.messages import HumanMessage
+    pg_logger = getattr(cfg, "_pg_logger", None)
+    model_name = cfg.anthropic_model
+
+    base_prompt = prompt + (
+        "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+    )
+
+    def _try(current_prompt: str, attempt_label: str):
+        t0 = time.time()
+        try:
+            llm = _make_anthropic_vision_llm(cfg, max_tokens=max_tokens)
+            content = _pdf_content_blocks(current_prompt, pdf_b64_list)
+            resp = llm.invoke([HumanMessage(content=content)])
+            inp, out = _token_usage(resp)
+            ms = int((time.time() - t0) * 1000)
+            if pg_logger:
+                pg_logger.log_llm_call(
+                    agent_name=f"{agent_name}[{attempt_label}]",
+                    stage=stage, provider="anthropic", model=model_name,
+                    prompt_tokens=inp, completion_tokens=out,
+                    duration_ms=ms, success=True,
+                )
+            try:
+                data = _parse_json(resp.content if isinstance(resp.content, str)
+                                   else _coerce_text_content(resp.content))
+            except json.JSONDecodeError as je:
+                raw = resp.content if isinstance(resp.content, str) \
+                    else _coerce_text_content(resp.content)
+                if expected_type is list:
+                    salvaged = _salvage_json_array(raw)
+                elif expected_type is dict:
+                    salvaged = _salvage_json_object(raw)
+                    if (salvaged and required_keys
+                            and any(k in salvaged for k in required_keys)
+                            and all(isinstance(salvaged[k], list)
+                                    for k in required_keys if k in salvaged)):
+                        for k in required_keys:
+                            salvaged.setdefault(k, [])
+                else:
+                    salvaged = None
+                if not salvaged:
+                    raise
+                logger.warning(
+                    "llm_call_pdf [%s/%s]: salvaged %d objects from truncated JSON (%s)",
+                    agent_name, attempt_label, len(salvaged), je,
+                )
+                data = salvaged
+            data = _unwrap_if_needed(data, expected_type)
+            if not _validate_schema(data, expected_type, required_keys):
+                raise ValueError(
+                    f"Schema mismatch: expected {expected_type.__name__} "
+                    f"with keys {required_keys}, got {type(data).__name__}"
+                )
+            return data, None
+        except Exception as exc:
+            ms = int((time.time() - t0) * 1000)
+            logger.warning("llm_call_pdf [%s/%s]: %s", agent_name, attempt_label, exc)
+            if pg_logger:
+                pg_logger.log_llm_call(
+                    agent_name=f"{agent_name}[{attempt_label}]",
+                    stage=stage, provider="anthropic", model=model_name,
+                    prompt_tokens=0, completion_tokens=0,
+                    duration_ms=ms, success=False, error_message=str(exc),
+                )
+            return None, str(exc)
+
+    last_error = ""
+    for attempt in range(1, max_retries + 1):
+        current = base_prompt
+        if last_error:
+            current = (
+                f"{base_prompt}\n\n[Previous attempt failed: {last_error}. "
+                "Fix the JSON format and try again.]"
+            )
+        data, err = _try(current, f"p{attempt}")
+        if data is not None:
+            return data
+        last_error = err or "unknown error"
+
+    logger.error("llm_call_pdf [%s]: all attempts failed, returning fallback", agent_name)
+    return fallback
+
+
+def _coerce_text_content(content: Any) -> str:
+    """Flatten Anthropic block-list responses to plain text.
+
+    Some langchain versions return `content` as a list of `{type, text}` blocks
+    rather than a bare string; concatenate the text blocks so JSON parsing works.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for blk in content:
+            if isinstance(blk, dict):
+                parts.append(blk.get("text", "") or "")
+            else:
+                parts.append(str(blk))
+        return "".join(parts)
+    return str(content)
+
+
 # ── 0. StepChecklistReconcilerAgent — Anthropic ───────────────────────────────
 # Consumes the deterministic step_inventory context store built by BS4 in
 # a03.html_step_inventory. Every step number on the checklist MUST end up in
@@ -745,8 +907,11 @@ def pre_section_rule_extractor(state: "PipelineState", cfg: "PipelineConfig") ->
     # provider-exclusion lists, "Duplicate Exceptions") must not be input-
     # truncated, so this is generous.
     PER_SECTION_CHARS = 12000
+    # Process every section — segmenting the PDF preamble into named sections
+    # can yield well over the old 15-section cap, and dropping the tail would
+    # silently lose whole sections (e.g. "Duplicate Exceptions").
     section_texts = []
-    for s in pre[:15]:
+    for s in pre[:60]:
         raw_text = " ".join(
             (i.get("text", str(i)) if isinstance(i, dict) else str(i))
             for i in s.get("items", [])

@@ -74,14 +74,19 @@ from .agents.a04_parse_docx import (docx_metadata, docx_headings, docx_paragraph
 from .agents.a05_parse_xlsx import (xlsx_workbook_type, xlsx_sheet_parser,
                                     xlsx_header_detector, xlsx_code_extractor,
                                     xlsx_calculator, xlsx_metadata)
-from .agents.a06_parse_pdf  import (pdf_text_extractor, pdf_metadata, pdf_raw_text_normalizer,
-                                   pdf_step_inventory)
-# Dedicated PDF agent army — runs in its own pdf_enrich stage, never mixed with
-# the HTML step/reconciler path.
-from .agents.a06b_pdf_agentic import (pdf_document_profiler, pdf_step_extractor,
-                                      pdf_question_refiner, pdf_decision_normalizer,
-                                      pdf_code_grounder, pdf_routing_resolver,
-                                      pdf_terminal_marker, pdf_quality_gate)
+from .agents.a06_parse_pdf  import pdf_metadata
+# PDF VISION DOOR — native-PDF perception + graph-first contextualization +
+# graph->canonical synthesis. Fully replaces the old pypdf text army.
+from .agents.a06c_pdf_perception import (pdf_slicer, pdf_page_reader,
+                                         pdf_perception_merger)
+from .agents.a06d_pdf_context_graph import (pdf_entity_extractor,
+                                            pdf_relation_reasoner,
+                                            pdf_context_graph_writer,
+                                            pdf_context_validator,
+                                            pdf_step_reconciler)
+from .agents.a06e_pdf_synthesis import (pdf_step_synthesizer,
+                                        pdf_presection_synthesizer,
+                                        pdf_quality_gate)
 from .agents.a07_enrich     import (step_checklist_reconciler,
                                     step_question_refiner, decision_row_classifier,
                                     rule_semantic_enricher, cross_reference_resolver,
@@ -188,7 +193,7 @@ def _route_after_fetch(state: PipelineState) -> str:
     if state.get("is_duplicate"):
         return "link_stage"
     fmt = state.get("doc_format","")
-    return {"HTML":"html_parse","DOCX":"docx_parse","XLSX":"xlsx_parse","PDF":"pdf_parse"}.get(fmt,"html_parse")
+    return {"HTML":"html_parse","DOCX":"docx_parse","XLSX":"xlsx_parse","PDF":"pdf_perceive"}.get(fmt,"html_parse")
 
 def _route_completion(state: PipelineState) -> str:
     return "final_stage" if state.get("processing_complete") else "pick_next_url"
@@ -240,10 +245,29 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
         xlsx_code_extractor, xlsx_calculator, xlsx_metadata,
         cfg=cfg, stage_name="xlsx_parse",
     ))
-    g.add_node("pdf_parse", _stage(
-        pdf_text_extractor, pdf_metadata, pdf_step_inventory,
-        pdf_raw_text_normalizer,
-        cfg=cfg, stage_name="pdf_parse",
+    # PDF VISION DOOR — three dedicated stages replace pdf_parse + pdf_enrich.
+    # 1) perceive: read every page natively via Claude, stitch cross-page.
+    g.add_node("pdf_perceive", _stage(
+        pdf_metadata,
+        pdf_slicer, pdf_page_reader, pdf_perception_merger,
+        cfg=cfg, stage_name="pdf_perceive",
+    ))
+    # 2) contextualize: build the durable Neo4j context graph BEFORE extraction.
+    g.add_node("pdf_contextualize", _stage(
+        pdf_entity_extractor, pdf_relation_reasoner,
+        pdf_context_graph_writer, pdf_context_validator,
+        pdf_step_reconciler,
+        cfg=cfg, stage_name="pdf_contextualize",
+    ))
+    # 3) synthesize: graph -> canonical steps/pre_sections (nested decision
+    #    rows), then the shared format-agnostic enrichers add group rules, date
+    #    conditions and the summary, then the SopIR Pydantic gate.
+    g.add_node("pdf_synthesize", _stage(
+        pdf_step_synthesizer, pdf_presection_synthesizer,
+        pre_section_rule_extractor, group_rule_extractor,
+        date_condition_extractor, summary_generator,
+        pdf_quality_gate,
+        cfg=cfg, stage_name="pdf_synthesize",
     ))
 
     # ── LLM enrichment ────────────────────────────────────────────────────────
@@ -255,26 +279,6 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
         pre_section_rule_extractor, group_rule_extractor,
         date_condition_extractor, summary_generator,
         cfg=cfg, stage_name="enrich_stage",
-    ))
-
-    # ── PDF enrichment — DEDICATED PDF AGENT ARMY ─────────────────────────────
-    # PDFs route here instead of enrich_stage so they never touch the HTML
-    # step_inventory / step_checklist_reconciler. The army turns the PDF-private
-    # pdf_inventory into the same high-fidelity ``steps`` an HTML SOP yields,
-    # then the generic (format-agnostic) preamble/group/date/summary agents add
-    # the remaining context before rejoining the shared backbone.
-    g.add_node("pdf_enrich", _stage(
-        pdf_document_profiler,
-        pdf_step_extractor,
-        pdf_question_refiner,
-        pdf_decision_normalizer,
-        pdf_code_grounder,
-        pdf_routing_resolver,
-        pdf_terminal_marker,
-        pdf_quality_gate,
-        pre_section_rule_extractor, group_rule_extractor,
-        date_condition_extractor, summary_generator,
-        cfg=cfg, stage_name="pdf_enrich",
     ))
 
     # ── Context extraction ────────────────────────────────────────────────────
@@ -406,7 +410,7 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
                             {"fetch_stage":"fetch_stage","final_stage":"final_stage"})
     g.add_conditional_edges("fetch_stage", _route_after_fetch,
                             {"html_parse":"html_parse","docx_parse":"docx_parse",
-                             "xlsx_parse":"xlsx_parse","pdf_parse":"pdf_parse",
+                             "xlsx_parse":"xlsx_parse","pdf_perceive":"pdf_perceive",
                              "link_stage":"link_stage"})
 
     # Parse → enrich → context → validate → write (sequential)
@@ -414,9 +418,10 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
     # army so the two flows never mix. Both rejoin at context_stage.
     for parse_node in ("html_parse","docx_parse","xlsx_parse"):
         g.add_edge(parse_node, "enrich_stage")
-    g.add_edge("pdf_parse",            "pdf_enrich")
+    g.add_edge("pdf_perceive",         "pdf_contextualize")
+    g.add_edge("pdf_contextualize",    "pdf_synthesize")
     g.add_edge("enrich_stage",         "context_stage")
-    g.add_edge("pdf_enrich",           "context_stage")
+    g.add_edge("pdf_synthesize",       "context_stage")
     g.add_edge("context_stage",        "validate_stage")
     g.add_edge("validate_stage",       "narrative_stage")
     g.add_edge("narrative_stage",      "graph_synthesis_stage")

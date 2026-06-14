@@ -17,6 +17,7 @@ The repo at a glance: a Django REST service plus three LangGraph packages.
 |--------------------------------------|-------------------------------------------------------------------------------|
 | [ARCHITECTURE.md](ARCHITECTURE.md)   | Components, datastores, auth, request flows, code layout, design rationale.  |
 | [SETUP.md](SETUP.md)                 | Step-by-step dev setup (conda env, migrate, seed, runserver, Celery worker). |
+| [VM_DEPLOYMENT.md](VM_DEPLOYMENT.md) | Bare-minimum single-VM deploy (Ubuntu / WSL2, Docker DBs, Django + Node).   |
 | [API.md](API.md)                     | Every REST endpoint with request / response examples and error codes.        |
 | [openapi.yaml](openapi.yaml)         | Machine-readable spec — drop into Postman / Swagger UI.                      |
 | [DATA_MODEL.md](DATA_MODEL.md)       | Every Django model, every field, JSONB shapes, foreign-key map.              |
