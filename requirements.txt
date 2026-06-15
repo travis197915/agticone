@@ -83,9 +83,9 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzdata==2026.2
 tzlocal==5.3.1
--e git+https://github.com/admintoystack/uhc-agentic-backend.git@cae85fcb358c091a7ce0f57abcdc10881749435e#egg=uhc_api_agent&subdirectory=uhc-api-agent
--e git+https://github.com/admintoystack/uhc-agentic-backend.git@cae85fcb358c091a7ce0f57abcdc10881749435e#egg=uhc_execution_engine&subdirectory=uhc-execution-engine
--e git+https://github.com/admintoystack/uhc-agentic-backend.git@cae85fcb358c091a7ce0f57abcdc10881749435e#egg=uhc_sop_ingestion&subdirectory=uhc-sop-ingestion
+-e ./uhc-api-agent
+-e ./uhc-execution-engine
+-e ./uhc-sop-ingestion
 urllib3==2.7.0
 uuid_utils==0.15.0
 vine==5.1.0
