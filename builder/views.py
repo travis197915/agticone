@@ -88,6 +88,7 @@ from .serializers import (
 )
 from .services import WorkflowGraphWriter
 from .attachments import attach_to_workflow
+from sop_ir.normalize import extract_all_gotos, extract_goto
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -680,9 +681,28 @@ class WorkflowViewSet(viewsets.ModelViewSet):
                         *(d.system_actions or []),
                     ]
                     cond_parts = [p for p in [d.condition_if, d.condition_and] if p]
+                    # Row-level routing: persisted goto_step, else recover an
+                    # explicit target from any of the row's text fields.
+                    row_goto = d.goto_step
+                    if row_goto is None:
+                        row_goto = extract_goto(" ".join(filter(None, [
+                            d.action_text, d.action_summary, d.condition_if,
+                            d.condition_and, d.output_text,
+                        ])))
+                    # Step-level routing carried only in the step narrative
+                    # (deny branch's "proceed to step 9" left in intro_text).
+                    step_gotos = extract_all_gotos(
+                        " ".join(filter(None, [step.intro_text,
+                                               step.narrative_context,
+                                               step.question]))
+                    )
+                    ref_steps: list[int] = []
+                    for n in ([row_goto] if row_goto is not None else []) + step_gotos:
+                        if n in step_to_keys and n not in ref_steps:
+                            ref_steps.append(n)
                     references: list[str] = []
-                    if d.goto_step is not None and d.goto_step in step_to_keys:
-                        references = step_to_keys[d.goto_step]
+                    for n in ref_steps:
+                        references.extend(step_to_keys[n])
 
                     rule_key  = f"step:{sop.id}:{step.step_number}:{d.row_index}"
                     graph_key = f"step_{step.step_number}_d{d.row_index}"
@@ -723,7 +743,9 @@ class WorkflowViewSet(viewsets.ModelViewSet):
                         "codes":           codes,
                         "is_blocking":     d.is_final,
                         "references":      references,
-                        "goto_step":       d.goto_step,
+                        "goto_step":       row_goto,
+                        "step_goto_step":  (step_gotos[0] if step_gotos else None),
+                        "step_goto_steps": step_gotos,
                         "graph_node_key":  graph_key,
                         "excluded_by":     [],
                         "html_reference":  html_ref,

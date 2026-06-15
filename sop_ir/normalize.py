@@ -111,16 +111,40 @@ def extract_codes(text: str) -> dict[str, list[str]]:
     }
 
 
+_GOTO_VERB_RE = re.compile(
+    r"(?:skip to|proceed to|go to|directly to|jump to)\s+step\s+(\d+)", re.I)
+_GOTO_DIRECTLY_RE = re.compile(r"step\s+(\d+)\s+directly", re.I)
+
+
 def extract_goto(text: str) -> int | None:
-    """Parse 'skip to Step 4', 'proceed to step 9', 'step 8 directly' -> int."""
-    t = (text or "").lower()
-    m = re.search(r"(?:skip to|proceed to|go to|directly to|jump to)\s+step\s+(\d+)", t)
+    """Parse 'skip to Step 4', 'proceed to step 9', 'step 8 directly' -> int.
+
+    Returns the FIRST explicit numbered target. Use :func:`extract_all_gotos`
+    when a block may reference several steps (e.g. a step narrative that both
+    'go to step 6 directly' and 'proceed to step 9')."""
+    t = text or ""
+    m = _GOTO_VERB_RE.search(t)
     if m:
         return int(m.group(1))
-    m = re.search(r"step\s+(\d+)\s+directly", t)
+    m = _GOTO_DIRECTLY_RE.search(t)
     if m:
         return int(m.group(1))
     return None
+
+
+def extract_all_gotos(text: str) -> list[int]:
+    """All explicit numbered routing targets in document order, de-duplicated."""
+    t = text or ""
+    seen: list[int] = []
+    for m in _GOTO_VERB_RE.finditer(t):
+        n = int(m.group(1))
+        if n not in seen:
+            seen.append(n)
+    for m in _GOTO_DIRECTLY_RE.finditer(t):
+        n = int(m.group(1))
+        if n not in seen:
+            seen.append(n)
+    return seen
 
 
 def as_text(v: Any, joiner: str = "\n") -> str:

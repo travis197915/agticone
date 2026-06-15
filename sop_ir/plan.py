@@ -25,15 +25,44 @@ from .normalize import (
 from .schema import Navigation, RuleNode, SopIR, Subrule
 
 
-def _resolve_goto(*texts: str, nav: Optional[Navigation]) -> Optional[int]:
-    """Prefer a structured Navigation hint, else parse it out of free text.
+# Relative routing: "proceed/continue/go/move/advance to (the) next step".
+# This is the verbal equivalent of NavOp.NEXT / NavOp.PROCEED and resolves to
+# the sequentially-following step (current_step + 1).
+_NEXT_STEP_RE = re.compile(
+    r"\b(?:proceed|continue|go|move|advance|on)\s+to\s+(?:the\s+)?next\s+step\b",
+    re.I,
+)
 
-    For the YAML door ``nav`` is always None, so behaviour is identical to the
-    legacy ``_extract_goto`` call. For the HTML/PDF door the maker can emit a
-    structured ``{"op": "goto", "step_number": N}`` and we honour it."""
+
+def _resolve_goto(
+    *texts: str,
+    nav: Optional[Navigation],
+    current_step: Optional[int] = None,
+) -> Optional[int]:
+    """Resolve a concrete target step for a rule/subrule.
+
+    Precedence:
+      1. Structured ``{"op": "goto", "step_number": N}`` (HTML/PDF maker hint).
+      2. Explicit number parsed from free text ("skip to Step 4").
+      3. Relative "next step" — structured ``op in {next, proceed}`` OR the
+         verbal phrase — resolves to ``current_step + 1`` so EVERY routing
+         reference is captured, not just numbered jumps.
+
+    For the YAML door ``nav`` is always None; precedence 2 and 3 still apply."""
     if nav is not None and nav.op.value == "goto" and nav.step_number is not None:
         return nav.step_number
-    return extract_goto(" ".join(t for t in texts if t))
+    blob = " ".join(t for t in texts if t)
+    explicit = extract_goto(blob)
+    if explicit is not None:
+        return explicit
+    # Relative "next step" only resolves for real, 1-based step numbers — a
+    # sentinel step 0 (degenerate ingest) must NOT silently route to step 1.
+    if current_step is not None and current_step >= 1:
+        if nav is not None and nav.op.value in ("next", "proceed"):
+            return current_step + 1
+        if _NEXT_STEP_RE.search(blob):
+            return current_step + 1
+    return None
 
 
 def _plan_rule(rule: RuleNode, ridx: int) -> dict:
@@ -62,6 +91,8 @@ def _plan_rule(rule: RuleNode, ridx: int) -> dict:
     # terminal exclusion that halts the path.
     is_blank = not conditions and not actions and not subrules
     action_blob = " ".join([description] + actions + [output])
+    # Routing can hide in any field (description / conditions), not just actions.
+    goto_blob = " ".join([description] + conditions + actions + [output])
     terminal_action = ""
     is_terminal = False
     m = re.search(r"\(?(F[3-5])\)?\b", (description + " " + " ".join(actions)).upper())
@@ -71,7 +102,7 @@ def _plan_rule(rule: RuleNode, ridx: int) -> dict:
         terminal_action = m.group(1)
 
     children = [
-        _plan_subrule(sr, i, depth=0, parent_oos=step_oos)
+        _plan_subrule(sr, i, depth=0, parent_oos=step_oos, step_number=step_number)
         for i, sr in enumerate(subrules)
     ]
 
@@ -102,7 +133,7 @@ def _plan_rule(rule: RuleNode, ridx: int) -> dict:
             "decision_type": classify_decision(action_blob),
             "tooling_allowed": bool(rule.tooling_allowed),
             "is_out_of_scope": step_oos,
-            "goto_step": _resolve_goto(action_blob, nav=rule.navigation),
+            "goto_step": _resolve_goto(goto_blob, nav=rule.navigation, current_step=step_number),
             "is_final": is_terminal or (step_oos and not is_blank),
             "aggregation": "LEAF",
             "codes": codes,
@@ -124,7 +155,13 @@ def _plan_rule(rule: RuleNode, ridx: int) -> dict:
     }
 
 
-def _plan_subrule(sr: Subrule, idx: int, depth: int, parent_oos: bool) -> dict:
+def _plan_subrule(
+    sr: Subrule,
+    idx: int,
+    depth: int,
+    parent_oos: bool,
+    step_number: Optional[int] = None,
+) -> dict:
     subrule_id = sr.subrule_id
     description = sr.description
     conditions = list(sr.conditions)
@@ -144,7 +181,7 @@ def _plan_subrule(sr: Subrule, idx: int, depth: int, parent_oos: bool) -> dict:
     has_children = bool(sub)
 
     children = [
-        _plan_subrule(s, i, depth=depth + 1, parent_oos=oos)
+        _plan_subrule(s, i, depth=depth + 1, parent_oos=oos, step_number=step_number)
         for i, s in enumerate(sub)
     ]
 
@@ -161,7 +198,9 @@ def _plan_subrule(sr: Subrule, idx: int, depth: int, parent_oos: bool) -> dict:
         "decision_type": classify_decision(" ".join(actions) + " " + description + " " + output),
         "tooling_allowed": bool(sr.tooling_allowed),
         "is_out_of_scope": oos,
-        "goto_step": _resolve_goto(" ".join(actions), output, nav=sr.navigation),
+        "goto_step": _resolve_goto(description, condition_if, condition_and,
+                                   " ".join(actions), output,
+                                   nav=sr.navigation, current_step=step_number),
         "is_final": oos or bool(extract_goto(" ".join(actions)) is None and "stop" in action_text.lower()),
         "aggregation": infer_aggregation(output, has_children),
         "codes": codes,

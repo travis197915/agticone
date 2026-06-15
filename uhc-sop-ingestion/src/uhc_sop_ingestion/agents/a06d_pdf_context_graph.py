@@ -19,6 +19,7 @@ Agents (each ``fn(state, cfg) -> dict``):
   4. ``pdf_context_validator``   — coverage gate: every page represented, every
                                    step/substep wired; one critique-retry on gaps.
 """
+
 from __future__ import annotations
 
 import json
@@ -35,17 +36,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ENTITY_TYPES = {
-    "SECTION", "STEP", "SUBSTEP", "CONDITION", "WARNING", "NOTE",
-    "TABLE", "ROW", "CODE", "REFERENCE",
+    "SECTION",
+    "STEP",
+    "SUBSTEP",
+    "CONDITION",
+    "WARNING",
+    "NOTE",
+    "TABLE",
+    "ROW",
+    "CODE",
+    "REFERENCE",
 }
 _REL_TYPES = {
-    "HAS_STEP", "HAS_SUBSTEP", "HAS_CONDITION", "HAS_ROW", "IN_SECTION",
-    "CONTINUES", "GOTO", "REFERENCES", "APPLIES_TO",
+    "HAS_STEP",
+    "HAS_SUBSTEP",
+    "HAS_CONDITION",
+    "HAS_ROW",
+    "IN_SECTION",
+    "CONTINUES",
+    "GOTO",
+    "REFERENCES",
+    "APPLIES_TO",
 }
-_PAGE_BATCH = 4   # pages per entity-extraction call — small so output never truncates
+_PAGE_BATCH = 4  # pages per entity-extraction call — small so output never truncates
 
 
 # ── page serialization (perception -> compact text the reasoner reads) ────────
+
 
 def _page_to_text(page: dict) -> str:
     lines: list[str] = []
@@ -68,17 +85,22 @@ def _page_to_text(page: dict) -> str:
 
 # ── 1. pdf_entity_extractor ───────────────────────────────────────────────────
 
-_ENTITY_SCHEMA_HINT = json.dumps({
-    "entities": [{
-        "id": "str — unique within THIS batch (e.g. 'n1','n2')",
-        "type": "SECTION | STEP | SUBSTEP | CONDITION | WARNING | NOTE | TABLE | ROW | CODE | REFERENCE",
-        "label": "short human label",
-        "text": "verbatim text (full, not summarised)",
-        "page": "int — page this entity is on",
-        "step_number": "int|null — the numbered step this belongs to, if any",
-        "parent_ref": "id of the enclosing entity in THIS batch, or '' ",
-    }],
-}, indent=2)
+_ENTITY_SCHEMA_HINT = json.dumps(
+    {
+        "entities": [
+            {
+                "id": "str — unique within THIS batch (e.g. 'n1','n2')",
+                "type": "SECTION | STEP | SUBSTEP | CONDITION | WARNING | NOTE | TABLE | ROW | CODE | REFERENCE",
+                "label": "short human label",
+                "text": "verbatim text (full, not summarised)",
+                "page": "int — page this entity is on",
+                "step_number": "int|null — the numbered step this belongs to, if any",
+                "parent_ref": "id of the enclosing entity in THIS batch, or '' ",
+            }
+        ],
+    },
+    indent=2,
+)
 
 
 def _extract_entities_for_pages(cfg, pages: list[dict], batch_tag: str) -> list[dict]:
@@ -111,7 +133,9 @@ Return STRICT JSON matching:
 {_ENTITY_SCHEMA_HINT}
 """
     result = _llm_call(
-        cfg, prompt, fallback={"entities": []},
+        cfg,
+        prompt,
+        fallback={"entities": []},
         agent_name="pdf_entity_extractor",
         provider="anthropic",
         expected_type=dict,
@@ -138,15 +162,17 @@ Return STRICT JSON matching:
         if etype not in _ENTITY_TYPES:
             etype = "NOTE"
         parent_local = str(e.get("parent_ref") or "")
-        out.append({
-            "id": idmap.get(local, f"{batch_tag}_{local}"),
-            "type": etype,
-            "label": str(e.get("label") or "")[:200],
-            "text": str(e.get("text") or "")[:4000],
-            "page": e.get("page"),
-            "step_number": e.get("step_number"),
-            "parent_ref": idmap.get(parent_local, "") if parent_local else "",
-        })
+        out.append(
+            {
+                "id": idmap.get(local, f"{batch_tag}_{local}"),
+                "type": etype,
+                "label": str(e.get("label") or "")[:200],
+                "text": str(e.get("text") or "")[:4000],
+                "page": e.get("page"),
+                "step_number": e.get("step_number"),
+                "parent_ref": idmap.get(parent_local, "") if parent_local else "",
+            }
+        )
     return out
 
 
@@ -158,27 +184,33 @@ def pdf_entity_extractor(state: "PipelineState", cfg: "PipelineConfig") -> dict:
 
     entities: list[dict] = []
     for start in range(0, len(pages), _PAGE_BATCH):
-        batch = pages[start:start + _PAGE_BATCH]
+        batch = pages[start : start + _PAGE_BATCH]
         tag = f"b{start // _PAGE_BATCH}"
         entities.extend(_extract_entities_for_pages(cfg, batch, tag))
 
     ctx_write(cfg, job_id, "entities", entities)
-    logger.info("pdf_entity_extractor: %d entities across %d pages",
-                len(entities), len(pages))
+    logger.info(
+        "pdf_entity_extractor: %d entities across %d pages", len(entities), len(pages)
+    )
     return {}
 
 
 # ── 2. pdf_relation_reasoner ──────────────────────────────────────────────────
 
-_RELATION_SCHEMA_HINT = json.dumps({
-    "relations": [{
-        "source": "entity id",
-        "target": "entity id",
-        "rel": "HAS_STEP | HAS_SUBSTEP | HAS_CONDITION | HAS_ROW | IN_SECTION | "
-               "CONTINUES | GOTO | REFERENCES | APPLIES_TO",
-        "label": "optional guard/branch label, else ''",
-    }],
-}, indent=2)
+_RELATION_SCHEMA_HINT = json.dumps(
+    {
+        "relations": [
+            {
+                "source": "entity id",
+                "target": "entity id",
+                "rel": "HAS_STEP | HAS_SUBSTEP | HAS_CONDITION | HAS_ROW | IN_SECTION | "
+                "CONTINUES | GOTO | REFERENCES | APPLIES_TO",
+                "label": "optional guard/branch label, else ''",
+            }
+        ],
+    },
+    indent=2,
+)
 
 
 def pdf_relation_reasoner(state: "PipelineState", cfg: "PipelineConfig") -> dict:
@@ -204,14 +236,25 @@ def pdf_relation_reasoner(state: "PipelineState", cfg: "PipelineConfig") -> dict
                 ("TABLE", "ROW"): "HAS_ROW",
             }.get((ptype, etype))
             if rel is None:
-                rel = "HAS_CONDITION" if etype in {"CONDITION", "WARNING", "NOTE"} else "IN_SECTION"
-            relations.append({"source": parent, "target": e["id"], "rel": rel, "label": ""})
+                rel = (
+                    "HAS_CONDITION"
+                    if etype in {"CONDITION", "WARNING", "NOTE"}
+                    else "IN_SECTION"
+                )
+            relations.append(
+                {"source": parent, "target": e["id"], "rel": rel, "label": ""}
+            )
 
-    brief = [{
-        "id": e["id"], "type": e["type"], "page": e.get("page"),
-        "step_number": e.get("step_number"),
-        "text": (e.get("text") or "")[:200],
-    } for e in entities]
+    brief = [
+        {
+            "id": e["id"],
+            "type": e["type"],
+            "page": e.get("page"),
+            "step_number": e.get("step_number"),
+            "text": (e.get("text") or "")[:200],
+        }
+        for e in entities
+    ]
 
     prompt = f"""You are a claims-audit routing reasoner. Below is the entity list
 extracted from one SOP (ids, types, page, step_number, text). Infer the
@@ -231,7 +274,9 @@ Entities:
 {json.dumps(brief, indent=2)[:48000]}
 """
     result = _llm_call(
-        cfg, prompt, fallback={"relations": []},
+        cfg,
+        prompt,
+        fallback={"relations": []},
         agent_name="pdf_relation_reasoner",
         provider="anthropic",
         expected_type=dict,
@@ -250,19 +295,30 @@ Entities:
             key = (src, tgt, rel)
             if key not in seen:
                 seen.add(key)
-                relations.append({"source": src, "target": tgt, "rel": rel,
-                                  "label": str(r.get("label") or "")[:200]})
+                relations.append(
+                    {
+                        "source": src,
+                        "target": tgt,
+                        "rel": rel,
+                        "label": str(r.get("label") or "")[:200],
+                    }
+                )
 
     ctx_write(cfg, job_id, "relations", relations)
-    logger.info("pdf_relation_reasoner: %d relations (%d structural seeds + LLM)",
-                len(relations), len(relations) - len(llm_rels) if llm_rels else len(relations))
+    logger.info(
+        "pdf_relation_reasoner: %d relations (%d structural seeds + LLM)",
+        len(relations),
+        len(relations) - len(llm_rels) if llm_rels else len(relations),
+    )
     return {}
 
 
 # ── 3. pdf_context_graph_writer ───────────────────────────────────────────────
 
+
 def _neo4j(cfg):
     from ..config import get_neo4j
+
     return get_neo4j(cfg)
 
 
@@ -286,7 +342,10 @@ def pdf_context_graph_writer(state: "PipelineState", cfg: "PipelineConfig") -> d
                 MERGE (d:PdfDoc {job_id:$job, content_hash:$ch})
                 SET d.title=$title, d.url=$url, d.page_count=$pc
                 """,
-                job=job_id, ch=content_hash, title=title, url=url,
+                job=job_id,
+                ch=content_hash,
+                title=title,
+                url=url,
                 pc=state.get("pdf_page_count", 0),
             )
             # Nodes — a single :PdfNode label + a `type` property keeps the write
@@ -302,7 +361,9 @@ def pdf_context_graph_writer(state: "PipelineState", cfg: "PipelineConfig") -> d
                 MATCH (d:PdfDoc {job_id:$job, content_hash:$ch})
                 MERGE (d)-[:HAS_NODE]->(n)
                 """,
-                rows=entities, job=job_id, ch=content_hash,
+                rows=entities,
+                job=job_id,
+                ch=content_hash,
             )
             if relations:
                 sess.run(
@@ -313,18 +374,26 @@ def pdf_context_graph_writer(state: "PipelineState", cfg: "PipelineConfig") -> d
                     MERGE (a)-[r:PDF_REL {rel:rel.rel}]->(b)
                     SET r.label=rel.label
                     """,
-                    rels=relations, job=job_id,
+                    rels=relations,
+                    job=job_id,
                 )
-        logger.info("pdf_context_graph_writer: wrote %d nodes / %d edges to Neo4j",
-                    len(entities), len(relations))
+        logger.info(
+            "pdf_context_graph_writer: wrote %d nodes / %d edges to Neo4j",
+            len(entities),
+            len(relations),
+        )
         return {"pdf_context_graph_id": f"{job_id}:{content_hash}"}
     except Exception as exc:
-        logger.warning("pdf_context_graph_writer: Neo4j write failed (%s) — "
-                       "context graph still lives on the Redis blackboard", exc)
+        logger.warning(
+            "pdf_context_graph_writer: Neo4j write failed (%s) — "
+            "context graph still lives on the Redis blackboard",
+            exc,
+        )
         return {}
 
 
 # ── 4. pdf_context_validator ──────────────────────────────────────────────────
+
 
 def pdf_context_validator(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     job_id = state.get("job_id", "")
@@ -333,40 +402,61 @@ def pdf_context_validator(state: "PipelineState", cfg: "PipelineConfig") -> dict
     if not pages:
         return {}
 
-    page_nums = {p.get("page_number") for p in pages if isinstance(p.get("page_number"), int)}
+    page_nums = {
+        p.get("page_number") for p in pages if isinstance(p.get("page_number"), int)
+    }
     covered = {e.get("page") for e in entities if isinstance(e.get("page"), int)}
     missing = sorted(n for n in page_nums if n not in covered)
 
     warnings = list(state.get("validation_warnings") or [])
     if missing:
-        logger.warning("pdf_context_validator: %d page(s) had no entities: %s — "
-                       "re-extracting", len(missing), missing)
+        logger.warning(
+            "pdf_context_validator: %d page(s) had no entities: %s — " "re-extracting",
+            len(missing),
+            missing,
+        )
         # One critique-retry: re-extract ONLY the uncovered pages and append.
         retry_pages = [p for p in pages if p.get("page_number") in set(missing)]
         extra: list[dict] = []
         for start in range(0, len(retry_pages), _PAGE_BATCH):
-            batch = retry_pages[start:start + _PAGE_BATCH]
-            extra.extend(_extract_entities_for_pages(cfg, batch, f"retry{start // _PAGE_BATCH}"))
+            batch = retry_pages[start : start + _PAGE_BATCH]
+            extra.extend(
+                _extract_entities_for_pages(cfg, batch, f"retry{start // _PAGE_BATCH}")
+            )
         if extra:
             entities = entities + extra
             ctx_write(cfg, job_id, "entities", entities)
-            covered = {e.get("page") for e in entities if isinstance(e.get("page"), int)}
+            covered = {
+                e.get("page") for e in entities if isinstance(e.get("page"), int)
+            }
             missing = sorted(n for n in page_nums if n not in covered)
 
     if missing:
-        warnings.append(f"PDF context graph: {len(missing)} page(s) still without "
-                        f"entities after retry: {missing}")
+        warnings.append(
+            f"PDF context graph: {len(missing)} page(s) still without "
+            f"entities after retry: {missing}"
+        )
 
     coverage_ok = not missing
-    ctx_write(cfg, job_id, "context_validation", {
-        "page_count": len(page_nums),
-        "covered_pages": len(covered),
-        "missing_pages": missing,
-        "entity_count": len(entities),
-        "coverage_ok": coverage_ok,
-    })
-    logger.info("pdf_context_validator: coverage_ok=%s (%d/%d pages, %d entities)",
-                coverage_ok, len(covered), len(page_nums), len(entities))
+    ctx_write(
+        cfg,
+        job_id,
+        "context_validation",
+        {
+            "page_count": len(page_nums),
+            "covered_pages": len(covered),
+            "missing_pages": missing,
+            "entity_count": len(entities),
+            "coverage_ok": coverage_ok,
+        },
+    )
+    logger.info(
+        "pdf_context_validator: coverage_ok=%s (%d/%d pages, %d entities)",
+        coverage_ok,
+        len(covered),
+        len(page_nums),
+        len(entities),
+    )
     return {"validation_warnings": warnings} if warnings else {}
 
 
@@ -379,6 +469,7 @@ def pdf_context_validator(state: "PipelineState", cfg: "PipelineConfig") -> dict
 # fragment of a step (listing all its contributing entity ids) and dropping
 # entities that are not really part of the numbered Step/Action procedure.
 
+
 def _deterministic_step_plan(step_entities: list[dict]) -> list[dict]:
     """LLM-free fallback: merge STEP entities by number. The shortest, most
     header-like text per number becomes the question; all ids are kept."""
@@ -389,26 +480,36 @@ def _deterministic_step_plan(step_entities: list[dict]) -> list[dict]:
     for num in sorted(by_num):
         frags = by_num[num]
         primary = min(frags, key=lambda e: len(e.get("text") or e.get("label") or ""))
-        plan.append({
-            "step_number": num,
-            "question": (primary.get("label") or primary.get("text") or "")[:500],
-            "entity_ids": [e["id"] for e in frags],
-        })
+        plan.append(
+            {
+                "step_number": num,
+                "question": (primary.get("label") or primary.get("text") or "")[:500],
+                "entity_ids": [e["id"] for e in frags],
+            }
+        )
     return plan
 
 
 def pdf_step_reconciler(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     job_id = state.get("job_id", "")
     entities = ctx_read(cfg, job_id, "entities", default=[]) or []
-    step_entities = [e for e in entities
-                     if e.get("type") == "STEP" and isinstance(e.get("step_number"), int)]
+    step_entities = [
+        e
+        for e in entities
+        if e.get("type") == "STEP" and isinstance(e.get("step_number"), int)
+    ]
     if not step_entities:
         return {}
 
-    outline = [{
-        "id": e["id"], "page": e.get("page"), "step_number": e["step_number"],
-        "text": (e.get("label") or e.get("text") or "")[:240],
-    } for e in step_entities]
+    outline = [
+        {
+            "id": e["id"],
+            "page": e.get("page"),
+            "step_number": e["step_number"],
+            "text": (e.get("label") or e.get("text") or "")[:240],
+        }
+        for e in step_entities
+    ]
 
     prompt = f"""You are reconciling the numbered procedure steps of ONE claims-audit
 SOP. Below is every entity that was tagged as a STEP across all pages (read in
@@ -430,7 +531,9 @@ STEP entities:
 Return STRICT JSON: {{"steps":[{{"step_number":int,"question":str,"entity_ids":[str,...]}}]}}
 """
     result = _llm_call(
-        cfg, prompt, fallback={"steps": []},
+        cfg,
+        prompt,
+        fallback={"steps": []},
         agent_name="pdf_step_reconciler",
         provider="anthropic",
         expected_type=dict,
@@ -446,19 +549,24 @@ Return STRICT JSON: {{"steps":[{{"step_number":int,"question":str,"entity_ids":[
         if not isinstance(s, dict) or not isinstance(s.get("step_number"), int):
             continue
         ids = [i for i in (s.get("entity_ids") or []) if i in valid_ids]
-        clean.append({
-            "step_number": s["step_number"],
-            "question": str(s.get("question") or "")[:500],
-            "entity_ids": ids,
-        })
+        clean.append(
+            {
+                "step_number": s["step_number"],
+                "question": str(s.get("question") or "")[:500],
+                "entity_ids": ids,
+            }
+        )
 
     # Guardrail: if the LLM dropped/merged so aggressively that a detected step
     # number vanished, fall back to the deterministic merge so nothing is lost.
     llm_nums = {s["step_number"] for s in clean}
     all_nums = {e["step_number"] for e in step_entities}
     if not clean or (all_nums - llm_nums):
-        logger.warning("pdf_step_reconciler: LLM plan missing %s — using deterministic "
-                       "merge fallback", sorted(all_nums - llm_nums))
+        logger.warning(
+            "pdf_step_reconciler: LLM plan missing %s — using deterministic "
+            "merge fallback",
+            sorted(all_nums - llm_nums),
+        )
         clean = _deterministic_step_plan(step_entities)
 
     # collapse any accidental duplicate numbers the LLM may still emit
@@ -466,7 +574,9 @@ Return STRICT JSON: {{"steps":[{{"step_number":int,"question":str,"entity_ids":[
     for s in clean:
         n = s["step_number"]
         if n in merged:
-            merged[n]["entity_ids"] = list(dict.fromkeys(merged[n]["entity_ids"] + s["entity_ids"]))
+            merged[n]["entity_ids"] = list(
+                dict.fromkeys(merged[n]["entity_ids"] + s["entity_ids"])
+            )
         else:
             merged[n] = s
 
@@ -477,8 +587,9 @@ Return STRICT JSON: {{"steps":[{{"step_number":int,"question":str,"entity_ids":[
     # failed to tag is still synthesised from its page window.
     by_id = {e["id"]: e for e in entities}
     pages = ctx_read(cfg, job_id, "pages", default=[]) or []
-    page_nums = sorted(p.get("page_number") for p in pages
-                       if isinstance(p.get("page_number"), int))
+    page_nums = sorted(
+        p.get("page_number") for p in pages if isinstance(p.get("page_number"), int)
+    )
     max_page = page_nums[-1] if page_nums else 1
 
     present = sorted(merged)
@@ -505,21 +616,26 @@ Return STRICT JSON: {{"steps":[{{"step_number":int,"question":str,"entity_ids":[
     for idx, n in enumerate(full):
         start = page_of[n] or 1
         nb = full[idx + 1] if idx + 1 < len(full) else None
-        end = (page_of[nb] if nb and page_of[nb] else max_page)
+        end = page_of[nb] if nb and page_of[nb] else max_page
         if end < start:
             end = start
-        final.append({
-            "step_number": n,
-            "question": (merged.get(n, {}).get("question") or "")[:500],
-            "start_page": start,
-            "end_page": end,
-            "entity_ids": merged.get(n, {}).get("entity_ids", []),
-        })
+        final.append(
+            {
+                "step_number": n,
+                "question": (merged.get(n, {}).get("question") or "")[:500],
+                "start_page": start,
+                "end_page": end,
+                "entity_ids": merged.get(n, {}).get("entity_ids", []),
+            }
+        )
 
     ctx_write(cfg, job_id, "step_plan", final)
-    logger.info("pdf_step_reconciler: %d STEP entities -> %d authoritative steps %s",
-                len(step_entities), len(final),
-                [(s["step_number"], s["start_page"], s["end_page"]) for s in final])
+    logger.info(
+        "pdf_step_reconciler: %d STEP entities -> %d authoritative steps %s",
+        len(step_entities),
+        len(final),
+        [(s["step_number"], s["start_page"], s["end_page"]) for s in final],
+    )
     return {}
 
 
@@ -550,17 +666,22 @@ def _entity_pages(entity_ids: list[str], by_id: dict) -> list[int]:
 # experimentation; wire it into graph.py only after validating it beats the
 # page-range path on the target corpus.
 
-_SEGMENT_SCHEMA_HINT = json.dumps({
-    "segments": [{
-        "step_number": "int — the numbered step this text belongs to",
-        "kind": "question | context | table",
-        "text": "verbatim text for this segment — copy every word",
-    }],
-    "ending_step": "int|null — the step still OPEN at the very end of these pages "
-                   "(its table/notes continue onto the next page), else null",
-}, indent=2)
+_SEGMENT_SCHEMA_HINT = json.dumps(
+    {
+        "segments": [
+            {
+                "step_number": "int — the numbered step this text belongs to",
+                "kind": "question | context | table",
+                "text": "verbatim text for this segment — copy every word",
+            }
+        ],
+        "ending_step": "int|null — the step still OPEN at the very end of these pages "
+        "(its table/notes continue onto the next page), else null",
+    },
+    indent=2,
+)
 
-_TRACK_WINDOW = 3   # pages per tracking call — small so context stays tight
+_TRACK_WINDOW = 3  # pages per tracking call — small so context stays tight
 
 
 def pdf_reading_context_tracker(state: "PipelineState", cfg: "PipelineConfig") -> dict:
@@ -570,31 +691,37 @@ def pdf_reading_context_tracker(state: "PipelineState", cfg: "PipelineConfig") -
     if not pages or not step_plan:
         return {}
 
-    known = [{"step_number": s["step_number"], "question": (s.get("question") or "")[:200]}
-             for s in sorted(step_plan, key=lambda x: x.get("step_number", 0))
-             if isinstance(s.get("step_number"), int)]
+    known = [
+        {"step_number": s["step_number"], "question": (s.get("question") or "")[:200]}
+        for s in sorted(step_plan, key=lambda x: x.get("step_number", 0))
+        if isinstance(s.get("step_number"), int)
+    ]
     known_nums = {k["step_number"] for k in known}
     if not known_nums:
         return {}
 
-    ordered = sorted((p for p in pages if isinstance(p.get("page_number"), int)),
-                     key=lambda p: p["page_number"])
+    ordered = sorted(
+        (p for p in pages if isinstance(p.get("page_number"), int)),
+        key=lambda p: p["page_number"],
+    )
 
     seg_map: dict[int, list[str]] = {}
     current_step: int | None = None
     open_tail = ""
 
     for start in range(0, len(ordered), _TRACK_WINDOW):
-        window = ordered[start:start + _TRACK_WINDOW]
+        window = ordered[start : start + _TRACK_WINDOW]
         body = "\n\n".join(_page_to_text(p) for p in window)
         if current_step is not None:
-            ctx_line = (f"RUNNING CONTEXT: the previous page ended inside Step "
-                        f"{current_step}, whose content so far ENDS with:\n\"\"\"\n"
-                        f"{open_tail[-800:]}\n\"\"\"\nUse this ONLY as a hint: if the "
-                        "first lines below genuinely continue that same text "
-                        f"(e.g. a table cell that wrapped onto this page), they "
-                        f"belong to Step {current_step}. Otherwise attribute them "
-                        "to whichever step they actually match.")
+            ctx_line = (
+                f"RUNNING CONTEXT: the previous page ended inside Step "
+                f'{current_step}, whose content so far ENDS with:\n"""\n'
+                f'{open_tail[-800:]}\n"""\nUse this ONLY as a hint: if the '
+                "first lines below genuinely continue that same text "
+                f"(e.g. a table cell that wrapped onto this page), they "
+                f"belong to Step {current_step}. Otherwise attribute them "
+                "to whichever step they actually match."
+            )
         else:
             ctx_line = "RUNNING CONTEXT: no step is open yet."
 
@@ -634,7 +761,9 @@ Return STRICT JSON matching:
 {_SEGMENT_SCHEMA_HINT}
 """
         result = _llm_call(
-            cfg, prompt, fallback={"segments": []},
+            cfg,
+            prompt,
+            fallback={"segments": []},
             agent_name="pdf_reading_context_tracker",
             provider="anthropic",
             expected_type=dict,
@@ -661,6 +790,10 @@ Return STRICT JSON matching:
 
     step_segments = {str(n): "\n".join(parts) for n, parts in seg_map.items() if parts}
     ctx_write(cfg, job_id, "step_segments", step_segments)
-    logger.info("pdf_reading_context_tracker: assigned read-time content to %d/%d "
-                "steps %s", len(step_segments), len(known_nums), sorted(seg_map))
+    logger.info(
+        "pdf_reading_context_tracker: assigned read-time content to %d/%d " "steps %s",
+        len(step_segments),
+        len(known_nums),
+        sorted(seg_map),
+    )
     return {}

@@ -8,9 +8,33 @@ the binding row only carries the auditor-editable overrides.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+_GOTO_VERB_RE = re.compile(
+    r"(?:skip to|proceed to|go to|directly to|jump to)\s+step\s+(\d+)", re.I)
+_GOTO_DIRECTLY_RE = re.compile(r"step\s+(\d+)\s+directly", re.I)
+
+
+def _first_goto(*texts: str) -> int | None:
+    """First explicit numbered routing target across the given text blobs."""
+    blob = " ".join(t for t in texts if t)
+    m = _GOTO_VERB_RE.search(blob) or _GOTO_DIRECTLY_RE.search(blob)
+    return int(m.group(1)) if m else None
+
+
+def _all_gotos(*texts: str) -> list[int]:
+    """All explicit numbered routing targets (document order, de-duplicated)."""
+    blob = " ".join(t for t in texts if t)
+    seen: list[int] = []
+    for rx in (_GOTO_VERB_RE, _GOTO_DIRECTLY_RE):
+        for m in rx.finditer(blob):
+            n = int(m.group(1))
+            if n not in seen:
+                seen.append(n)
+    return seen
 
 
 def _split_key(rule_key: str) -> tuple[str, list[str]]:
@@ -65,6 +89,24 @@ def _hydrate_decision(sop, step, dec, override_condition: str,
     section_label = f"Step {step.step_number}"
     if step.question:
         section_label += f": {step.question}"
+
+    # Routing: prefer the persisted goto_step, else recover an explicit target
+    # from ANY of the row's text fields (the LLM sometimes lands the phrase in
+    # condition/description rather than the action).
+    row_goto = dec.goto_step
+    if row_goto is None:
+        row_goto = _first_goto(
+            dec.action_text or "", dec.action_summary or "",
+            dec.condition_if or "", dec.condition_and or "",
+            dec.output_text or "",
+        )
+    # Step-level routing carried only in the step narrative (e.g. a deny branch
+    # whose "directly proceed to step 9" survives in intro_text). Surfaced as a
+    # labeled field so the engine/UI can honour the step's default next-hop(s).
+    step_narrative = " ".join(
+        t for t in [step.intro_text, step.narrative_context, step.question] if t
+    )
+    step_gotos = _all_gotos(step_narrative)
     return {
         "key":               f"step:{sop.id}:{step.step_number}:{dec.row_index}",
         "sop_id":            sop.id,
@@ -89,7 +131,11 @@ def _hydrate_decision(sop, step, dec, override_condition: str,
         "is_final":          bool(dec.is_final),
         "aggregation":       dec.aggregation or "LEAF",
         "applicable_when":   (getattr(dec, "applicable_when", "") or "").strip(),
-        "goto_step":         dec.goto_step,
+        "goto_step":         row_goto,
+        # Step's default next-hop(s) parsed from the narrative — used when no
+        # row-level goto fires and rendered as a labeled "Step N" reference.
+        "step_goto_step":    (step_gotos[0] if step_gotos else None),
+        "step_goto_steps":   step_gotos,
         # ── Hierarchy metadata so the canvas/inspector can render nested
         # sub-rules (a parent row at depth 0 + its depth>0 children) instead of
         # a flat list. ``row_index`` is the step-global document order.
