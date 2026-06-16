@@ -1,4 +1,4 @@
-"""Load MODEL_REGISTRY / AGENT_MODEL_MAP from JSON files or inline env JSON."""
+"""Load MODEL_REGISTRY / AGENT_MODEL_MAP from env secrets, files, or bundled profiles."""
 from __future__ import annotations
 
 import json
@@ -67,6 +67,31 @@ def _resolve_config_source(env_value: str, *, subdir: str, label: str) -> tuple[
     return _load_json_file(path, label), f"{label}:{path}"
 
 
+def _load_registry_entries() -> tuple[dict[str, Any], str]:
+    """Load raw model registry entries.
+
+    Priority (first match wins):
+    1. ``MODEL_REGISTRY_JSON`` — full JSON string in env (recommended for secrets)
+    2. ``MODEL_REGISTRY_FILE`` — path to a gitignored local JSON file
+    3. ``MODEL_REGISTRY`` — inline JSON, profile name, or file path
+    """
+    json_env = _env("MODEL_REGISTRY_JSON")
+    if json_env:
+        return _parse_json_object(json_env, "MODEL_REGISTRY_JSON"), "MODEL_REGISTRY_JSON"
+
+    file_env = _env("MODEL_REGISTRY_FILE")
+    if file_env:
+        path = Path(file_env).expanduser()
+        if not path.is_file():
+            raise RuntimeError(f"MODEL_REGISTRY_FILE not found: {path}")
+        return _load_json_file(path, "MODEL_REGISTRY_FILE"), f"MODEL_REGISTRY_FILE:{path}"
+
+    raw = _env("MODEL_REGISTRY")
+    if not raw:
+        return {}, ""
+    return _resolve_config_source(raw, subdir="registries", label="MODEL_REGISTRY")
+
+
 def _build_model_specs(entries: dict[str, Any]) -> dict[str, ModelSpec]:
     specs: dict[str, ModelSpec] = {}
     for name, entry in entries.items():
@@ -91,13 +116,10 @@ def _build_model_specs(entries: dict[str, Any]) -> dict[str, ModelSpec]:
 
 @lru_cache(maxsize=1)
 def load_model_registry() -> dict[str, ModelSpec]:
-    """Load models from ``MODEL_REGISTRY`` profile name, file path, or inline JSON."""
-    raw = _env("MODEL_REGISTRY")
-    if not raw:
+    """Load models from env secrets, ``MODEL_REGISTRY`` profile, or inline JSON."""
+    data, _source = _load_registry_entries()
+    if not data:
         return {}
-    data, _source = _resolve_config_source(
-        raw, subdir="registries", label="MODEL_REGISTRY",
-    )
     return _build_model_specs(data)
 
 
@@ -114,7 +136,11 @@ def load_agent_model_map() -> dict[str, str]:
 
 
 def registry_profile_name() -> str:
-    """Human-readable selector currently configured for MODEL_REGISTRY."""
+    """Human-readable source for the active model registry."""
+    if _env("MODEL_REGISTRY_JSON"):
+        return "MODEL_REGISTRY_JSON"
+    if _env("MODEL_REGISTRY_FILE"):
+        return f"MODEL_REGISTRY_FILE:{_env('MODEL_REGISTRY_FILE')}"
     return _env("MODEL_REGISTRY") or ""
 
 
@@ -145,8 +171,9 @@ def resolve_registry_model_name(agent_name: str) -> str:
     registry = load_model_registry()
     if not registry:
         raise RuntimeError(
-            "MODEL_REGISTRY is not set but registry backend is active. "
-            "Set MODEL_REGISTRY to a profile name (e.g. uhg-gateway) or a .json path."
+            "Registry backend is active but no models are configured. "
+            "Set MODEL_REGISTRY_JSON (recommended), MODEL_REGISTRY_FILE, or "
+            "MODEL_REGISTRY to a profile name / inline JSON."
         )
 
     model_name = global_registry_model_name()
@@ -158,14 +185,13 @@ def resolve_registry_model_name(agent_name: str) -> str:
             return next(iter(registry))
         raise RuntimeError(
             f"No model configured for agent {agent_name!r}. "
-            f"Set LLM_MODEL to a key from MODEL_REGISTRY profile "
-            f"{registry_profile_name()!r} (recommended for app-wide routing), "
-            f"or set AGENT_MODEL_MAP. Known models: {sorted(registry)}"
+            f"Set LLM_MODEL to a key from the active registry "
+            f"({registry_profile_name()!r}). Known models: {sorted(registry)}"
         )
     if model_name not in registry:
         raise RuntimeError(
             f"Resolved model {model_name!r} for agent {agent_name!r} "
-            f"is not in MODEL_REGISTRY profile {registry_profile_name()!r}. "
+            f"is not in the active registry ({registry_profile_name()!r}). "
             f"Known models: {sorted(registry)}"
         )
     return model_name
@@ -176,7 +202,7 @@ def get_model_spec(model_name: str) -> ModelSpec:
     spec = registry.get(model_name)
     if spec is None:
         raise RuntimeError(
-            f"Model {model_name!r} not found in MODEL_REGISTRY profile "
-            f"{registry_profile_name()!r}. Known: {sorted(registry)}"
+            f"Model {model_name!r} not found in registry "
+            f"({registry_profile_name()!r}). Known: {sorted(registry)}"
         )
     return spec

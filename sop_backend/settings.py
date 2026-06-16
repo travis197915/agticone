@@ -27,6 +27,29 @@ _TOOLS_ENV_FILE = BASE_DIR / "agent_tools" / ".env.tools"
 if _TOOLS_ENV_FILE.exists():
     load_dotenv(_TOOLS_ENV_FILE, override=False)
 
+# ── Validate LLM registry config early (Option A: MODEL_REGISTRY_JSON) ─────
+if os.environ.get("LLM_BACKEND", "").strip().lower() == "registry":
+    try:
+        from uhc_llm.registry import load_model_registry, registry_profile_name
+        _llm_registry = load_model_registry()
+        if not _llm_registry:
+            import warnings
+            warnings.warn(
+                "LLM_BACKEND=registry but no models loaded. "
+                "Set MODEL_REGISTRY_JSON in .env (see .env.example).",
+                stacklevel=1,
+            )
+        elif not os.environ.get("AI_GATEWAY_API_KEY", "").strip():
+            import warnings
+            warnings.warn(
+                f"LLM registry loaded from {registry_profile_name()!r} "
+                f"({len(_llm_registry)} models) but AI_GATEWAY_API_KEY is empty.",
+                stacklevel=1,
+            )
+    except Exception as _llm_exc:
+        import warnings
+        warnings.warn(f"LLM registry config invalid: {_llm_exc}", stacklevel=1)
+
 # ── Core ──────────────────────────────────────────────────────────────────────
 SECRET_KEY    = os.environ.get("DJANGO_SECRET_KEY", "django-insecure-v2-dev-only")
 DEBUG         = os.environ.get("DJANGO_DEBUG", "true").lower() in {"1", "true", "yes"}

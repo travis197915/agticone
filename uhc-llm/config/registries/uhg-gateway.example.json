@@ -1,18 +1,18 @@
 {
   "gpt-5-mini": {
     "kind": "azure_openai",
-    "endpoint": "https://api.uhg.com/api/cloud/api-management/ai-gateway-reasoning/1.0",
+    "endpoint": "https://YOUR-GATEWAY-HOST/api/cloud/api-management/ai-gateway-reasoning/1.0",
     "deployment": "gpt-5-mini_2025-08-07",
     "api_version": "2025-01-01-preview"
   },
   "llama": {
     "kind": "openai_compat",
-    "endpoint": "https://api.uhg.com/api/cloud/api-management/ai-gateway/1.0",
+    "endpoint": "https://YOUR-GATEWAY-HOST/api/cloud/api-management/ai-gateway/1.0",
     "deployment": "llama-3-3_70b-instruct"
   },
   "opus": {
     "kind": "bedrock_claude",
-    "endpoint": "https://api.uhg.com/api/cloud/api-management/ai-gateway/1.0",
+    "endpoint": "https://YOUR-GATEWAY-HOST/api/cloud/api-management/ai-gateway/1.0",
     "deployment": "us.anthropic.claude-opus-4-6-v1"
   }
 }

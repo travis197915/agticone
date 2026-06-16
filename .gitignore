@@ -3,6 +3,11 @@
 .env.*
 !.env.example
 
+# UHG gateway registry — real endpoints belong in .env / local files only
+uhc-llm/config/registries/uhg-gateway.json
+secrets/
+**/model-registry.local.json
+
 # ── Python bytecode & caches ─────────────────────────────────────────────
 __pycache__/
 *.py[cod]
