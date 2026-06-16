@@ -6,6 +6,8 @@ from typing import Any
 
 from django.db import transaction
 
+from sop_ingestion.db_utils import call_with_db_retry
+
 from uhc_sop_ingestion.revision import (
     normalize_canonical_url,
     normalize_revision_date,
@@ -189,7 +191,7 @@ def compute_sop_diff(from_sop: AuditSop, to_sop: AuditSop) -> dict[str, Any]:
 
 
 @transaction.atomic
-def register_sop_version(
+def _register_sop_version_impl(
     sop_id: int,
     *,
     prior_sop_id: int | None,
@@ -279,6 +281,27 @@ def register_sop_version(
         payload["summary"].get("total_changes", 0),
     )
     return diff
+
+
+def register_sop_version(
+    sop_id: int,
+    *,
+    prior_sop_id: int | None,
+    version_action: str,
+    canonical_url: str,
+    revision_date: str,
+    auto_activate: bool = True,
+) -> SopVersionDiff | None:
+    """Public entry — refreshes stale worker connections before the atomic write."""
+    return call_with_db_retry(
+        _register_sop_version_impl,
+        sop_id,
+        prior_sop_id=prior_sop_id,
+        version_action=version_action,
+        canonical_url=canonical_url,
+        revision_date=revision_date,
+        auto_activate=auto_activate,
+    )
 
 
 @transaction.atomic

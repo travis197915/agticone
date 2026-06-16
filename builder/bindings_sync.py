@@ -317,15 +317,12 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
     # the shape is reused instead of issuing a query; sort in Python to keep the
     # prefetch cache intact. Falls back to a query when not prefetched.
     try:
-        prefetched = getattr(shape, "_prefetched_objects_cache", {})
-        if "rule_bindings" in prefetched:
-            rule_rows = sorted(shape.rule_bindings.all(), key=lambda r: r.ordering)
-        else:
-            rule_rows = list(
-                NodeRuleBinding.objects.filter(shape=shape)
-                .select_related("sop", "sop__document", "sop__document__current_version")
-                .order_by("ordering")
-            )
+        rule_rows = sorted(
+            shape.rule_bindings.select_related(
+                "sop", "sop__document", "sop__document__current_version",
+            ).all(),
+            key=lambda r: r.ordering,
+        )
     except Exception:
         rule_rows = []
 

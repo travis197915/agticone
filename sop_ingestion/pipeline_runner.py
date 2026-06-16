@@ -64,6 +64,10 @@ def execute_ingestion_job(job_id: str) -> dict:
         job.mark_failed(str(exc))
         return {"job_id": job_id, "error": str(exc)}
 
+    from sop_ingestion.db_utils import ensure_db_connection
+
+    ensure_db_connection()
+
     all_docs = final_state.get("all_documents") or []
     job.docs_queued = len(all_docs)
     job.save(update_fields=["docs_queued"])

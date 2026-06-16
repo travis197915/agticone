@@ -114,8 +114,10 @@ def pg_version_registry(state: "PipelineState", cfg: "PipelineConfig") -> dict:
         return {"version_registered": False, "version_action": version_action}
 
     try:
+        from sop_ingestion.db_utils import ensure_db_connection
         from sop_ingestion.services.versioning import register_sop_version
 
+        ensure_db_connection()
         diff = register_sop_version(
             int(sop_id),
             prior_sop_id=state.get("prior_sop_db_id"),
