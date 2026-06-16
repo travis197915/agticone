@@ -3,18 +3,14 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "uhc-execution-engine"
+name = "uhc-llm"
 version = "0.1.0"
-description = "Rule execution engine: Excel of claim ids in, per-claim SOP-rule adjudication out"
+description = "Env-driven LLM routing: direct API keys or UHG MODEL_REGISTRY gateway"
 requires-python = ">=3.11"
 dependencies = [
-    "uhc-llm",
-    "langgraph>=0.2",
-    "langchain-core>=0.3",
-    "langchain-anthropic>=0.2",
-    "langchain-openai>=0.2",
-    "openpyxl>=3.1",
-    "pydantic>=2",
+    "openai>=2.0",
+    "anthropic>=0.40",
+    "httpx>=0.28",
     "python-dotenv>=1.0",
 ]
 

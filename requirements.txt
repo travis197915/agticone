@@ -84,6 +84,7 @@ typing_extensions==4.15.0
 tzdata==2026.2
 tzlocal==5.3.1
 -e ./uhc-api-agent
+-e ./uhc-llm
 -e ./uhc-execution-engine
 -e ./uhc-sop-ingestion
 urllib3==2.7.0

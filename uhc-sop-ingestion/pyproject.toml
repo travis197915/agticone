@@ -8,6 +8,7 @@ version = "1.0.0"
 description = "LangGraph multi-agent SOP ingestion pipeline — URL in, full context graph out"
 requires-python = ">=3.11"
 dependencies = [
+    "uhc-llm",
     # Orchestration
     "langgraph>=0.2",
     "langchain>=0.3",

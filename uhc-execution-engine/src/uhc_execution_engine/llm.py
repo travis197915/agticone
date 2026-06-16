@@ -216,6 +216,26 @@ def _validate(data: Any, expected_type: type,
 # ── Core dispatcher ──────────────────────────────────────────────────────────
 
 
+def _parse_llm_payload(
+    content: str,
+    *,
+    expected_type: type,
+    required_keys: list[str] | None,
+) -> Any:
+    data = _parse_json(content)
+    if expected_type is list and isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, list):
+                data = v
+                break
+    if not _validate(data, expected_type, required_keys):
+        raise ValueError(
+            f"Schema mismatch: expected {expected_type.__name__}"
+            f" with keys {required_keys}, got {type(data).__name__}"
+        )
+    return data
+
+
 def llm_call(
     cfg: EngineConfig,
     prompt: str,
@@ -234,9 +254,97 @@ def llm_call(
     that ultimately succeeded plus total duration; useful for `RuleEvaluation`
     persistence rows.
     """
-    from langchain_core.messages import HumanMessage
+    from uhc_llm import invoke_prompt, is_registry_backend
 
     max_tokens = max_tokens or cfg.llm_max_tokens
+    meta: dict[str, Any] = {"provider": "", "model": "", "ms": 0, "attempts": 0}
+
+    if is_registry_backend():
+        from uhc_llm.registry import load_agent_model_map, resolve_registry_model_name
+
+        used_prompt = prompt + (
+            "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+        )
+        if expected_type is list:
+            used_prompt += '\n\nWrap the array in a JSON object: {"items": [...]}'
+
+        def _attempt_registry(current_prompt: str, label: str,
+                              *, model_name: str | None = None):
+            t0 = time.time()
+            meta["attempts"] += 1
+            try:
+                resp = invoke_prompt(
+                    agent_name=agent_name,
+                    prompt=current_prompt,
+                    max_tokens=max_tokens,
+                    json_mode=(expected_type in (dict, list)),
+                    cfg=cfg,
+                    model_name=model_name,
+                )
+                ms = int((time.time() - t0) * 1000)
+                _log_llm_call(
+                    agent_name=f"{agent_name}[{label}]",
+                    stage=stage,
+                    provider=resp.provider,
+                    model=resp.model,
+                    prompt_tokens=resp.prompt_tokens,
+                    completion_tokens=resp.completion_tokens,
+                    duration_ms=ms,
+                    success=True,
+                )
+                data = _parse_llm_payload(
+                    resp.content,
+                    expected_type=expected_type,
+                    required_keys=required_keys,
+                )
+                meta.update(provider=resp.provider, model=resp.model, ms=ms)
+                return data, None
+            except Exception as exc:
+                ms = int((time.time() - t0) * 1000)
+                logger.warning("llm_call [%s/%s]: %s", agent_name, label, exc)
+                _log_llm_call(
+                    agent_name=f"{agent_name}[{label}]",
+                    stage=stage,
+                    provider="registry",
+                    model=model_name or "auto",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    duration_ms=ms,
+                    success=False,
+                    error=str(exc),
+                )
+                return None, str(exc)
+
+        current_prompt = used_prompt
+        last_error = ""
+        for attempt in range(1, cfg.llm_retries + 1):
+            if last_error:
+                current_prompt = (
+                    f"{used_prompt}\n\n[Previous attempt failed: {last_error}. "
+                    "Fix the JSON format and try again.]"
+                )
+            data, err = _attempt_registry(current_prompt, f"p{attempt}")
+            if data is not None:
+                return data, meta
+            last_error = err or "unknown error"
+
+        default_model = load_agent_model_map().get("__default__")
+        try:
+            primary_model = resolve_registry_model_name(agent_name)
+        except RuntimeError:
+            primary_model = None
+        if default_model and default_model != primary_model:
+            data, _err = _attempt_registry(
+                used_prompt, "default-fallback", model_name=default_model,
+            )
+            if data is not None:
+                return data, meta
+
+        logger.error("llm_call [%s]: registry attempts failed; returning fallback", agent_name)
+        return fallback, meta
+
+    from langchain_core.messages import HumanMessage
+
     alt_provider = "openai" if provider == "anthropic" else "anthropic"
     primary_fn = _make_anthropic_llm if provider == "anthropic" else _make_openai_llm
     fallback_fn = _make_openai_llm if alt_provider == "openai" else _make_anthropic_llm
@@ -247,8 +355,6 @@ def llm_call(
         prompt = prompt + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
     elif provider == "openai" and expected_type is list:
         prompt = prompt + '\n\nWrap the array in a JSON object: {"items": [...]}'
-
-    meta: dict[str, Any] = {"provider": "", "model": "", "ms": 0, "attempts": 0}
 
     def _attempt(make_fn, prov, model, used_prompt, label):
         t0 = time.time()
@@ -261,18 +367,11 @@ def llm_call(
             _log_llm_call(agent_name=f"{agent_name}[{label}]", stage=stage,
                           provider=prov, model=model, prompt_tokens=inp,
                           completion_tokens=out, duration_ms=ms, success=True)
-            data = _parse_json(resp.content)
-            if expected_type is list and isinstance(data, dict):
-                # OpenAI json_object mode wraps lists in an object
-                for v in data.values():
-                    if isinstance(v, list):
-                        data = v
-                        break
-            if not _validate(data, expected_type, required_keys):
-                raise ValueError(
-                    f"Schema mismatch: expected {expected_type.__name__}"
-                    f" with keys {required_keys}, got {type(data).__name__}"
-                )
+            data = _parse_llm_payload(
+                resp.content if isinstance(resp.content, str) else str(resp.content),
+                expected_type=expected_type,
+                required_keys=required_keys,
+            )
             meta.update(provider=prov, model=model, ms=ms)
             return data, None
         except Exception as exc:

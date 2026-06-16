@@ -1,0 +1,10 @@
+{
+  "MemberEligibility": "gpt-5-mini",
+  "CoverageBenefit": "gpt-5-mini",
+  "InitialVerificationAgent": "gpt-5-mini",
+  "NpiMatch": "llama",
+  "ProviderOptoutAuditAgent": "llama",
+  "ProviderSelectionVerification": "opus",
+  "LlmClaimParser": "gpt-5-mini",
+  "__default__": "gpt-5-mini"
+}
