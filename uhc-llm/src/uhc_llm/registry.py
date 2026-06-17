@@ -177,6 +177,10 @@ def resolve_registry_model_name(agent_name: str) -> str:
         )
 
     model_name = global_registry_model_name()
+    # Ingestion jobs store provider model names (e.g. claude-sonnet-…) on the row;
+    # ignore values that are not registry keys so AGENT_MODEL_MAP still applies.
+    if model_name and model_name not in registry:
+        model_name = ""
     if not model_name:
         mapping = load_agent_model_map()
         model_name = mapping.get(agent_name) or mapping.get("__default__")

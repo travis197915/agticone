@@ -44,3 +44,23 @@ def get_llm_backend() -> str:
 
 def is_registry_backend() -> bool:
     return get_llm_backend() == "registry"
+
+
+def apply_job_llm_env(*, llm_provider: str, llm_model: str) -> None:
+    """Push per-job LLM fields into ``os.environ`` without breaking registry mode.
+
+    In ``registry`` mode, ``IngestionJob.llm_model`` defaults to a direct
+    provider name (``claude-sonnet-…``). Only override ``LLM_MODEL`` when the
+    job value is a key in ``MODEL_REGISTRY``; otherwise keep ``.env`` routing
+    (``LLM_MODEL`` + ``AGENT_MODEL_MAP``).
+    """
+    if is_registry_backend():
+        from .registry import load_model_registry
+
+        registry = load_model_registry()
+        if llm_model and llm_model in registry:
+            os.environ["LLM_MODEL"] = llm_model
+        return
+
+    os.environ["LLM_PROVIDER"] = llm_provider
+    os.environ["LLM_MODEL"] = llm_model

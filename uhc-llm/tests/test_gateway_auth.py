@@ -35,3 +35,13 @@ def test_gateway_key_missing_raises(monkeypatch):
     assert not gateway_api_key_configured()
     with pytest.raises(RuntimeError, match="AI_GATEWAY_API_KEY"):
         _gateway_api_key()
+
+
+def test_gateway_headers_include_apim_subscription_key(monkeypatch):
+    from uhc_llm.gateway import _gateway_headers
+
+    monkeypatch.setenv("AI_GATEWAY_API_KEY", "sub-key")
+    monkeypatch.setenv("PROJECT_ID", "proj-123")
+    headers = _gateway_headers()
+    assert headers["Ocp-Apim-Subscription-Key"] == "sub-key"
+    assert headers["project-id"] == "proj-123"

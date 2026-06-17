@@ -182,10 +182,9 @@ class SyncRunView(APIView):
         )
         job.mark_started()
 
-        # Mirror what tasks.py does: push LLM choice into env so
-        # PipelineConfig.from_env() picks them up when the pipeline initialises.
-        os.environ["LLM_PROVIDER"] = job.llm_provider
-        os.environ["LLM_MODEL"]    = job.llm_model
+        from uhc_llm.backend import apply_job_llm_env
+
+        apply_job_llm_env(llm_provider=job.llm_provider, llm_model=job.llm_model)
 
         try:
             from uhc_sop_ingestion.pipeline import SopIngestionPipeline

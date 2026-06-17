@@ -42,6 +42,12 @@ def _gateway_headers() -> dict[str, str]:
     if project_id:
         headers["project-id"] = project_id
         headers["x-project-id"] = project_id
+    # UHG gateway sits behind Azure APIM; subscription key is required alongside api-key.
+    for name in ("AI_GATEWAY_API_KEY", "APIM_SUBSCRIPTION_KEY"):
+        val = os.environ.get(name, "").strip()
+        if val:
+            headers["Ocp-Apim-Subscription-Key"] = val
+            break
     return headers
 
 
@@ -152,7 +158,7 @@ def _invoke_bedrock_claude(
 
     client = Anthropic(
         api_key=_gateway_api_key(),
-        base_url=spec.endpoint,
+        base_url=f"{spec.endpoint}/v1",
         default_headers=_gateway_headers(),
     )
     resp = client.messages.create(

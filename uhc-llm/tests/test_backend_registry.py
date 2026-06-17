@@ -121,6 +121,34 @@ def test_llm_model_overrides_agent_map(monkeypatch):
     assert resolve_registry_model_name("NpiMatch") == "opus"
 
 
+def test_invalid_llm_model_falls_back_to_agent_map(monkeypatch):
+    """Job rows store provider model names; ignore them for registry routing."""
+    monkeypatch.setenv("MODEL_REGISTRY_JSON", json.dumps(SAMPLE_REGISTRY))
+    monkeypatch.setenv("AGENT_MODEL_MAP", "ingestion")
+    monkeypatch.setenv("LLM_MODEL", "claude-sonnet-4-5-20250929")
+
+    assert resolve_registry_model_name("rule_semantic_enricher") == "opus"
+    assert resolve_registry_model_name("date_condition_extractor") == "gpt-5-mini"
+
+
+def test_apply_job_llm_env_skips_provider_model_in_registry_mode(monkeypatch):
+    from uhc_llm.backend import apply_job_llm_env
+
+    monkeypatch.setenv("LLM_BACKEND", "registry")
+    monkeypatch.setenv("MODEL_REGISTRY_JSON", json.dumps(SAMPLE_REGISTRY))
+    monkeypatch.setenv("LLM_MODEL", "opus")
+    monkeypatch.setenv("AGENT_MODEL_MAP", "ingestion")
+
+    apply_job_llm_env(
+        llm_provider="anthropic",
+        llm_model="claude-sonnet-4-5-20250929",
+    )
+    assert global_registry_model_name() == "opus"
+
+    apply_job_llm_env(llm_provider="anthropic", llm_model="gpt-5-mini")
+    assert global_registry_model_name() == "gpt-5-mini"
+
+
 def test_load_bundled_registry_profile_with_agent_map(monkeypatch):
     monkeypatch.delenv("UHC_LLM_CONFIG_DIR", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)

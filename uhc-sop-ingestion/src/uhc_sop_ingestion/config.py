@@ -107,10 +107,9 @@ class PipelineConfig:
     openai_model: str       # default: gpt-4o
     anthropic_model: str    # default: claude-sonnet-4-5-20250929
     llm_backend: str        # api_key | registry (see uhc_llm.backend)
-    llm_model: str          # app-wide registry model key when LLM_BACKEND=registry
+    llm_model: str          # LLM_MODEL env — registry key or legacy provider model name
     # legacy single-provider fields (kept for backward compat)
     llm_provider: str
-    llm_model: str
 
     # Pipeline
     max_depth: int
@@ -209,7 +208,6 @@ class PipelineConfig:
             llm_backend=_env("LLM_BACKEND"),
             llm_model=_env("LLM_MODEL") or _env("REGISTRY_DEFAULT_MODEL"),
             llm_provider=_env("LLM_PROVIDER", "anthropic"),
-            llm_model=_env("LLM_MODEL", "claude-sonnet-4-5-20250929"),
             # Pipeline
             max_depth=_env_int("MAX_DEPTH", 4),
             max_docs=_env_int("MAX_DOCS", 200),

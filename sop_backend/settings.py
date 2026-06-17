@@ -10,6 +10,7 @@ Credentials are read from:
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -193,6 +194,10 @@ CELERY_BROKER_URL      = f"amqp://{_rmq_user}:{_rmq_pass}@{_rmq_host}:{_rmq_port
 CELERY_RESULT_BACKEND  = REDIS_URL
 CELERY_ACCEPT_CONTENT  = ["json"]
 CELERY_TASK_SERIALIZER = "json"
+# Windows: prefork pool breaks task registry in worker child processes.
+# Override with CELERY_WORKER_POOL=threads|eventlet if needed for local dev.
+if sys.platform == "win32":
+    CELERY_WORKER_POOL = os.environ.get("CELERY_WORKER_POOL", "solo")
 
 # Ingestion + execution: thin masters on job_queue; LangGraph runs in
 # child OS processes (see sop_ingestion/subprocess_manager.py and
