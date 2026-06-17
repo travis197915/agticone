@@ -272,6 +272,18 @@ def llm_call(
                               *, model_name: str | None = None):
             t0 = time.time()
             meta["attempts"] += 1
+            endpoint_hint = "unknown endpoint"
+            try:
+                from uhc_llm.gateway import describe_registry_target
+                from uhc_llm.registry import get_model_spec, resolve_registry_model_name
+
+                resolved = model_name or resolve_registry_model_name(agent_name)
+                endpoint_hint = describe_registry_target(
+                    get_model_spec(resolved),
+                    json_mode=(expected_type in (dict, list)),
+                )
+            except Exception:
+                pass
             try:
                 resp = invoke_prompt(
                     agent_name=agent_name,
@@ -301,7 +313,10 @@ def llm_call(
                 return data, None
             except Exception as exc:
                 ms = int((time.time() - t0) * 1000)
-                logger.warning("llm_call [%s/%s]: %s", agent_name, label, exc)
+                logger.warning(
+                    "llm_call [%s/%s] → %s: %s",
+                    agent_name, label, endpoint_hint, exc,
+                )
                 _log_llm_call(
                     agent_name=f"{agent_name}[{label}]",
                     stage=stage,
@@ -311,7 +326,7 @@ def llm_call(
                     completion_tokens=0,
                     duration_ms=ms,
                     success=False,
-                    error=str(exc),
+                    error=f"{endpoint_hint}: {exc}",
                 )
                 return None, str(exc)
 

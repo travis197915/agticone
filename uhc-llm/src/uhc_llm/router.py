@@ -67,7 +67,7 @@ def _invoke_registry(
     json_mode: bool,
     model_name: str | None,
 ) -> LLMResponse:
-    from .gateway import invoke_registry_model, supports_json_mode
+    from .gateway import describe_registry_target, invoke_registry_model, supports_json_mode
     from .registry import get_model_spec, resolve_registry_model_name
 
     resolved = model_name or resolve_registry_model_name(agent_name)
@@ -78,6 +78,7 @@ def _invoke_registry(
         prompt=prompt,
         max_tokens=max_tokens,
         json_mode=use_json,
+        agent_name=agent_name,
     )
     return LLMResponse(
         content=content,

@@ -278,6 +278,18 @@ def _llm_call_via_registry(
     def _try_registry(current_prompt: str, attempt_label: str,
                       *, model_name: str | None = None):
         t0 = time.time()
+        endpoint_hint = "unknown endpoint"
+        try:
+            from uhc_llm.gateway import describe_registry_target
+            from uhc_llm.registry import get_model_spec, resolve_registry_model_name
+
+            resolved = model_name or resolve_registry_model_name(agent_name)
+            endpoint_hint = describe_registry_target(
+                get_model_spec(resolved),
+                json_mode=(expected_type in (dict, list)),
+            )
+        except Exception:
+            pass
         try:
             llm_resp = invoke_prompt(
                 agent_name=agent_name,
@@ -309,7 +321,10 @@ def _llm_call_via_registry(
             return data, None
         except Exception as exc:
             ms = int((time.time() - t0) * 1000)
-            logger.warning("llm_call [%s/%s]: %s", agent_name, attempt_label, exc)
+            logger.warning(
+                "llm_call [%s/%s] → %s: %s",
+                agent_name, attempt_label, endpoint_hint, exc,
+            )
             if pg_logger:
                 pg_logger.log_llm_call(
                     agent_name=f"{agent_name}[{attempt_label}]",
@@ -320,7 +335,7 @@ def _llm_call_via_registry(
                     completion_tokens=0,
                     duration_ms=ms,
                     success=False,
-                    error_message=str(exc),
+                    error_message=f"{endpoint_hint}: {exc}",
                 )
             return None, str(exc)
 
