@@ -13,6 +13,12 @@ class JobStatus(models.TextChoices):
     PARTIAL   = "PARTIAL",   "Partial"
 
 
+class TriggerSource(models.TextChoices):
+    API      = "api",      "REST API"
+    WORKFLOW = "workflow", "Workflow builder"
+    CLI      = "cli",      "CLI / script"
+
+
 class IngestionJob(models.Model):
     job_id         = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     # Optional FK to the builder Workflow that triggered this ingestion.
@@ -34,6 +40,12 @@ class IngestionJob(models.Model):
     max_docs       = models.PositiveIntegerField(default=200)
     llm_provider   = models.CharField(max_length=32, default="anthropic")
     llm_model      = models.CharField(max_length=64,  default="claude-sonnet-4-5-20250929")
+    trigger_source = models.CharField(
+        max_length=32,
+        choices=TriggerSource.choices,
+        default=TriggerSource.API,
+        db_index=True,
+    )
     updated_at     = models.DateTimeField(auto_now=True)
     celery_task_id = models.CharField(max_length=255, blank=True)
     created_at     = models.DateTimeField(auto_now_add=True)

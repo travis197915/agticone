@@ -39,12 +39,20 @@ if os.environ.get("LLM_BACKEND", "").strip().lower() == "registry":
                 "Set MODEL_REGISTRY_JSON in .env (see .env.example).",
                 stacklevel=1,
             )
-        elif not os.environ.get("AI_GATEWAY_API_KEY", "").strip():
+        elif not gateway_api_key_configured():
             import warnings
+            from uhc_llm.gateway import GATEWAY_KEY_ENV_VARS
             warnings.warn(
                 f"LLM registry loaded from {registry_profile_name()!r} "
-                f"({len(_llm_registry)} models) but AI_GATEWAY_API_KEY is empty.",
+                f"({len(_llm_registry)} models) but no gateway API key is set. "
+                f"Set one of: {', '.join(GATEWAY_KEY_ENV_VARS)}.",
                 stacklevel=1,
+            )
+        else:
+            from uhc_llm.gateway import gateway_api_key_source
+            import logging
+            logging.getLogger(__name__).info(
+                "LLM registry auth via %s", gateway_api_key_source(),
             )
     except Exception as _llm_exc:
         import warnings

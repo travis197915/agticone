@@ -6,15 +6,33 @@ from typing import Any
 
 from .registry import JSON_COMPATIBLE_KINDS, ModelSpec
 
+# Env vars checked in order for gateway authentication.
+GATEWAY_KEY_ENV_VARS = (
+    "AI_GATEWAY_API_KEY",
+    "APIM_SUBSCRIPTION_KEY",
+    "OPENAI_API_KEY",
+)
+
+
+def gateway_api_key_source() -> str:
+    """Return the env var name that supplies the gateway key, or '' if unset."""
+    for name in GATEWAY_KEY_ENV_VARS:
+        if os.environ.get(name, "").strip():
+            return name
+    return ""
+
+
+def gateway_api_key_configured() -> bool:
+    return bool(gateway_api_key_source())
+
 
 def _gateway_api_key() -> str:
-    for name in ("AI_GATEWAY_API_KEY", "APIM_SUBSCRIPTION_KEY", "OPENAI_API_KEY"):
-        val = os.environ.get(name, "").strip()
-        if val:
-            return val
+    source = gateway_api_key_source()
+    if source:
+        return os.environ.get(source, "").strip()
     raise RuntimeError(
-        "Registry backend requires AI_GATEWAY_API_KEY, APIM_SUBSCRIPTION_KEY, "
-        "or OPENAI_API_KEY"
+        "Registry backend requires one of: "
+        + ", ".join(GATEWAY_KEY_ENV_VARS)
     )
 
 
