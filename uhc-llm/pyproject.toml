@@ -19,6 +19,7 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 uhc-llm-export-registry = "uhc_llm.export_registry_env:main"
+uhc-llm-run-registry = "uhc_llm.run_registry:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

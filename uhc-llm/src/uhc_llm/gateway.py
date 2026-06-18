@@ -10,7 +10,7 @@ from .registry import JSON_COMPATIBLE_KINDS, ModelSpec
 
 log = logging.getLogger(__name__)
 
-# Env vars checked in order for gateway authentication.
+# Env vars checked in order for static gateway API-key authentication.
 GATEWAY_KEY_ENV_VARS = (
     "AI_GATEWAY_API_KEY",
     "APIM_SUBSCRIPTION_KEY",
@@ -19,7 +19,7 @@ GATEWAY_KEY_ENV_VARS = (
 
 
 def gateway_api_key_source() -> str:
-    """Return the env var name that supplies the gateway key, or '' if unset."""
+    """Return the env var name that supplies a static API key, or '' if unset."""
     for name in GATEWAY_KEY_ENV_VARS:
         if os.environ.get(name, "").strip():
             return name
@@ -30,28 +30,67 @@ def gateway_api_key_configured() -> bool:
     return bool(gateway_api_key_source())
 
 
+def gateway_auth_configured() -> bool:
+    """True when OAuth client-credentials or a static API key is configured."""
+    from .oauth import oauth_configured
+
+    return oauth_configured() or gateway_api_key_configured()
+
+
+def gateway_auth_source() -> str:
+    """Human-readable auth mode for logs (never includes secrets)."""
+    from .oauth import oauth_configured
+
+    if oauth_configured():
+        return "oauth:client_credentials"
+    source = gateway_api_key_source()
+    return source or "missing"
+
+
 def _gateway_api_key() -> str:
+    """Static APIM / gateway subscription key (api_key mode only)."""
     source = gateway_api_key_source()
     if source:
         return os.environ.get(source, "").strip()
     raise RuntimeError(
-        "Registry backend requires one of: "
-        + ", ".join(GATEWAY_KEY_ENV_VARS)
+        "Registry backend requires OAuth (AUTH_URL, CLIENT_ID, CLIENT_SECRET, SCOPE) "
+        "or one of: " + ", ".join(GATEWAY_KEY_ENV_VARS)
     )
 
 
+def _gateway_bearer_token() -> str:
+    from .oauth import fetch_oauth_token
+
+    return fetch_oauth_token()
+
+
+def _client_api_key() -> str:
+    """Value passed as ``api_key=`` on OpenAI / Anthropic SDK clients."""
+    from .oauth import oauth_configured
+
+    if oauth_configured():
+        return _gateway_bearer_token()
+    return _gateway_api_key()
+
+
 def _gateway_headers() -> dict[str, str]:
+    from .oauth import oauth_configured
+
     headers: dict[str, str] = {}
     project_id = os.environ.get("PROJECT_ID", "").strip()
     if project_id:
         headers["project-id"] = project_id
         headers["x-project-id"] = project_id
-    # UHG gateway sits behind Azure APIM; subscription key is required alongside api-key.
-    for name in ("AI_GATEWAY_API_KEY", "APIM_SUBSCRIPTION_KEY"):
-        val = os.environ.get(name, "").strip()
-        if val:
-            headers["Ocp-Apim-Subscription-Key"] = val
-            break
+
+    if oauth_configured():
+        headers["Authorization"] = f"Bearer {_gateway_bearer_token()}"
+    else:
+        # UHG gateway sits behind Azure APIM; subscription key header when using api_key mode.
+        for name in ("AI_GATEWAY_API_KEY", "APIM_SUBSCRIPTION_KEY"):
+            val = os.environ.get(name, "").strip()
+            if val:
+                headers["Ocp-Apim-Subscription-Key"] = val
+                break
     return headers
 
 
@@ -106,36 +145,53 @@ def describe_registry_target(spec: ModelSpec, *, json_mode: bool = False) -> str
 def _log_gateway_context(*, agent_name: str, spec: ModelSpec, json_mode: bool) -> str:
     """Build one log line prefix with endpoint + auth context (no secrets)."""
     target = describe_registry_target(spec, json_mode=json_mode)
-    auth = gateway_api_key_source() or "missing"
+    auth = gateway_auth_source()
     project = "set" if os.environ.get("PROJECT_ID", "").strip() else "unset"
     agent = f"agent={agent_name} " if agent_name else ""
     return f"{agent}{target} auth={auth} project_id={project}"
 
 
-def invoke_registry_model(
+def _normalize_messages(
+    messages: list[dict[str, Any]] | None,
+    *,
+    prompt: str = "",
+) -> list[dict[str, str]]:
+    if messages:
+        return [
+            {"role": str(m.get("role", "user")), "content": str(m.get("content", ""))}
+            for m in messages
+        ]
+    if prompt:
+        return [{"role": "user", "content": prompt}]
+    return [{"role": "user", "content": ""}]
+
+
+def invoke_registry_chat(
     spec: ModelSpec,
     *,
-    prompt: str,
+    messages: list[dict[str, Any]],
     max_tokens: int,
     json_mode: bool,
     agent_name: str = "",
 ) -> tuple[str, int, int]:
-    """Call a registry model and return (content, prompt_tokens, completion_tokens)."""
+    """Call a registry model with a chat ``messages`` list."""
+    normalized = _normalize_messages(messages)
     ctx = _log_gateway_context(agent_name=agent_name, spec=spec, json_mode=json_mode)
-    log.info("llm_gateway request → %s max_tokens=%s", ctx, max_tokens)
+    log.info("llm_gateway request → %s max_tokens=%s messages=%d",
+             ctx, max_tokens, len(normalized))
     t0 = time.time()
     try:
         if spec.kind == "azure_openai":
             result = _invoke_azure_openai(
-                spec, prompt=prompt, max_tokens=max_tokens, json_mode=json_mode,
+                spec, messages=normalized, max_tokens=max_tokens, json_mode=json_mode,
             )
         elif spec.kind == "openai_compat":
             result = _invoke_openai_compat(
-                spec, prompt=prompt, max_tokens=max_tokens, json_mode=json_mode,
+                spec, messages=normalized, max_tokens=max_tokens, json_mode=json_mode,
             )
         elif spec.kind == "bedrock_claude":
             result = _invoke_bedrock_claude(
-                spec, prompt=prompt, max_tokens=max_tokens,
+                spec, messages=normalized, max_tokens=max_tokens,
             )
         else:
             raise RuntimeError(
@@ -152,6 +208,24 @@ def invoke_registry_model(
     ms = int((time.time() - t0) * 1000)
     log.info("llm_gateway ok (%sms) → %s", ms, ctx)
     return result
+
+
+def invoke_registry_model(
+    spec: ModelSpec,
+    *,
+    prompt: str,
+    max_tokens: int,
+    json_mode: bool,
+    agent_name: str = "",
+) -> tuple[str, int, int]:
+    """Call a registry model with a single user prompt (legacy helper)."""
+    return invoke_registry_chat(
+        spec,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        json_mode=json_mode,
+        agent_name=agent_name,
+    )
 
 
 def invoke_registry_messages(
@@ -176,7 +250,7 @@ def invoke_registry_messages(
         from anthropic import Anthropic
 
         client = Anthropic(
-            api_key=_gateway_api_key(),
+            api_key=_client_api_key(),
             base_url=f"{spec.endpoint}/v1",
             default_headers=_gateway_headers(),
         )
@@ -209,7 +283,7 @@ def invoke_registry_messages(
 def _invoke_azure_openai(
     spec: ModelSpec,
     *,
-    prompt: str,
+    messages: list[dict[str, str]],
     max_tokens: int,
     json_mode: bool,
 ) -> tuple[str, int, int]:
@@ -217,14 +291,14 @@ def _invoke_azure_openai(
 
     api_version = spec.api_version or "2025-01-01-preview"
     client = AzureOpenAI(
-        api_key=_gateway_api_key(),
+        api_key=_client_api_key(),
         azure_endpoint=spec.endpoint,
         api_version=api_version,
         default_headers=_gateway_headers(),
     )
     kwargs: dict[str, Any] = {
         "model": spec.deployment,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "max_tokens": max_tokens,
     }
     if json_mode:
@@ -238,20 +312,20 @@ def _invoke_azure_openai(
 def _invoke_openai_compat(
     spec: ModelSpec,
     *,
-    prompt: str,
+    messages: list[dict[str, str]],
     max_tokens: int,
     json_mode: bool,
 ) -> tuple[str, int, int]:
     from openai import OpenAI
 
     client = OpenAI(
-        api_key=_gateway_api_key(),
+        api_key=_client_api_key(),
         base_url=f"{spec.endpoint}/v1",
         default_headers=_gateway_headers(),
     )
     kwargs: dict[str, Any] = {
         "model": spec.deployment,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "max_tokens": max_tokens,
     }
     if json_mode:
@@ -262,25 +336,49 @@ def _invoke_openai_compat(
     return content or "", inp, out
 
 
+def _split_anthropic_messages(
+    messages: list[dict[str, str]],
+) -> tuple[str | None, list[dict[str, str]]]:
+    """Move ``system`` role content to Anthropic's ``system`` parameter."""
+    system_parts: list[str] = []
+    chat: list[dict[str, str]] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            if content:
+                system_parts.append(content)
+            continue
+        chat.append({"role": role, "content": content})
+    if not chat:
+        chat = [{"role": "user", "content": ""}]
+    system = "\n\n".join(system_parts) if system_parts else None
+    return system, chat
+
+
 def _invoke_bedrock_claude(
     spec: ModelSpec,
     *,
-    prompt: str,
+    messages: list[dict[str, str]],
     max_tokens: int,
 ) -> tuple[str, int, int]:
     from anthropic import Anthropic
 
+    system, chat_messages = _split_anthropic_messages(messages)
     client = Anthropic(
-        api_key=_gateway_api_key(),
+        api_key=_client_api_key(),
         base_url=f"{spec.endpoint}/v1",
         default_headers=_gateway_headers(),
     )
-    resp = client.messages.create(
-        model=spec.deployment,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
+    kwargs: dict[str, Any] = {
+        "model": spec.deployment,
+        "max_tokens": max_tokens,
+        "messages": chat_messages,
+        "temperature": 0,
+    }
+    if system:
+        kwargs["system"] = system
+    resp = client.messages.create(**kwargs)
     parts: list[str] = []
     for block in resp.content:
         text = getattr(block, "text", None)

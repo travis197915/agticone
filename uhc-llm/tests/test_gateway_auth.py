@@ -32,8 +32,11 @@ def test_gateway_key_falls_back_to_openai_api_key(monkeypatch):
 
 
 def test_gateway_key_missing_raises(monkeypatch):
+    from uhc_llm.oauth import oauth_configured
+
     assert not gateway_api_key_configured()
-    with pytest.raises(RuntimeError, match="AI_GATEWAY_API_KEY"):
+    assert not oauth_configured()
+    with pytest.raises(RuntimeError, match="AUTH_URL|AI_GATEWAY_API_KEY"):
         _gateway_api_key()
 
 
