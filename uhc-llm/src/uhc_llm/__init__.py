@@ -8,6 +8,7 @@ from .registry import (
     load_model_registry,
     registry_profile_name,
     resolve_registry_model_name,
+    resolve_pdf_registry_model_name,
 )
 from .router import LLMResponse, invoke_prompt
 
@@ -23,4 +24,5 @@ __all__ = [
     "load_model_registry",
     "registry_profile_name",
     "resolve_registry_model_name",
+    "resolve_pdf_registry_model_name",
 ]

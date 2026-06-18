@@ -13,6 +13,7 @@ from uhc_llm.registry import (
     load_agent_model_map,
     load_model_registry,
     registry_profile_name,
+    resolve_pdf_registry_model_name,
     resolve_registry_model_name,
 )
 
@@ -167,6 +168,18 @@ def test_load_ingestion_agent_map(monkeypatch):
 
     assert resolve_registry_model_name("rule_semantic_enricher") == "opus"
     assert resolve_registry_model_name("date_condition_extractor") == "gpt-5-mini"
+    assert resolve_pdf_registry_model_name("pdf_page_reader") == "opus"
+
+
+def test_pdf_model_ignores_non_bedrock_llm_model(monkeypatch):
+    from uhc_llm.registry import resolve_pdf_registry_model_name
+
+    monkeypatch.setenv("MODEL_REGISTRY_JSON", json.dumps(SAMPLE_REGISTRY))
+    monkeypatch.setenv("AGENT_MODEL_MAP", "ingestion")
+    monkeypatch.setenv("LLM_MODEL", "gpt-5-mini")
+
+    assert resolve_registry_model_name("pdf_page_reader") == "gpt-5-mini"
+    assert resolve_pdf_registry_model_name("pdf_page_reader") == "opus"
 
 
 def test_inline_json_still_supported(monkeypatch):

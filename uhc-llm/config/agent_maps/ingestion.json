@@ -11,5 +11,6 @@
   "summary_generator": "opus",
   "code_detector": "gpt-5-mini",
   "entity_list_ref_detector": "gpt-5-mini",
+  "pdf_page_reader": "opus",
   "__default__": "gpt-5-mini"
 }

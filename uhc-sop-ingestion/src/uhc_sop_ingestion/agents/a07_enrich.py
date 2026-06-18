@@ -526,6 +526,100 @@ def _pdf_content_blocks(prompt: str, pdf_b64_list: list[str]) -> list[dict]:
     return blocks
 
 
+def _llm_call_pdf_via_registry(
+    cfg,
+    prompt: str,
+    pdf_b64_list: list[str],
+    fallback: Any,
+    agent_name: str,
+    *,
+    expected_type: type = dict,
+    required_keys: list[str] | None = None,
+    stage: str = "pdf_perceive",
+    max_retries: int = 2,
+    max_tokens: int = 8192,
+) -> Any:
+    """Registry-backend PDF vision via bedrock_claude UHG gateway."""
+    from uhc_llm.gateway import describe_registry_target, invoke_registry_messages
+    from uhc_llm.registry import get_model_spec, resolve_pdf_registry_model_name
+
+    pg_logger = getattr(cfg, "_pg_logger", None)
+    base_prompt = prompt + (
+        "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+    )
+
+    def _try(current_prompt: str, attempt_label: str):
+        t0 = time.time()
+        endpoint_hint = "unknown endpoint"
+        model_key = "auto"
+        try:
+            model_key = resolve_pdf_registry_model_name(agent_name)
+            spec = get_model_spec(model_key)
+            endpoint_hint = describe_registry_target(spec)
+            content_blocks = _pdf_content_blocks(current_prompt, pdf_b64_list)
+            raw_content, inp, out = invoke_registry_messages(
+                spec,
+                content_blocks=content_blocks,
+                max_tokens=max_tokens,
+                agent_name=agent_name,
+            )
+            ms = int((time.time() - t0) * 1000)
+            if pg_logger:
+                pg_logger.log_llm_call(
+                    agent_name=f"{agent_name}[{attempt_label}]",
+                    stage=stage,
+                    provider=f"registry:{spec.kind}",
+                    model=model_key,
+                    prompt_tokens=inp,
+                    completion_tokens=out,
+                    duration_ms=ms,
+                    success=True,
+                )
+            data = _parse_llm_output(
+                raw_content,
+                agent_name=agent_name,
+                attempt_label=attempt_label,
+                expected_type=expected_type,
+                required_keys=required_keys,
+            )
+            return data, None
+        except Exception as exc:
+            ms = int((time.time() - t0) * 1000)
+            logger.warning(
+                "llm_call_pdf [%s/%s] → %s: %s",
+                agent_name, attempt_label, endpoint_hint, exc,
+            )
+            if pg_logger:
+                pg_logger.log_llm_call(
+                    agent_name=f"{agent_name}[{attempt_label}]",
+                    stage=stage,
+                    provider="registry",
+                    model=model_key,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    duration_ms=ms,
+                    success=False,
+                    error_message=f"{endpoint_hint}: {exc}",
+                )
+            return None, str(exc)
+
+    last_error = ""
+    for attempt in range(1, max_retries + 1):
+        current = base_prompt
+        if last_error:
+            current = (
+                f"{base_prompt}\n\n[Previous attempt failed: {last_error}. "
+                "Fix the JSON format and try again.]"
+            )
+        data, err = _try(current, f"p{attempt}")
+        if data is not None:
+            return data
+        last_error = err or "unknown error"
+
+    logger.error("llm_call_pdf [%s]: registry attempts failed, returning fallback", agent_name)
+    return fallback
+
+
 def _llm_call_pdf(
     cfg,
     prompt: str,
@@ -545,6 +639,18 @@ def _llm_call_pdf(
     attempt is logged to Postgres via cfg._pg_logger. Returns `fallback` on total
     failure so the perception layer always has a deterministic floor.
     """
+    from uhc_llm import is_registry_backend
+
+    if is_registry_backend():
+        return _llm_call_pdf_via_registry(
+            cfg, prompt, pdf_b64_list, fallback, agent_name,
+            expected_type=expected_type,
+            required_keys=required_keys,
+            stage=stage,
+            max_retries=max_retries,
+            max_tokens=max_tokens,
+        )
+
     from langchain_core.messages import HumanMessage
     pg_logger = getattr(cfg, "_pg_logger", None)
     model_name = cfg.anthropic_model
@@ -602,7 +708,11 @@ def _llm_call_pdf(
             return data, None
         except Exception as exc:
             ms = int((time.time() - t0) * 1000)
-            logger.warning("llm_call_pdf [%s/%s]: %s", agent_name, attempt_label, exc)
+            logger.warning(
+                "llm_call_pdf [%s/%s] → anthropic direct api.anthropic.com/v1/messages "
+                "model=%s: %s",
+                agent_name, attempt_label, model_name, exc,
+            )
             if pg_logger:
                 pg_logger.log_llm_call(
                     agent_name=f"{agent_name}[{attempt_label}]",

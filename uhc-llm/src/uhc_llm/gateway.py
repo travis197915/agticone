@@ -154,6 +154,58 @@ def invoke_registry_model(
     return result
 
 
+def invoke_registry_messages(
+    spec: ModelSpec,
+    *,
+    content_blocks: list[dict[str, Any]],
+    max_tokens: int,
+    agent_name: str = "",
+) -> tuple[str, int, int]:
+    """Multimodal registry call (PDF document blocks) via bedrock_claude gateway."""
+    if spec.kind != "bedrock_claude":
+        raise RuntimeError(
+            f"Multimodal PDF calls require a bedrock_claude registry model; "
+            f"got kind={spec.kind!r} for registry key {spec.name!r}. "
+            f"Set AGENT_MODEL_MAP pdf_page_reader=opus (or LLM_MODEL=opus)."
+        )
+    ctx = _log_gateway_context(agent_name=agent_name, spec=spec, json_mode=False)
+    log.info("llm_gateway pdf request → %s max_tokens=%s blocks=%d",
+             ctx, max_tokens, len(content_blocks))
+    t0 = time.time()
+    try:
+        from anthropic import Anthropic
+
+        client = Anthropic(
+            api_key=_gateway_api_key(),
+            base_url=f"{spec.endpoint}/v1",
+            default_headers=_gateway_headers(),
+        )
+        resp = client.messages.create(
+            model=spec.deployment,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": content_blocks}],
+            temperature=0,
+        )
+        parts: list[str] = []
+        for block in resp.content:
+            text = getattr(block, "text", None)
+            if text:
+                parts.append(text)
+        inp, out = _usage_from_anthropic(resp)
+        result = "".join(parts), inp, out
+    except Exception as exc:
+        ms = int((time.time() - t0) * 1000)
+        log.warning(
+            "llm_gateway pdf failed (%sms) → %s error=%s",
+            ms, ctx, exc,
+        )
+        raise
+
+    ms = int((time.time() - t0) * 1000)
+    log.info("llm_gateway pdf ok (%sms) → %s", ms, ctx)
+    return result
+
+
 def _invoke_azure_openai(
     spec: ModelSpec,
     *,

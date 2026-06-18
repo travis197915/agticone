@@ -210,3 +210,45 @@ def get_model_spec(model_name: str) -> ModelSpec:
             f"({registry_profile_name()!r}). Known: {sorted(registry)}"
         )
     return spec
+
+
+def resolve_pdf_registry_model_name(agent_name: str) -> str:
+    """Resolve a ``bedrock_claude`` registry key for native-PDF vision calls.
+
+  Unlike ``resolve_registry_model_name``, this ignores a global ``LLM_MODEL``
+  when that key is not ``bedrock_claude`` so PDF ingestion can still route to
+  ``opus`` while text agents use ``gpt-5-mini``.
+    """
+    registry = load_model_registry()
+    if not registry:
+        raise RuntimeError(
+            "Registry backend is active but no models are configured. "
+            "Set MODEL_REGISTRY_JSON in .env."
+        )
+
+    bedrock_keys = [name for name, spec in registry.items() if spec.kind == "bedrock_claude"]
+    if not bedrock_keys:
+        raise RuntimeError(
+            "PDF vision requires a bedrock_claude model in MODEL_REGISTRY (e.g. opus)."
+        )
+
+    mapping = load_agent_model_map()
+    for key in (mapping.get(agent_name), mapping.get("__default__")):
+        if key and key in registry and registry[key].kind == "bedrock_claude":
+            return key
+
+    global_name = global_registry_model_name()
+    if global_name and global_name in registry and registry[global_name].kind == "bedrock_claude":
+        return global_name
+
+    if "opus" in registry and registry["opus"].kind == "bedrock_claude":
+        return "opus"
+
+    if len(bedrock_keys) == 1:
+        return bedrock_keys[0]
+
+    raise RuntimeError(
+        f"No bedrock_claude model configured for PDF agent {agent_name!r}. "
+        f"Set AGENT_MODEL_MAP {agent_name}=opus or LLM_MODEL=opus. "
+        f"bedrock_claude keys: {bedrock_keys}"
+    )
