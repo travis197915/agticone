@@ -48,3 +48,4 @@ def test_gateway_headers_include_apim_subscription_key(monkeypatch):
     headers = _gateway_headers()
     assert headers["Ocp-Apim-Subscription-Key"] == "sub-key"
     assert headers["project-id"] == "proj-123"
+    assert headers["projectId"] == "proj-123"

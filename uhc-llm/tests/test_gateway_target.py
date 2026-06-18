@@ -1,7 +1,11 @@
 """Tests for gateway request target descriptions."""
 from __future__ import annotations
 
-from uhc_llm.gateway import describe_registry_target
+from uhc_llm.gateway import (
+    _anthropic_base_url,
+    _anthropic_model_candidates,
+    describe_registry_target,
+)
 from uhc_llm.registry import ModelSpec
 
 
@@ -39,13 +43,23 @@ def test_describe_bedrock_claude_target():
         deployment="us.anthropic.claude-opus-4-6-v1",
     )
     target = describe_registry_target(spec)
-    assert "POST https://api.uhg.com/ai-gateway/1.0/v1/messages" in target
+    assert "POST https://api.uhg.com/ai-gateway/1.0/anthropic/v1/messages" in target
     assert "deployment='us.anthropic.claude-opus-4-6-v1'" in target
 
 
-def test_anthropic_base_url_avoids_double_v1():
-    from uhc_llm.gateway import _anthropic_base_url
-
+def test_anthropic_base_url_appends_anthropic_subpath():
     assert _anthropic_base_url("https://api.uhg.com/ai-gateway/1.0/") == (
-        "https://api.uhg.com/ai-gateway/1.0"
+        "https://api.uhg.com/ai-gateway/1.0/anthropic"
     )
+    assert _anthropic_base_url("https://api.uhg.com/ai-gateway/1.0/anthropic") == (
+        "https://api.uhg.com/ai-gateway/1.0/anthropic"
+    )
+
+
+def test_anthropic_model_candidates_strips_bedrock_prefix_and_v1():
+    names = _anthropic_model_candidates("us.anthropic.claude-opus-4-6-v1")
+    assert names == [
+        "us.anthropic.claude-opus-4-6-v1",
+        "claude-opus-4-6-v1",
+        "claude-opus-4-6",
+    ]

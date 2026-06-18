@@ -266,7 +266,11 @@ def _llm_call_via_registry(
 ) -> Any:
     """Registry-backend variant of ``_llm_call`` (MODEL_REGISTRY + gateway)."""
     from uhc_llm import invoke_prompt
-    from uhc_llm.registry import load_agent_model_map, resolve_registry_model_name
+    from uhc_llm.registry import (
+        load_agent_model_map,
+        load_model_registry,
+        resolve_registry_model_name,
+    )
 
     pg_logger = getattr(cfg, "_pg_logger", None)
     prompt = prompt + (
@@ -352,12 +356,17 @@ def _llm_call_via_registry(
             return data
         last_error = err or "unknown error"
 
+    registry = load_model_registry()
     default_model = load_agent_model_map().get("__default__")
     try:
         primary_model = resolve_registry_model_name(agent_name)
     except RuntimeError:
         primary_model = None
-    if default_model and default_model != primary_model:
+    if (
+        default_model
+        and default_model != primary_model
+        and default_model in registry
+    ):
         data, _err = _try_registry(
             prompt, "default-fallback", model_name=default_model,
         )
@@ -526,6 +535,33 @@ def _pdf_content_blocks(prompt: str, pdf_b64_list: list[str]) -> list[dict]:
     return blocks
 
 
+def _pdf_text_extract(pdf_b64_list: list[str], *, max_chars: int = 120000) -> str:
+    """Best-effort plain-text extraction from base64 PDF slices."""
+    from pypdf import PdfReader
+
+    parts: list[str] = []
+    total = 0
+    for b64 in pdf_b64_list:
+        if not b64:
+            continue
+        try:
+            reader = PdfReader(io.BytesIO(base64.b64decode(b64)))
+        except Exception:
+            continue
+        for page in reader.pages:
+            txt = (page.extract_text() or "").strip()
+            if not txt:
+                continue
+            parts.append(txt)
+            total += len(txt)
+            if total >= max_chars:
+                break
+        if total >= max_chars:
+            break
+    out = "\n\n".join(parts)
+    return out[:max_chars]
+
+
 def _llm_call_pdf_via_registry(
     cfg,
     prompt: str,
@@ -539,8 +575,16 @@ def _llm_call_pdf_via_registry(
     max_retries: int = 2,
     max_tokens: int = 8192,
 ) -> Any:
-    """Registry-backend PDF vision via bedrock_claude UHG gateway."""
-    from uhc_llm.gateway import describe_registry_target, invoke_registry_messages
+    """Registry-backend PDF call honoring env model selection.
+
+    - If resolved model is ``bedrock_claude``: use native PDF document blocks.
+    - Otherwise: extract text from PDF slices and send as text prompt.
+    """
+    from uhc_llm.gateway import (
+        describe_registry_target,
+        invoke_registry_chat,
+        invoke_registry_messages,
+    )
     from uhc_llm.registry import get_model_spec, resolve_pdf_registry_model_name
 
     pg_logger = getattr(cfg, "_pg_logger", None)
@@ -556,13 +600,32 @@ def _llm_call_pdf_via_registry(
             model_key = resolve_pdf_registry_model_name(agent_name)
             spec = get_model_spec(model_key)
             endpoint_hint = describe_registry_target(spec)
-            content_blocks = _pdf_content_blocks(current_prompt, pdf_b64_list)
-            raw_content, inp, out = invoke_registry_messages(
-                spec,
-                content_blocks=content_blocks,
-                max_tokens=max_tokens,
-                agent_name=agent_name,
-            )
+            if spec.kind == "bedrock_claude":
+                content_blocks = _pdf_content_blocks(current_prompt, pdf_b64_list)
+                raw_content, inp, out = invoke_registry_messages(
+                    spec,
+                    content_blocks=content_blocks,
+                    max_tokens=max_tokens,
+                    agent_name=agent_name,
+                )
+            else:
+                extracted = _pdf_text_extract(pdf_b64_list)
+                if not extracted:
+                    raise RuntimeError(
+                        "Unable to extract text from PDF slices for non-bedrock registry model"
+                    )
+                text_prompt = (
+                    f"{current_prompt}\n\n"
+                    "PDF_TEXT_EXTRACT (from attached slices):\n"
+                    f"{extracted}"
+                )
+                raw_content, inp, out = invoke_registry_chat(
+                    spec,
+                    messages=[{"role": "user", "content": text_prompt}],
+                    max_tokens=max_tokens,
+                    json_mode=False,
+                    agent_name=agent_name,
+                )
             ms = int((time.time() - t0) * 1000)
             if pg_logger:
                 pg_logger.log_llm_call(

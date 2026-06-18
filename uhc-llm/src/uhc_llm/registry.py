@@ -193,16 +193,22 @@ def resolve_registry_model_name(agent_name: str) -> str:
         )
 
     model_name = global_registry_model_name()
-    # Ingestion jobs store provider model names (e.g. claude-sonnet-…) on the row;
-    # ignore values that are not registry keys so AGENT_MODEL_MAP still applies.
+    # Ingestion jobs sometimes carry provider-style names; ignore unknown keys.
     if model_name and model_name not in registry:
         model_name = ""
     if not model_name:
         mapping = load_agent_model_map()
-        model_name = mapping.get(agent_name) or mapping.get("__default__")
+        for candidate in (mapping.get(agent_name), mapping.get("__default__")):
+            if candidate and candidate in registry:
+                model_name = candidate
+                break
     if not model_name:
         if len(registry) == 1:
             return next(iter(registry))
+        # Safe fallback for mixed deployments where one registry key is the
+        # intended default but AGENT_MODEL_MAP / job values drift.
+        if "gpt-5-mini" in registry:
+            return "gpt-5-mini"
         raise RuntimeError(
             f"No model configured for agent {agent_name!r}. "
             f"Set LLM_MODEL to a key from the active registry "

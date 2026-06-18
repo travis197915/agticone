@@ -79,6 +79,8 @@ def _gateway_headers(*, oauth_bearer: bool = True) -> dict[str, str]:
     headers: dict[str, str] = {}
     project_id = os.environ.get("PROJECT_ID", "").strip()
     if project_id:
+        # Different gateway paths expect different project-id header casing.
+        headers["projectId"] = project_id
         headers["project-id"] = project_id
         headers["x-project-id"] = project_id
 
@@ -96,8 +98,35 @@ def _gateway_headers(*, oauth_bearer: bool = True) -> dict[str, str]:
 
 
 def _anthropic_base_url(endpoint: str) -> str:
-    """Anthropic SDK appends ``/v1/messages`` — do not suffix ``/v1`` here."""
-    return endpoint.rstrip("/")
+    """Anthropic SDK appends ``/v1/messages``; target Anthropic sub-route only once."""
+    base = endpoint.rstrip("/")
+    if base.endswith("/anthropic"):
+        return base
+    return f"{base}/anthropic"
+
+
+def _anthropic_model_candidates(deployment: str) -> list[str]:
+    """Return model/deployment candidates compatible with tenant gateway naming."""
+    raw = (deployment or "").strip()
+    if not raw:
+        return [raw]
+
+    candidates: list[str] = [raw]
+    # Common Bedrock deployment form: us.anthropic.claude-opus-4-6-v1
+    simplified = raw
+    if simplified.startswith("us.anthropic."):
+        simplified = simplified[len("us.anthropic."):]
+        candidates.append(simplified)
+    if simplified.endswith("-v1"):
+        candidates.append(simplified[:-3])
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in candidates:
+        if name and name not in seen:
+            ordered.append(name)
+            seen.add(name)
+    return ordered or [raw]
 
 
 def _anthropic_gateway_client(spec: ModelSpec):
@@ -161,7 +190,7 @@ def describe_registry_target(spec: ModelSpec, *, json_mode: bool = False) -> str
         )
     if spec.kind == "bedrock_claude":
         return (
-            f"POST {spec.endpoint}/v1/messages"
+            f"POST {_anthropic_base_url(spec.endpoint)}/v1/messages"
             f" deployment={spec.deployment!r}"
             f" [registry={spec.name!r} kind=bedrock_claude]"
         )
@@ -285,12 +314,25 @@ def invoke_registry_messages(
     t0 = time.time()
     try:
         client = _anthropic_gateway_client(spec)
-        resp = client.messages.create(
-            model=spec.deployment,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": content_blocks}],
-            temperature=0,
-        )
+        last_exc: Exception | None = None
+        resp = None
+        for model_name in _anthropic_model_candidates(spec.deployment):
+            try:
+                resp = client.messages.create(
+                    model=model_name,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": content_blocks}],
+                    temperature=0,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                err_text = str(exc)
+                if "model doesn't exist" not in err_text and "not_found_error" not in err_text:
+                    raise
+        if resp is None:
+            assert last_exc is not None
+            raise last_exc
         parts: list[str] = []
         for block in resp.content:
             text = getattr(block, "text", None)
@@ -331,8 +373,12 @@ def _invoke_azure_openai(
     kwargs: dict[str, Any] = {
         "model": spec.deployment,
         "messages": messages,
-        "max_tokens": max_tokens,
     }
+    deployment_name = (spec.deployment or "").lower()
+    if "gpt-5" in deployment_name:
+        kwargs["max_completion_tokens"] = max_tokens
+    else:
+        kwargs["max_tokens"] = max_tokens
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     resp = client.chat.completions.create(**kwargs)
@@ -397,14 +443,26 @@ def _invoke_bedrock_claude(
     system, chat_messages = _split_anthropic_messages(messages)
     client = _anthropic_gateway_client(spec)
     kwargs: dict[str, Any] = {
-        "model": spec.deployment,
         "max_tokens": max_tokens,
         "messages": chat_messages,
         "temperature": 0,
     }
     if system:
         kwargs["system"] = system
-    resp = client.messages.create(**kwargs)
+    last_exc: Exception | None = None
+    resp = None
+    for model_name in _anthropic_model_candidates(spec.deployment):
+        try:
+            resp = client.messages.create(model=model_name, **kwargs)
+            break
+        except Exception as exc:
+            last_exc = exc
+            err_text = str(exc)
+            if "model doesn't exist" not in err_text and "not_found_error" not in err_text:
+                raise
+    if resp is None:
+        assert last_exc is not None
+        raise last_exc
     parts: list[str] = []
     for block in resp.content:
         text = getattr(block, "text", None)
