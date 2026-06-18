@@ -41,3 +41,11 @@ def test_describe_bedrock_claude_target():
     target = describe_registry_target(spec)
     assert "POST https://api.uhg.com/ai-gateway/1.0/v1/messages" in target
     assert "deployment='us.anthropic.claude-opus-4-6-v1'" in target
+
+
+def test_anthropic_base_url_avoids_double_v1():
+    from uhc_llm.gateway import _anthropic_base_url
+
+    assert _anthropic_base_url("https://api.uhg.com/ai-gateway/1.0/") == (
+        "https://api.uhg.com/ai-gateway/1.0"
+    )

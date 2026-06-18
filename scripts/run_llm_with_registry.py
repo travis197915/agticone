@@ -5,8 +5,6 @@ Usage (from repo root, with uhc-llm installed editable)::
 
     cp .env.example .env   # fill AUTH_URL, CLIENT_ID, CLIENT_SECRET, SCOPE, MODEL_REGISTRY_JSON
     python scripts/run_llm_with_registry.py
-
-Or set env inline like the reference ``run_llm_with_registry.py`` example.
 """
 from __future__ import annotations
 
@@ -27,33 +25,32 @@ def _load_dotenv() -> None:
 
 def main() -> None:
     _load_dotenv()
+    os.environ.setdefault("LLM_BACKEND", "registry")
 
-    # Minimal inline registry (override with MODEL_REGISTRY_JSON in .env)
     if not os.environ.get("MODEL_REGISTRY_JSON") and not os.environ.get("MODEL_REGISTRY"):
-        model_registry = {
-            "test-model": {
-                "kind": "openai_compat",
-                "endpoint": "https://api.uhg.com/api/cloud/api-management/ai-gateway/1.0",
-                "deployment": "llama-3-3_70b-instruct",
-            }
-        }
-        os.environ.setdefault("MODEL_REGISTRY", json.dumps(model_registry))
+        os.environ.setdefault(
+            "MODEL_REGISTRY",
+            json.dumps({
+                "test-model": {
+                    "kind": "openai_compat",
+                    "endpoint": "https://api.uhg.com/api/cloud/api-management/ai-gateway/1.0",
+                    "deployment": "llama-3-3_70b-instruct",
+                }
+            }),
+        )
         model_key = "test-model"
     else:
         model_key = os.environ.get("LLM_MODEL", "gpt-5-mini")
 
-    os.environ.setdefault("LLM_BACKEND", "registry")
-
-    # OAuth (preferred) — or set AI_GATEWAY_API_KEY in .env instead
-    # os.environ.setdefault("AUTH_URL", "https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token")
-    # os.environ.setdefault("SCOPE", "https://api.uhg.com/.default")
-    # os.environ.setdefault("CLIENT_ID", "your-client-id")
-    # os.environ.setdefault("CLIENT_SECRET", "your-client-secret")
-    # os.environ.setdefault("PROJECT_ID", "optional-project-uuid")
-
-    from uhc_llm import invoke_model
+    from uhc_llm import bootstrap_llm_secrets, invoke_model
     from uhc_llm.gateway import gateway_auth_source
-    from uhc_llm.registry import registry_profile_name
+    from uhc_llm.keyvault_loader import keyvault_configured
+    from uhc_llm.registry import refresh_model_registry, registry_profile_name
+
+    if keyvault_configured() or (Path(__file__).resolve().parents[1] / ".env.stg").exists():
+        bootstrap_llm_secrets()
+    else:
+        refresh_model_registry()
 
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},

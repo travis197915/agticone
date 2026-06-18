@@ -123,6 +123,22 @@ def load_model_registry() -> dict[str, ModelSpec]:
     return _build_model_specs(data)
 
 
+def refresh_model_registry() -> dict[str, ModelSpec]:
+    """Clear cached registry/agent-map/OAuth token and reload from ``os.environ``.
+
+    Call after ``load_secrets_into_env()`` so Key Vault secrets are visible.
+    """
+    load_model_registry.cache_clear()
+    load_agent_model_map.cache_clear()
+    try:
+        from .oauth import clear_oauth_token_cache
+
+        clear_oauth_token_cache()
+    except Exception:
+        pass
+    return load_model_registry()
+
+
 @lru_cache(maxsize=1)
 def load_agent_model_map() -> dict[str, str]:
     """Load agent→model mapping from ``AGENT_MODEL_MAP`` profile, file, or inline JSON."""

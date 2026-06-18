@@ -16,6 +16,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+keyvault = [
+    "azure-identity>=1.16",
+    "azure-keyvault-secrets>=4.8",
+]
 
 [project.scripts]
 uhc-llm-export-registry = "uhc_llm.export_registry_env:main"

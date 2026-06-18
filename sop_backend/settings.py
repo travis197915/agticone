@@ -28,9 +28,23 @@ _TOOLS_ENV_FILE = BASE_DIR / "agent_tools" / ".env.tools"
 if _TOOLS_ENV_FILE.exists():
     load_dotenv(_TOOLS_ENV_FILE, override=False)
 
+# ── Azure Key Vault → os.environ (optional; matches reference ask_llm.py) ───
+# Loads AUTH_URL, CLIENT_ID, CLIENT_SECRET, SCOPE, MODEL_REGISTRY_JSON, etc.
+# from Key Vault when AZURE_KEY_VAULT_URL is set (or .env.stg provides KV creds).
+try:
+    from uhc_llm.keyvault_loader import bootstrap_llm_secrets, keyvault_configured
+
+    if keyvault_configured() or (BASE_DIR / ".env.stg").exists():
+        bootstrap_llm_secrets()
+except Exception as _kv_exc:
+    import logging
+    logging.getLogger(__name__).warning("Key Vault bootstrap skipped: %s", _kv_exc)
+
 # ── Validate LLM registry config early (Option A: MODEL_REGISTRY_JSON) ─────
 if os.environ.get("LLM_BACKEND", "").strip().lower() == "registry":
     try:
+        from uhc_llm.gateway import gateway_auth_configured, gateway_auth_source, GATEWAY_KEY_ENV_VARS
+        from uhc_llm.oauth import OAUTH_ENV_VARS, oauth_configured
         from uhc_llm.registry import load_model_registry, registry_profile_name
         _llm_registry = load_model_registry()
         if not _llm_registry:
@@ -47,16 +61,20 @@ if os.environ.get("LLM_BACKEND", "").strip().lower() == "registry":
             warnings.warn(
                 f"LLM registry loaded from {registry_profile_name()!r} "
                 f"({len(_llm_registry)} models) but no gateway auth is set. "
-                f"Set OAuth ({', '.join(OAUTH_ENV_VARS)}, SCOPE) or "
+                f"Set OAuth ({', '.join(OAUTH_ENV_VARS)}) or "
                 f"API key ({', '.join(GATEWAY_KEY_ENV_VARS)}).",
                 stacklevel=1,
             )
         else:
-            from uhc_llm.gateway import gateway_auth_source
             import logging
-            logging.getLogger(__name__).info(
-                "LLM registry auth via %s", gateway_auth_source(),
-            )
+            auth = gateway_auth_source()
+            logging.getLogger(__name__).info("LLM registry auth via %s", auth)
+            if not oauth_configured() and auth == "OPENAI_API_KEY":
+                logging.getLogger(__name__).warning(
+                    "LLM registry uses OPENAI_API_KEY for gateway auth. "
+                    "api.uhg.com typically requires OAuth "
+                    "(AUTH_URL, CLIENT_ID, CLIENT_SECRET, SCOPE)."
+                )
     except Exception as _llm_exc:
         import warnings
         warnings.warn(f"LLM registry config invalid: {_llm_exc}", stacklevel=1)

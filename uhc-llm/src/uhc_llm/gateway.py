@@ -73,7 +73,7 @@ def _client_api_key() -> str:
     return _gateway_api_key()
 
 
-def _gateway_headers() -> dict[str, str]:
+def _gateway_headers(*, oauth_bearer: bool = True) -> dict[str, str]:
     from .oauth import oauth_configured
 
     headers: dict[str, str] = {}
@@ -83,7 +83,8 @@ def _gateway_headers() -> dict[str, str]:
         headers["x-project-id"] = project_id
 
     if oauth_configured():
-        headers["Authorization"] = f"Bearer {_gateway_bearer_token()}"
+        if oauth_bearer:
+            headers["Authorization"] = f"Bearer {_gateway_bearer_token()}"
     else:
         # UHG gateway sits behind Azure APIM; subscription key header when using api_key mode.
         for name in ("AI_GATEWAY_API_KEY", "APIM_SUBSCRIPTION_KEY"):
@@ -92,6 +93,31 @@ def _gateway_headers() -> dict[str, str]:
                 headers["Ocp-Apim-Subscription-Key"] = val
                 break
     return headers
+
+
+def _anthropic_base_url(endpoint: str) -> str:
+    """Anthropic SDK appends ``/v1/messages`` — do not suffix ``/v1`` here."""
+    return endpoint.rstrip("/")
+
+
+def _anthropic_gateway_client(spec: ModelSpec):
+    """Build Anthropic client for bedrock_claude gateway (OAuth or API key)."""
+    from anthropic import Anthropic
+    from .oauth import oauth_configured
+
+    base_url = _anthropic_base_url(spec.endpoint)
+    if oauth_configured():
+        # Gateway expects Authorization: Bearer (not x-api-key).
+        return Anthropic(
+            auth_token=_gateway_bearer_token(),
+            base_url=base_url,
+            default_headers=_gateway_headers(oauth_bearer=False),
+        )
+    return Anthropic(
+        api_key=_gateway_api_key(),
+        base_url=base_url,
+        default_headers=_gateway_headers(oauth_bearer=False),
+    )
 
 
 def _usage_from_openai(resp: Any) -> tuple[int, int]:
@@ -166,6 +192,16 @@ def _normalize_messages(
     return [{"role": "user", "content": ""}]
 
 
+def _format_gateway_error(exc: Exception) -> str:
+    err = str(exc)
+    if "access_token is missing" in err and gateway_auth_source() != "oauth:client_credentials":
+        err += (
+            " — UHG gateway requires OAuth. Set AUTH_URL, CLIENT_ID, "
+            "CLIENT_SECRET, and SCOPE in .env (not OPENAI_API_KEY)."
+        )
+    return err
+
+
 def invoke_registry_chat(
     spec: ModelSpec,
     *,
@@ -199,11 +235,12 @@ def invoke_registry_chat(
             )
     except Exception as exc:
         ms = int((time.time() - t0) * 1000)
+        err = _format_gateway_error(exc)
         log.warning(
             "llm_gateway failed (%sms) → %s error=%s",
-            ms, ctx, exc,
+            ms, ctx, err,
         )
-        raise
+        raise RuntimeError(err) from exc
 
     ms = int((time.time() - t0) * 1000)
     log.info("llm_gateway ok (%sms) → %s", ms, ctx)
@@ -247,13 +284,7 @@ def invoke_registry_messages(
              ctx, max_tokens, len(content_blocks))
     t0 = time.time()
     try:
-        from anthropic import Anthropic
-
-        client = Anthropic(
-            api_key=_client_api_key(),
-            base_url=f"{spec.endpoint}/v1",
-            default_headers=_gateway_headers(),
-        )
+        client = _anthropic_gateway_client(spec)
         resp = client.messages.create(
             model=spec.deployment,
             max_tokens=max_tokens,
@@ -269,11 +300,12 @@ def invoke_registry_messages(
         result = "".join(parts), inp, out
     except Exception as exc:
         ms = int((time.time() - t0) * 1000)
+        err = _format_gateway_error(exc)
         log.warning(
             "llm_gateway pdf failed (%sms) → %s error=%s",
-            ms, ctx, exc,
+            ms, ctx, err,
         )
-        raise
+        raise RuntimeError(err) from exc
 
     ms = int((time.time() - t0) * 1000)
     log.info("llm_gateway pdf ok (%sms) → %s", ms, ctx)
@@ -362,14 +394,8 @@ def _invoke_bedrock_claude(
     messages: list[dict[str, str]],
     max_tokens: int,
 ) -> tuple[str, int, int]:
-    from anthropic import Anthropic
-
     system, chat_messages = _split_anthropic_messages(messages)
-    client = Anthropic(
-        api_key=_client_api_key(),
-        base_url=f"{spec.endpoint}/v1",
-        default_headers=_gateway_headers(),
-    )
+    client = _anthropic_gateway_client(spec)
     kwargs: dict[str, Any] = {
         "model": spec.deployment,
         "max_tokens": max_tokens,
