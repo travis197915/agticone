@@ -163,7 +163,7 @@ class ClaimProcessingEndpointTests(TestCase):
         body = resp.json()
         self.assertEqual(body["reviewStatus"], "in_progress")
         run.refresh_from_db()
-        self.assertEqual(run.review_status, "in_progress")
+        self.assertEqual(run.auditor_status, "IN_PROGRESS")
 
         summary = self.client.get("/api/claims/REVIEW-CLAIM/summary/")
         self.assertEqual(summary.json()["reviewStatus"], "in_progress")
@@ -178,6 +178,57 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["runId"], str(run.id))
         self.assertEqual(resp.json()["reviewStatus"], "in_progress")
+
+    def test_approve_review_optional_feedback(self):
+        run = self._create_run(claim_id="APPROVE-CLAIM")
+        resp = self.client.post(
+            f"/api/execute/runs/{run.id}/review/approve/",
+            {"feedback": "Looks good"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["reviewStatus"], "approved")
+        self.assertEqual(body["auditorStatus"], "APPROVED")
+        self.assertEqual(body["feedback"], "Looks good")
+        run.refresh_from_db()
+        self.assertEqual(run.review_status, "approved")
+        self.assertEqual(run.auditor_status, "APPROVED")
+        self.assertEqual(run.review_feedback, "Looks good")
+
+    def test_approve_review_without_feedback(self):
+        run = self._create_run(claim_id="APPROVE-NO-FB")
+        resp = self.client.post(
+            f"/api/execute/runs/{run.id}/review/approve/",
+            {},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["reviewStatus"], "approved")
+        self.assertIsNone(resp.json()["feedback"])
+
+    def test_reject_review_requires_feedback(self):
+        run = self._create_run(claim_id="REJECT-CLAIM")
+        resp = self.client.post(
+            f"/api/execute/runs/{run.id}/review/reject/",
+            {},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("feedback is required", resp.json()["detail"])
+
+    def test_reject_review_with_feedback(self):
+        run = self._create_run(claim_id="REJECT-CLAIM")
+        resp = self.client.post(
+            "/api/claims/REJECT-CLAIM/review/reject/",
+            {"feedback": "Missing documentation"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["reviewStatus"], "rejected")
+        self.assertEqual(body["auditorStatus"], "REJECTED")
+        self.assertEqual(body["feedback"], "Missing documentation")
 
 
 class PersistFailureRegressionTests(TestCase):

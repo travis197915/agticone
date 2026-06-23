@@ -44,6 +44,8 @@ def serialize_run_summary(run: RuleExecutionRun) -> dict:
         ),
         "processing_time_min": _processing_time_min(run),
         "review_status": run.review_status or None,
+        "auditor_status": run.auditor_status or None,
+        "feedback": run.review_feedback or None,
     }
 
 
@@ -100,8 +102,8 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
         fields = ["id", "batch", "workflow", "claim_id", "claim_payload",
                   "raw_fetch", "started_at", "finished_at", "status",
                   "final_decision_type", "applied_codes", "narrative",
-                  "error_message", "review_status", "evaluations",
-                  "tool_invocations"]
+                  "error_message", "review_status", "review_feedback",
+                  "auditor_status", "evaluations", "tool_invocations"]
 
 
 class BatchExecutionRunSerializer(serializers.ModelSerializer):

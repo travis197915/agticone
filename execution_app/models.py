@@ -61,7 +61,17 @@ class RuleExecutionRun(_UUIDPK):
         ("", "Not started"),
         ("pending", "Pending review"),
         ("in_progress", "In progress"),
+        ("approved", "Approved"),
+        ("rejected", "Rejected"),
         ("completed", "Completed"),
+    ]
+    AUDITOR_STATUS_CHOICES = [
+        ("", "Not started"),
+        ("PENDING", "Pending"),
+        ("IN_PROGRESS", "In progress"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+        ("COMPLETED", "Completed"),
     ]
 
     batch = models.ForeignKey(
@@ -83,6 +93,10 @@ class RuleExecutionRun(_UUIDPK):
     error_message = models.TextField(blank=True, default="")
     review_status = models.CharField(
         max_length=32, choices=REVIEW_STATUS_CHOICES, blank=True, default="",
+    )
+    review_feedback = models.TextField(blank=True, default="")
+    auditor_status = models.CharField(
+        max_length=32, choices=AUDITOR_STATUS_CHOICES, blank=True, default="",
     )
 
     class Meta:

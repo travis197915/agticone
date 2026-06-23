@@ -684,6 +684,8 @@ def _run_header_payload_light(run: RuleExecutionRun, trace=None) -> dict[str, An
         "startedAt": _iso_utc(run.started_at),
         "finishedAt": _iso_utc(run.finished_at),
         "reviewStatus": run.review_status or None,
+        "auditorStatus": run.auditor_status or None,
+        "feedback": run.review_feedback or None,
     }
 
 
@@ -707,6 +709,8 @@ def _run_header_payload(
         "startedAt": _iso_utc(run.started_at),
         "finishedAt": _iso_utc(run.finished_at),
         "reviewStatus": run.review_status or None,
+        "auditorStatus": run.auditor_status or None,
+        "feedback": run.review_feedback or None,
     }
 
 
@@ -1005,7 +1009,22 @@ class RunDetailView(APIView):
         return Response(RuleExecutionRunSerializer(run).data)
 
 
-_VALID_REVIEW_STATUSES = frozenset({"", "pending", "in_progress", "completed"})
+_VALID_REVIEW_STATUSES = frozenset({
+    "", "pending", "in_progress", "approved", "rejected", "completed",
+})
+
+_REVIEW_TO_AUDITOR_STATUS = {
+    "": "",
+    "pending": "PENDING",
+    "in_progress": "IN_PROGRESS",
+    "approved": "APPROVED",
+    "rejected": "REJECTED",
+    "completed": "COMPLETED",
+}
+
+
+def _auditor_status_for_review(review_status: str) -> str:
+    return _REVIEW_TO_AUDITOR_STATUS.get(review_status, "")
 
 
 def _parse_review_status_body(request: Request) -> tuple[str | None, Response | None]:
@@ -1035,7 +1054,136 @@ def _serialize_review_status_update(run: RuleExecutionRun) -> dict[str, Any]:
         "runStatus": run.status,
         "claimStatus": claim_audit_status(run),
         "reviewStatus": run.review_status or None,
+        "auditorStatus": run.auditor_status or None,
+        "feedback": run.review_feedback or None,
     }
+
+
+def _parse_feedback_body(
+    request: Request, *, required: bool,
+) -> tuple[str | None, Response | None]:
+    raw = request.data.get("feedback", request.data.get("reviewFeedback"))
+    if raw is None:
+        raw = ""
+    value = str(raw).strip()
+    if required and not value:
+        return None, Response(
+            {"detail": "feedback is required when rejecting a review"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return value, None
+
+
+def _apply_review_decision(
+    run: RuleExecutionRun,
+    *,
+    review_status: str,
+    feedback: str,
+) -> RuleExecutionRun:
+    run.review_status = review_status
+    run.auditor_status = _auditor_status_for_review(review_status)
+    run.review_feedback = feedback
+    run.save(update_fields=["review_status", "auditor_status", "review_feedback"])
+    return run
+
+
+def _apply_review_status(run: RuleExecutionRun, review_status: str) -> RuleExecutionRun:
+    run.review_status = review_status
+    run.auditor_status = _auditor_status_for_review(review_status)
+    run.save(update_fields=["review_status", "auditor_status"])
+    return run
+
+
+class RunReviewApproveView(APIView):
+    """POST /api/execute/runs/<run_id>/review/approve/"""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request: Request, run_id: str) -> Response:
+        try:
+            run = RuleExecutionRun.objects.get(id=run_id)
+        except RuleExecutionRun.DoesNotExist:
+            return Response({"detail": "not found"},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        feedback, err = _parse_feedback_body(request, required=False)
+        if err is not None:
+            return err
+        assert feedback is not None
+
+        _apply_review_decision(run, review_status="approved", feedback=feedback)
+        return Response(_serialize_review_status_update(run))
+
+
+class RunReviewRejectView(APIView):
+    """POST /api/execute/runs/<run_id>/review/reject/"""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request: Request, run_id: str) -> Response:
+        try:
+            run = RuleExecutionRun.objects.get(id=run_id)
+        except RuleExecutionRun.DoesNotExist:
+            return Response({"detail": "not found"},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        feedback, err = _parse_feedback_body(request, required=True)
+        if err is not None:
+            return err
+        assert feedback is not None
+
+        _apply_review_decision(run, review_status="rejected", feedback=feedback)
+        return Response(_serialize_review_status_update(run))
+
+
+class ClaimReviewApproveView(APIView):
+    """POST /api/claims/<claim_id>/review/approve/"""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request: Request, claim_id: str) -> Response:
+        run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
+        if err is not None:
+            return err
+        run, err = _load_run_for_claim(
+            claim_id, run_uuid, batch_uuid, lightweight=True,
+        )
+        if err is not None:
+            return err
+        assert run is not None
+
+        feedback, err = _parse_feedback_body(request, required=False)
+        if err is not None:
+            return err
+        assert feedback is not None
+
+        _apply_review_decision(run, review_status="approved", feedback=feedback)
+        return Response(_serialize_review_status_update(run))
+
+
+class ClaimReviewRejectView(APIView):
+    """POST /api/claims/<claim_id>/review/reject/"""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request: Request, claim_id: str) -> Response:
+        run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
+        if err is not None:
+            return err
+        run, err = _load_run_for_claim(
+            claim_id, run_uuid, batch_uuid, lightweight=True,
+        )
+        if err is not None:
+            return err
+        assert run is not None
+
+        feedback, err = _parse_feedback_body(request, required=True)
+        if err is not None:
+            return err
+        assert feedback is not None
+
+        _apply_review_decision(run, review_status="rejected", feedback=feedback)
+        return Response(_serialize_review_status_update(run))
 
 
 class RunReviewStatusView(APIView):
@@ -1059,8 +1207,7 @@ class RunReviewStatusView(APIView):
             return err
         assert review_status is not None
 
-        run.review_status = review_status
-        run.save(update_fields=["review_status"])
+        _apply_review_status(run, review_status)
         return Response(_serialize_review_status_update(run))
 
 
@@ -1089,8 +1236,7 @@ class ClaimReviewStatusView(APIView):
             return err
         assert review_status is not None
 
-        run.review_status = review_status
-        run.save(update_fields=["review_status"])
+        _apply_review_status(run, review_status)
         return Response(_serialize_review_status_update(run))
 
 
@@ -1171,7 +1317,8 @@ class ClaimSummaryView(APIView):
                 for inv in outer_tools
             ],
             "reviewStatus": run.review_status or None,
-            "feedback": None,
+            "auditorStatus": run.auditor_status or None,
+            "feedback": run.review_feedback or None,
         }
         return Response(payload, status=status.HTTP_200_OK)
 
@@ -1260,7 +1407,8 @@ class ClaimProcessingView(APIView):
                 for log in llm_calls
             ],
             "reviewStatus": run.review_status or None,
-            "feedback": None,
+            "auditorStatus": run.auditor_status or None,
+            "feedback": run.review_feedback or None,
         }
         return Response(payload, status=status.HTTP_200_OK)
 
