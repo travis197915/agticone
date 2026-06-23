@@ -36,8 +36,9 @@ from rest_framework.views import APIView
 from . import trace_builder
 from .models import BatchExecutionRun, RuleExecutionRun
 from .serializers import (BatchExecutionRunSerializer,
-                          RuleExecutionRunSerializer, serialize_run_summary)
-from .trace_builder import (CLEAN, DEFECT, INCONCLUSIVE, _CLEAN_DECISIONS,
+                          RuleExecutionRunSerializer, claim_audit_status,
+                          serialize_run_summary)
+from .trace_builder import (CLEAN, DEFECT, INCONCLUSIVE, IN_PROGRESS, _CLEAN_DECISIONS,
                             _DEFECT_DECISIONS)
 
 logger = logging.getLogger(__name__)
@@ -242,7 +243,7 @@ def _claim_status(
     agrees with the per-agent / Explainability views.
     """
     if run.status == "RUNNING":
-        return INCONCLUSIVE
+        return IN_PROGRESS
     if run.status in {"FAILED", "FETCH_FAILED"}:
         return INCONCLUSIVE
     if run.status == "TERMINATED_EARLY":
@@ -478,7 +479,7 @@ def _claim_run_context(
 def _claim_status_light(run: RuleExecutionRun, trace=None) -> str:
     """Fast claim status for the summary tab — no trace_json walk or node rollup."""
     if run.status == "RUNNING":
-        return INCONCLUSIVE
+        return IN_PROGRESS
     if run.status in {"FAILED", "FETCH_FAILED"}:
         return INCONCLUSIVE
     if run.status == "TERMINATED_EARLY":
@@ -682,6 +683,7 @@ def _run_header_payload_light(run: RuleExecutionRun, trace=None) -> dict[str, An
         "processingTimeMin": _processing_time_min(run),
         "startedAt": _iso_utc(run.started_at),
         "finishedAt": _iso_utc(run.finished_at),
+        "reviewStatus": run.review_status or None,
     }
 
 
@@ -704,6 +706,7 @@ def _run_header_payload(
         "processingTimeMin": _processing_time_min(run),
         "startedAt": _iso_utc(run.started_at),
         "finishedAt": _iso_utc(run.finished_at),
+        "reviewStatus": run.review_status or None,
     }
 
 
@@ -913,10 +916,12 @@ def _filter_run_list_queryset(request: Request, qs):
         )
     elif claim_status == INCONCLUSIVE:
         qs = qs.filter(
-            Q(status__in=["RUNNING", "FAILED", "FETCH_FAILED"])
+            Q(status__in=["FAILED", "FETCH_FAILED"])
             | Q(final_decision_type__iexact="INCONCLUSIVE")
             | Q(final_decision_type="")
         )
+    elif claim_status == IN_PROGRESS:
+        qs = qs.filter(status="RUNNING")
 
     from_date = _parse_yyyy_mm_dd(request.query_params.get("from_date", ""))
     if from_date is not None:
@@ -1000,6 +1005,95 @@ class RunDetailView(APIView):
         return Response(RuleExecutionRunSerializer(run).data)
 
 
+_VALID_REVIEW_STATUSES = frozenset({"", "pending", "in_progress", "completed"})
+
+
+def _parse_review_status_body(request: Request) -> tuple[str | None, Response | None]:
+    if "reviewStatus" not in request.data and "review_status" not in request.data:
+        return None, Response(
+            {"detail": "reviewStatus is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    raw = request.data.get("reviewStatus", request.data.get("review_status"))
+    value = str(raw or "").strip().lower().replace("-", "_")
+    if value not in _VALID_REVIEW_STATUSES:
+        return None, Response(
+            {
+                "detail": f"invalid reviewStatus: {raw!r}",
+                "allowed": sorted(_VALID_REVIEW_STATUSES - {""}),
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return value, None
+
+
+def _serialize_review_status_update(run: RuleExecutionRun) -> dict[str, Any]:
+    return {
+        "runId": str(run.id),
+        "claimId": run.claim_id,
+        "batchId": str(run.batch_id) if run.batch_id else None,
+        "runStatus": run.status,
+        "claimStatus": claim_audit_status(run),
+        "reviewStatus": run.review_status or None,
+    }
+
+
+class RunReviewStatusView(APIView):
+    """PATCH /api/execute/runs/<run_id>/review-status/
+
+    Mark the human audit / review workflow for one claim run (e.g.
+    ``{"reviewStatus": "in_progress"}``).
+    """
+
+    permission_classes = [AllowAny]
+
+    def patch(self, request: Request, run_id: str) -> Response:
+        try:
+            run = RuleExecutionRun.objects.get(id=run_id)
+        except RuleExecutionRun.DoesNotExist:
+            return Response({"detail": "not found"},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        review_status, err = _parse_review_status_body(request)
+        if err is not None:
+            return err
+        assert review_status is not None
+
+        run.review_status = review_status
+        run.save(update_fields=["review_status"])
+        return Response(_serialize_review_status_update(run))
+
+
+class ClaimReviewStatusView(APIView):
+    """PATCH /api/claims/<claim_id>/review-status/
+
+    Same as ``RunReviewStatusView`` but resolves the run via ``claim_id`` and
+    optional ``?run_id=`` / ``?batch_id=`` query params.
+    """
+
+    permission_classes = [AllowAny]
+
+    def patch(self, request: Request, claim_id: str) -> Response:
+        run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
+        if err is not None:
+            return err
+        run, err = _load_run_for_claim(
+            claim_id, run_uuid, batch_uuid, lightweight=True,
+        )
+        if err is not None:
+            return err
+        assert run is not None
+
+        review_status, err = _parse_review_status_body(request)
+        if err is not None:
+            return err
+        assert review_status is not None
+
+        run.review_status = review_status
+        run.save(update_fields=["review_status"])
+        return Response(_serialize_review_status_update(run))
+
+
 class RunNodesView(APIView):
     """GET /api/execute/runs/<run_id>/nodes/
 
@@ -1076,7 +1170,7 @@ class ClaimSummaryView(APIView):
                 }
                 for inv in outer_tools
             ],
-            "reviewStatus": None,
+            "reviewStatus": run.review_status or None,
             "feedback": None,
         }
         return Response(payload, status=status.HTTP_200_OK)
@@ -1165,7 +1259,7 @@ class ClaimProcessingView(APIView):
                 }
                 for log in llm_calls
             ],
-            "reviewStatus": None,
+            "reviewStatus": run.review_status or None,
             "feedback": None,
         }
         return Response(payload, status=status.HTTP_200_OK)

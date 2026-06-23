@@ -110,11 +110,11 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(body["runId"], str(run.id))
         self.assertEqual(body["batchId"], str(self.batch.id))
         self.assertEqual(body["workflowId"], str(self.workflow.id))
-        self.assertEqual(body["claimStatus"], "MET")
+        self.assertEqual(body["claimStatus"], "CLEAN")
         self.assertEqual(body["reviewStatus"], None)
         self.assertEqual(body["feedback"], None)
         self.assertEqual(len(body["agents"]), 1)
-        self.assertEqual(body["agents"][0]["status"], "MET")
+        self.assertEqual(body["agents"][0]["status"], "CLEAN")
         self.assertEqual(body["agents"][0]["steps"][0]["duration"], "12s")
         self.assertEqual(len(body["outerToolInvocations"]), 1)
         self.assertEqual(body["outerToolInvocations"][0]["phase"], "FETCH")
@@ -138,6 +138,46 @@ class ClaimProcessingEndpointTests(TestCase):
         body = resp.json()
         self.assertEqual(body["source"], "django")
         self.assertIn("Malformed run_id", body["error"])
+
+    def test_running_claim_reports_in_progress_status(self):
+        run = RuleExecutionRun.objects.create(
+            batch=self.batch,
+            workflow=self.workflow,
+            claim_id="RUNNING-CLAIM",
+            status="RUNNING",
+        )
+        resp = self.client.get("/api/claims/RUNNING-CLAIM/summary/")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["runStatus"], "RUNNING")
+        self.assertEqual(body["claimStatus"], "IN_PROGRESS")
+
+    def test_patch_review_status_in_progress(self):
+        run = self._create_run(claim_id="REVIEW-CLAIM")
+        resp = self.client.patch(
+            f"/api/execute/runs/{run.id}/review-status/",
+            {"reviewStatus": "in_progress"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["reviewStatus"], "in_progress")
+        run.refresh_from_db()
+        self.assertEqual(run.review_status, "in_progress")
+
+        summary = self.client.get("/api/claims/REVIEW-CLAIM/summary/")
+        self.assertEqual(summary.json()["reviewStatus"], "in_progress")
+
+    def test_patch_claim_review_status_endpoint(self):
+        run = self._create_run(claim_id="REVIEW-CLAIM-2")
+        resp = self.client.patch(
+            "/api/claims/REVIEW-CLAIM-2/review-status/",
+            {"review_status": "in_progress"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["runId"], str(run.id))
+        self.assertEqual(resp.json()["reviewStatus"], "in_progress")
 
 
 class PersistFailureRegressionTests(TestCase):

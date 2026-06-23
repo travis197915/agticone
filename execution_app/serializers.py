@@ -43,6 +43,7 @@ def serialize_run_summary(run: RuleExecutionRun) -> dict:
             run.finished_at.strftime("%Y-%m-%d") if run.finished_at else ""
         ),
         "processing_time_min": _processing_time_min(run),
+        "review_status": run.review_status or None,
     }
 
 
@@ -54,7 +55,7 @@ def claim_audit_status(run: RuleExecutionRun) -> str:
     the detail page. A system/fetch failure is *inconclusive*, not a defect.
     """
     if run.status == "RUNNING":
-        return trace_builder.INCONCLUSIVE
+        return trace_builder.IN_PROGRESS
     if run.status in {"FAILED", "FETCH_FAILED"}:
         return trace_builder.INCONCLUSIVE
     if run.status == "TERMINATED_EARLY":
@@ -99,7 +100,8 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
         fields = ["id", "batch", "workflow", "claim_id", "claim_payload",
                   "raw_fetch", "started_at", "finished_at", "status",
                   "final_decision_type", "applied_codes", "narrative",
-                  "error_message", "evaluations", "tool_invocations"]
+                  "error_message", "review_status", "evaluations",
+                  "tool_invocations"]
 
 
 class BatchExecutionRunSerializer(serializers.ModelSerializer):

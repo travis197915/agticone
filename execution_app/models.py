@@ -57,6 +57,12 @@ class RuleExecutionRun(_UUIDPK):
         ("TERMINATED_EARLY", "Terminated early (DENY/STOP rule on a shape)"),
         ("FETCH_FAILED", "Claim fetch failed"),
     ]
+    REVIEW_STATUS_CHOICES = [
+        ("", "Not started"),
+        ("pending", "Pending review"),
+        ("in_progress", "In progress"),
+        ("completed", "Completed"),
+    ]
 
     batch = models.ForeignKey(
         BatchExecutionRun, on_delete=models.SET_NULL, null=True, blank=True,
@@ -75,6 +81,9 @@ class RuleExecutionRun(_UUIDPK):
     applied_codes = models.JSONField(default=list, blank=True)
     narrative = models.TextField(blank=True, default="")
     error_message = models.TextField(blank=True, default="")
+    review_status = models.CharField(
+        max_length=32, choices=REVIEW_STATUS_CHOICES, blank=True, default="",
+    )
 
     class Meta:
         db_table = "execution_rule_run"
