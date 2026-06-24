@@ -356,17 +356,15 @@ def _llm_call_via_registry(
             return data
         last_error = err or "unknown error"
 
-    registry = load_model_registry()
+    registry_keys = set(load_model_registry().keys())
     default_model = load_agent_model_map().get("__default__")
+    if default_model and default_model not in registry_keys:
+        default_model = None
     try:
         primary_model = resolve_registry_model_name(agent_name)
     except RuntimeError:
         primary_model = None
-    if (
-        default_model
-        and default_model != primary_model
-        and default_model in registry
-    ):
+    if default_model and default_model != primary_model:
         data, _err = _try_registry(
             prompt, "default-fallback", model_name=default_model,
         )

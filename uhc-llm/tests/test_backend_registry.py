@@ -122,14 +122,14 @@ def test_llm_model_overrides_agent_map(monkeypatch):
     assert resolve_registry_model_name("NpiMatch") == "opus"
 
 
-def test_invalid_llm_model_falls_back_to_agent_map(monkeypatch):
-    """Job rows store provider model names; ignore them for registry routing."""
+def test_invalid_llm_model_raises(monkeypatch):
+    """Provider-style LLM_MODEL values must not silently win over agent map."""
     monkeypatch.setenv("MODEL_REGISTRY_JSON", json.dumps(SAMPLE_REGISTRY))
     monkeypatch.setenv("AGENT_MODEL_MAP", "ingestion")
     monkeypatch.setenv("LLM_MODEL", "claude-sonnet-4-5-20250929")
 
-    assert resolve_registry_model_name("rule_semantic_enricher") == "opus"
-    assert resolve_registry_model_name("date_condition_extractor") == "gpt-5-mini"
+    with pytest.raises(RuntimeError, match="not in the active registry"):
+        resolve_registry_model_name("rule_semantic_enricher")
 
 
 def test_agent_map_skips_keys_not_in_registry(monkeypatch):
@@ -143,11 +143,12 @@ def test_agent_map_skips_keys_not_in_registry(monkeypatch):
     assert resolve_registry_model_name("my_agent") == "gpt-5-mini"
 
 
-def test_gpt5_mini_fallback_when_no_agent_map_match(monkeypatch):
+def test_no_model_raises_when_agent_map_missing(monkeypatch):
     monkeypatch.setenv("MODEL_REGISTRY_JSON", json.dumps(SAMPLE_REGISTRY))
     monkeypatch.setenv("AGENT_MODEL_MAP", json.dumps({"__default__": "also-missing"}))
 
-    assert resolve_registry_model_name("unknown_agent") == "gpt-5-mini"
+    with pytest.raises(RuntimeError, match="No model configured"):
+        resolve_registry_model_name("unknown_agent")
 
 
 def test_apply_job_llm_env_skips_provider_model_in_registry_mode(monkeypatch):

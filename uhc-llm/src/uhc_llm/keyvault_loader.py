@@ -217,17 +217,15 @@ def fetch_selected_secrets(client: Any, names: list[str]) -> dict[str, str]:
             if value is not None:
                 secrets[name] = value
         except ResourceNotFoundError:
+            # Some environments have mixed naming / optional secrets.
             continue
     return secrets
 
 
-def load_secrets_into_env(*, force: bool = False, scope: str = "llm") -> dict[str, str]:
+def load_secrets_into_env(*, force: bool = False, scope: str = "all") -> dict[str, str]:
     """Fetch Key Vault secrets and inject them into ``os.environ``.
 
     Does not overwrite env vars that are already set (OS / .env take precedence).
-
-    ``scope="llm"`` fetches only focused LLM/gateway secret names (default).
-    ``scope="all"`` lists and loads every enabled secret in the vault.
 
     Returns the mapping of **newly injected** env-var keys → values.
     """
