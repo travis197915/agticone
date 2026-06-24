@@ -17,7 +17,7 @@ import os
 import time
 import uuid
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timezone as dt_timezone
 from pathlib import Path
 from time import monotonic as _monotonic
 from typing import Any, Iterator
@@ -25,6 +25,7 @@ from typing import Any, Iterator
 from django.conf import settings
 from django.db.models import Avg, DurationField, ExpressionWrapper, F, Q
 from django.http import StreamingHttpResponse
+from django.utils import timezone as dj_timezone
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import AllowAny
@@ -58,8 +59,8 @@ def _iso_utc(ts: datetime | None) -> str | None:
     if ts is None:
         return None
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        ts = ts.replace(tzinfo=dt_timezone.utc)
+    return ts.astimezone(dt_timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _format_clock(ts: datetime | None) -> str:
@@ -67,8 +68,8 @@ def _format_clock(ts: datetime | None) -> str:
     if ts is None:
         return ""
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc).strftime("%I:%M:%S %p")
+        ts = ts.replace(tzinfo=dt_timezone.utc)
+    return ts.astimezone(dt_timezone.utc).strftime("%I:%M:%S %p")
 
 
 def _format_duration(duration_ms: int | None) -> str:
@@ -686,6 +687,7 @@ def _run_header_payload_light(run: RuleExecutionRun, trace=None) -> dict[str, An
         "reviewStatus": run.review_status or None,
         "auditorStatus": run.auditor_status or None,
         "feedback": run.review_feedback or None,
+        **_review_date_fields(run),
     }
 
 
@@ -711,6 +713,7 @@ def _run_header_payload(
         "reviewStatus": run.review_status or None,
         "auditorStatus": run.auditor_status or None,
         "feedback": run.review_feedback or None,
+        **_review_date_fields(run),
     }
 
 
@@ -899,7 +902,7 @@ def _parse_yyyy_mm_dd(value: str) -> datetime | None:
     if not raw:
         return None
     try:
-        return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=dt_timezone.utc)
     except ValueError:
         return None
 
@@ -1046,6 +1049,13 @@ def _parse_review_status_body(request: Request) -> tuple[str | None, Response | 
     return value, None
 
 
+def _review_date_fields(run: RuleExecutionRun) -> dict[str, Any]:
+    return {
+        "reviewStartedAt": _iso_utc(run.review_started_at),
+        "reviewedAt": _iso_utc(run.reviewed_at),
+    }
+
+
 def _serialize_review_status_update(run: RuleExecutionRun) -> dict[str, Any]:
     return {
         "runId": str(run.id),
@@ -1056,6 +1066,7 @@ def _serialize_review_status_update(run: RuleExecutionRun) -> dict[str, Any]:
         "reviewStatus": run.review_status or None,
         "auditorStatus": run.auditor_status or None,
         "feedback": run.review_feedback or None,
+        **_review_date_fields(run),
     }
 
 
@@ -1080,17 +1091,26 @@ def _apply_review_decision(
     review_status: str,
     feedback: str,
 ) -> RuleExecutionRun:
+    now = dj_timezone.now()
     run.review_status = review_status
     run.auditor_status = _auditor_status_for_review(review_status)
     run.review_feedback = feedback
-    run.save(update_fields=["review_status", "auditor_status", "review_feedback"])
+    if review_status in {"approved", "rejected"}:
+        run.reviewed_at = now
+    fields = ["review_status", "auditor_status", "review_feedback", "reviewed_at"]
+    run.save(update_fields=fields)
     return run
 
 
 def _apply_review_status(run: RuleExecutionRun, review_status: str) -> RuleExecutionRun:
+    now = dj_timezone.now()
     run.review_status = review_status
     run.auditor_status = _auditor_status_for_review(review_status)
-    run.save(update_fields=["review_status", "auditor_status"])
+    fields = ["review_status", "auditor_status"]
+    if review_status == "in_progress":
+        run.review_started_at = now
+        fields.append("review_started_at")
+    run.save(update_fields=fields)
     return run
 
 

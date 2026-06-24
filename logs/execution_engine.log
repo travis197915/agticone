@@ -5134,3 +5134,4 @@ django.db.utils.ProgrammingError: column "verdict" of relation "execution_rule_e
 LINE 1: ...son", "confidence", "reasoning", "decision_type", "verdict",...
                                                              ^
 
+2026-06-23 09:27:36 INFO execution_app.views batch-events: client disconnected batch=6554fb94-733c-4072-b070-a90521669042

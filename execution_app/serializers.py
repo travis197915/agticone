@@ -46,6 +46,8 @@ def serialize_run_summary(run: RuleExecutionRun) -> dict:
         "review_status": run.review_status or None,
         "auditor_status": run.auditor_status or None,
         "feedback": run.review_feedback or None,
+        "review_started_at": _format_time(run.review_started_at),
+        "reviewed_at": _format_time(run.reviewed_at),
     }
 
 
@@ -103,7 +105,8 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
                   "raw_fetch", "started_at", "finished_at", "status",
                   "final_decision_type", "applied_codes", "narrative",
                   "error_message", "review_status", "review_feedback",
-                  "auditor_status", "evaluations", "tool_invocations"]
+                  "auditor_status", "review_started_at", "reviewed_at",
+                  "evaluations", "tool_invocations"]
 
 
 class BatchExecutionRunSerializer(serializers.ModelSerializer):

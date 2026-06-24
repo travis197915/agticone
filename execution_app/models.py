@@ -98,6 +98,8 @@ class RuleExecutionRun(_UUIDPK):
     auditor_status = models.CharField(
         max_length=32, choices=AUDITOR_STATUS_CHOICES, blank=True, default="",
     )
+    review_started_at = models.DateTimeField(null=True, blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         db_table = "execution_rule_run"

@@ -164,6 +164,8 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(body["reviewStatus"], "in_progress")
         run.refresh_from_db()
         self.assertEqual(run.auditor_status, "IN_PROGRESS")
+        self.assertIsNotNone(run.review_started_at)
+        self.assertIn("reviewStartedAt", body)
 
         summary = self.client.get("/api/claims/REVIEW-CLAIM/summary/")
         self.assertEqual(summary.json()["reviewStatus"], "in_progress")
@@ -194,6 +196,7 @@ class ClaimProcessingEndpointTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.review_status, "approved")
         self.assertEqual(run.auditor_status, "APPROVED")
+        self.assertIsNotNone(run.reviewed_at)
         self.assertEqual(run.review_feedback, "Looks good")
 
     def test_approve_review_without_feedback(self):
@@ -229,6 +232,8 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(body["reviewStatus"], "rejected")
         self.assertEqual(body["auditorStatus"], "REJECTED")
         self.assertEqual(body["feedback"], "Missing documentation")
+        run.refresh_from_db()
+        self.assertIsNotNone(run.reviewed_at)
 
 
 class PersistFailureRegressionTests(TestCase):
