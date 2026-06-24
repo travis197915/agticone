@@ -266,40 +266,40 @@ def _llm_call_via_registry(
 ) -> Any:
     """Registry-backend variant of ``_llm_call`` (MODEL_REGISTRY + gateway)."""
     from uhc_llm import invoke_prompt
+    from uhc_llm.prompts import enrich_for_json
     from uhc_llm.registry import (
         load_agent_model_map,
         load_model_registry,
         resolve_registry_model_name,
     )
+    from uhc_llm.router import describe_target
 
     pg_logger = getattr(cfg, "_pg_logger", None)
-    prompt = prompt + (
-        "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+    json_mode = expected_type in (dict, list)
+    prompt = enrich_for_json(
+        prompt,
+        json_mode=json_mode,
+        expects_list=(expected_type is list),
     )
-    if expected_type is list:
-        prompt = prompt + '\n\nWrap the array in a JSON object: {"items": [...]}'
 
     def _try_registry(current_prompt: str, attempt_label: str,
                       *, model_name: str | None = None):
         t0 = time.time()
-        endpoint_hint = "unknown endpoint"
         try:
-            from uhc_llm.gateway import describe_registry_target
-            from uhc_llm.registry import get_model_spec, resolve_registry_model_name
-
-            resolved = model_name or resolve_registry_model_name(agent_name)
-            endpoint_hint = describe_registry_target(
-                get_model_spec(resolved),
-                json_mode=(expected_type in (dict, list)),
+            endpoint_hint = describe_target(
+                agent_name,
+                json_mode=json_mode,
+                model_name=model_name,
+                cfg=cfg,
             )
         except Exception:
-            pass
+            endpoint_hint = "unknown endpoint"
         try:
             llm_resp = invoke_prompt(
                 agent_name=agent_name,
                 prompt=current_prompt,
                 max_tokens=max_tokens,
-                json_mode=(expected_type in (dict, list)),
+                json_mode=json_mode,
                 cfg=cfg,
                 model_name=model_name,
             )
@@ -460,12 +460,13 @@ def _llm_call(
     primary_model  = cfg.anthropic_model if provider     == "anthropic" else cfg.openai_model
     fallback_model = cfg.openai_model    if alt_provider == "openai"    else cfg.anthropic_model
 
-    # Provider-specific JSON instructions
+    # Provider-specific JSON instructions (direct API-key path).
+    from uhc_llm.prompts import ARRAY_WRAP_SUFFIX, enrich_for_json
+
     if provider == "anthropic":
-        prompt = prompt + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+        prompt = enrich_for_json(prompt, json_mode=True)
     elif provider == "openai" and expected_type is list:
-        # json_object mode can't return a bare array — ask for a wrapper key
-        prompt = prompt + '\n\nWrap the array in a JSON object: {"items": [...]}'
+        prompt = prompt + ARRAY_WRAP_SUFFIX
 
     current_prompt = prompt
     last_error = ""
@@ -482,9 +483,7 @@ def _llm_call(
         last_error = err or "unknown error"
 
     # Cross-provider fallback
-    fb_prompt = prompt
-    if alt_provider == "anthropic":
-        fb_prompt = prompt + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+    fb_prompt = enrich_for_json(prompt, json_mode=(alt_provider == "anthropic"))
     data, err = _try(fallback_fn, alt_provider, fallback_model, fb_prompt, "fallback")
     if data is not None:
         return data
@@ -494,150 +493,58 @@ def _llm_call(
 
 
 # ── Native-PDF (vision) call path ─────────────────────────────────────────────
-# Anthropic-only variant of `_llm_call` that sends the ACTUAL PDF bytes to Claude
-# as `document` content blocks so the model "sees" the real page layout, tables,
-# redaction boxes and footnotes — exactly like the Claude chat UI. There is no
-# OpenAI fallback here because GPT-4o's API ingests images, not native PDFs; the
-# perception layer's deterministic page list is the safety net instead.
-
-def _make_anthropic_vision_llm(cfg, max_tokens: int = 8192):
-    """A higher-token ChatAnthropic for document perception (pages are dense)."""
-    from langchain_anthropic import ChatAnthropic
-    return ChatAnthropic(
-        model=cfg.anthropic_model,
-        api_key=cfg.anthropic_api_key,
-        max_tokens=max_tokens,
-        temperature=0,
-    )
+# Registry bedrock models use gateway ``/model/{deployment}/invoke``; direct
+# API-key mode uses Anthropic ``/v1/messages`` with document blocks. Both paths
+# go through ``uhc_llm.router.invoke_pdf``.
 
 
-def _pdf_content_blocks(prompt: str, pdf_b64_list: list[str]) -> list[dict]:
-    """Build a langchain Anthropic multimodal message body.
-
-    One `document` block per base64 PDF slice, followed by the text prompt so the
-    instruction comes after the evidence the model just read.
-    """
-    blocks: list[dict] = []
-    for b64 in pdf_b64_list:
-        if not b64:
-            continue
-        blocks.append({
-            "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": "application/pdf",
-                "data": b64,
-            },
-        })
-    blocks.append({"type": "text", "text": prompt})
-    return blocks
-
-
-def _pdf_text_extract(pdf_b64_list: list[str], *, max_chars: int = 120000) -> str:
-    """Best-effort plain-text extraction from base64 PDF slices."""
-    from pypdf import PdfReader
-
-    parts: list[str] = []
-    total = 0
-    for b64 in pdf_b64_list:
-        if not b64:
-            continue
-        try:
-            reader = PdfReader(io.BytesIO(base64.b64decode(b64)))
-        except Exception:
-            continue
-        for page in reader.pages:
-            txt = (page.extract_text() or "").strip()
-            if not txt:
-                continue
-            parts.append(txt)
-            total += len(txt)
-            if total >= max_chars:
-                break
-        if total >= max_chars:
-            break
-    out = "\n\n".join(parts)
-    return out[:max_chars]
-
-
-def _llm_call_pdf_via_registry(
+def _llm_call_pdf(
     cfg,
     prompt: str,
     pdf_b64_list: list[str],
     fallback: Any,
     agent_name: str,
-    *,
     expected_type: type = dict,
     required_keys: list[str] | None = None,
     stage: str = "pdf_perceive",
     max_retries: int = 2,
     max_tokens: int = 8192,
 ) -> Any:
-    """Registry-backend PDF call honoring env model selection.
-
-    - If resolved model is ``bedrock_claude``: use native PDF document blocks.
-    - Otherwise: extract text from PDF slices and send as text prompt.
-    """
-    from uhc_llm.gateway import (
-        describe_registry_target,
-        invoke_registry_chat,
-        invoke_registry_messages,
-    )
-    from uhc_llm.registry import get_model_spec, resolve_pdf_registry_model_name
+    """PDF vision call with the same guardrails as ``_llm_call`` (both backends)."""
+    from uhc_llm.prompts import enrich_for_json
+    from uhc_llm.router import describe_target, invoke_pdf
 
     pg_logger = getattr(cfg, "_pg_logger", None)
-    base_prompt = prompt + (
-        "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
-    )
+    base_prompt = enrich_for_json(prompt, json_mode=True)
 
     def _try(current_prompt: str, attempt_label: str):
         t0 = time.time()
-        endpoint_hint = "unknown endpoint"
-        model_key = "auto"
         try:
-            model_key = resolve_pdf_registry_model_name(agent_name)
-            spec = get_model_spec(model_key)
-            endpoint_hint = describe_registry_target(spec)
-            if spec.kind == "bedrock_claude":
-                content_blocks = _pdf_content_blocks(current_prompt, pdf_b64_list)
-                raw_content, inp, out = invoke_registry_messages(
-                    spec,
-                    content_blocks=content_blocks,
-                    max_tokens=max_tokens,
-                    agent_name=agent_name,
-                )
-            else:
-                extracted = _pdf_text_extract(pdf_b64_list)
-                if not extracted:
-                    raise RuntimeError(
-                        "Unable to extract text from PDF slices for non-bedrock registry model"
-                    )
-                text_prompt = (
-                    f"{current_prompt}\n\n"
-                    "PDF_TEXT_EXTRACT (from attached slices):\n"
-                    f"{extracted}"
-                )
-                raw_content, inp, out = invoke_registry_chat(
-                    spec,
-                    messages=[{"role": "user", "content": text_prompt}],
-                    max_tokens=max_tokens,
-                    json_mode=False,
-                    agent_name=agent_name,
-                )
+            endpoint_hint = describe_target(agent_name, pdf=True, cfg=cfg)
+        except Exception:
+            endpoint_hint = "unknown endpoint"
+        try:
+            llm_resp = invoke_pdf(
+                agent_name=agent_name,
+                prompt=current_prompt,
+                pdf_b64_list=pdf_b64_list,
+                max_tokens=max_tokens,
+                cfg=cfg,
+            )
             ms = int((time.time() - t0) * 1000)
             if pg_logger:
                 pg_logger.log_llm_call(
                     agent_name=f"{agent_name}[{attempt_label}]",
                     stage=stage,
-                    provider=f"registry:{spec.kind}",
-                    model=model_key,
-                    prompt_tokens=inp,
-                    completion_tokens=out,
+                    provider=llm_resp.provider,
+                    model=llm_resp.model,
+                    prompt_tokens=llm_resp.prompt_tokens,
+                    completion_tokens=llm_resp.completion_tokens,
                     duration_ms=ms,
                     success=True,
                 )
             data = _parse_llm_output(
-                raw_content,
+                llm_resp.content,
                 agent_name=agent_name,
                 attempt_label=attempt_label,
                 expected_type=expected_type,
@@ -654,8 +561,8 @@ def _llm_call_pdf_via_registry(
                 pg_logger.log_llm_call(
                     agent_name=f"{agent_name}[{attempt_label}]",
                     stage=stage,
-                    provider="registry",
-                    model=model_key,
+                    provider="llm",
+                    model="auto",
                     prompt_tokens=0,
                     completion_tokens=0,
                     duration_ms=ms,
@@ -677,146 +584,8 @@ def _llm_call_pdf_via_registry(
             return data
         last_error = err or "unknown error"
 
-    logger.error("llm_call_pdf [%s]: registry attempts failed, returning fallback", agent_name)
-    return fallback
-
-
-def _llm_call_pdf(
-    cfg,
-    prompt: str,
-    pdf_b64_list: list[str],
-    fallback: Any,
-    agent_name: str,
-    expected_type: type = dict,
-    required_keys: list[str] | None = None,
-    stage: str = "pdf_perceive",
-    max_retries: int = 2,
-    max_tokens: int = 8192,
-) -> Any:
-    """Native-PDF Claude call with the same guardrails as `_llm_call`.
-
-    Sends `pdf_b64_list` (one or more base64 PDF slices) plus `prompt` to Claude,
-    then runs the identical parse → salvage → schema-validate → retry path. Every
-    attempt is logged to Postgres via cfg._pg_logger. Returns `fallback` on total
-    failure so the perception layer always has a deterministic floor.
-    """
-    from uhc_llm import is_registry_backend
-
-    if is_registry_backend():
-        return _llm_call_pdf_via_registry(
-            cfg, prompt, pdf_b64_list, fallback, agent_name,
-            expected_type=expected_type,
-            required_keys=required_keys,
-            stage=stage,
-            max_retries=max_retries,
-            max_tokens=max_tokens,
-        )
-
-    from langchain_core.messages import HumanMessage
-    pg_logger = getattr(cfg, "_pg_logger", None)
-    model_name = cfg.anthropic_model
-
-    base_prompt = prompt + (
-        "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
-    )
-
-    def _try(current_prompt: str, attempt_label: str):
-        t0 = time.time()
-        try:
-            llm = _make_anthropic_vision_llm(cfg, max_tokens=max_tokens)
-            content = _pdf_content_blocks(current_prompt, pdf_b64_list)
-            resp = llm.invoke([HumanMessage(content=content)])
-            inp, out = _token_usage(resp)
-            ms = int((time.time() - t0) * 1000)
-            if pg_logger:
-                pg_logger.log_llm_call(
-                    agent_name=f"{agent_name}[{attempt_label}]",
-                    stage=stage, provider="anthropic", model=model_name,
-                    prompt_tokens=inp, completion_tokens=out,
-                    duration_ms=ms, success=True,
-                )
-            try:
-                data = _parse_json(resp.content if isinstance(resp.content, str)
-                                   else _coerce_text_content(resp.content))
-            except json.JSONDecodeError as je:
-                raw = resp.content if isinstance(resp.content, str) \
-                    else _coerce_text_content(resp.content)
-                if expected_type is list:
-                    salvaged = _salvage_json_array(raw)
-                elif expected_type is dict:
-                    salvaged = _salvage_json_object(raw)
-                    if (salvaged and required_keys
-                            and any(k in salvaged for k in required_keys)
-                            and all(isinstance(salvaged[k], list)
-                                    for k in required_keys if k in salvaged)):
-                        for k in required_keys:
-                            salvaged.setdefault(k, [])
-                else:
-                    salvaged = None
-                if not salvaged:
-                    raise
-                logger.warning(
-                    "llm_call_pdf [%s/%s]: salvaged %d objects from truncated JSON (%s)",
-                    agent_name, attempt_label, len(salvaged), je,
-                )
-                data = salvaged
-            data = _unwrap_if_needed(data, expected_type)
-            if not _validate_schema(data, expected_type, required_keys):
-                raise ValueError(
-                    f"Schema mismatch: expected {expected_type.__name__} "
-                    f"with keys {required_keys}, got {type(data).__name__}"
-                )
-            return data, None
-        except Exception as exc:
-            ms = int((time.time() - t0) * 1000)
-            logger.warning(
-                "llm_call_pdf [%s/%s] → anthropic direct api.anthropic.com/v1/messages "
-                "model=%s: %s",
-                agent_name, attempt_label, model_name, exc,
-            )
-            if pg_logger:
-                pg_logger.log_llm_call(
-                    agent_name=f"{agent_name}[{attempt_label}]",
-                    stage=stage, provider="anthropic", model=model_name,
-                    prompt_tokens=0, completion_tokens=0,
-                    duration_ms=ms, success=False, error_message=str(exc),
-                )
-            return None, str(exc)
-
-    last_error = ""
-    for attempt in range(1, max_retries + 1):
-        current = base_prompt
-        if last_error:
-            current = (
-                f"{base_prompt}\n\n[Previous attempt failed: {last_error}. "
-                "Fix the JSON format and try again.]"
-            )
-        data, err = _try(current, f"p{attempt}")
-        if data is not None:
-            return data
-        last_error = err or "unknown error"
-
     logger.error("llm_call_pdf [%s]: all attempts failed, returning fallback", agent_name)
     return fallback
-
-
-def _coerce_text_content(content: Any) -> str:
-    """Flatten Anthropic block-list responses to plain text.
-
-    Some langchain versions return `content` as a list of `{type, text}` blocks
-    rather than a bare string; concatenate the text blocks so JSON parsing works.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for blk in content:
-            if isinstance(blk, dict):
-                parts.append(blk.get("text", "") or "")
-            else:
-                parts.append(str(blk))
-        return "".join(parts)
-    return str(content)
 
 
 # ── 0. StepChecklistReconcilerAgent — Anthropic ───────────────────────────────

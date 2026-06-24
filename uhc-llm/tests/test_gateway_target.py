@@ -1,8 +1,15 @@
-"""Tests for gateway request target descriptions."""
+"""Tests for transport route descriptors."""
 from __future__ import annotations
 
-from uhc_llm.gateway import describe_registry_target
 from uhc_llm.registry import ModelSpec
+from uhc_llm.routes import (
+    anthropic_direct_messages_url,
+    anthropic_gateway_messages_url,
+    anthropic_gateway_sdk_base,
+    bedrock_invoke_url,
+    describe_api_key_target,
+    describe_registry_target,
+)
 
 
 def test_describe_azure_openai_target():
@@ -43,9 +50,23 @@ def test_describe_bedrock_claude_target():
     assert "deployment='us.anthropic.claude-opus-4-6-v1'" in target
 
 
-def test_anthropic_base_url_avoids_double_v1():
-    from uhc_llm.gateway import _anthropic_base_url
-
-    assert _anthropic_base_url("https://api.uhg.com/ai-gateway/1.0/") == (
-        "https://api.uhg.com/ai-gateway/1.0"
+def test_anthropic_direct_vs_gateway_paths():
+    assert anthropic_direct_messages_url() == "https://api.anthropic.com/v1/messages"
+    assert anthropic_gateway_sdk_base("https://api.uhg.com/ai-gateway/1.0/") == (
+        "https://api.uhg.com/ai-gateway/1.0/anthropic"
     )
+    assert anthropic_gateway_messages_url("https://api.uhg.com/ai-gateway/1.0") == (
+        "https://api.uhg.com/ai-gateway/1.0/anthropic/v1/messages"
+    )
+    assert bedrock_invoke_url(
+        "https://api.uhg.com/ai-gateway/1.0",
+        "us.anthropic.claude-opus-4-6-v1",
+    ) == (
+        "https://api.uhg.com/ai-gateway/1.0/model/"
+        "us.anthropic.claude-opus-4-6-v1/invoke"
+    )
+
+
+def test_describe_api_key_target():
+    assert "/v1/messages" in describe_api_key_target(provider="anthropic", model="claude")
+    assert "api_key" in describe_api_key_target(provider="openai")

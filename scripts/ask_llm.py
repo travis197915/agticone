@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import io
 import sys
 from pathlib import Path
 
@@ -55,40 +54,6 @@ def _pdf_to_b64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
-def _extract_pdf_text(path: Path, *, max_chars: int = 30000) -> str:
-    try:
-        from pypdf import PdfReader
-    except ImportError as exc:
-        raise RuntimeError("pypdf is required for --pdf with non-bedrock models") from exc
-
-    reader = PdfReader(io.BytesIO(path.read_bytes()))
-    parts: list[str] = []
-    total = 0
-    for page in reader.pages:
-        txt = (page.extract_text() or "").strip()
-        if not txt:
-            continue
-        parts.append(txt)
-        total += len(txt)
-        if total >= max_chars:
-            break
-    return "\n\n".join(parts)[:max_chars]
-
-
-def _pdf_content_blocks(prompt: str, pdf_b64: str) -> list[dict]:
-    return [
-        {
-            "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": "application/pdf",
-                "data": pdf_b64,
-            },
-        },
-        {"type": "text", "text": prompt},
-    ]
-
-
 def main() -> None:
     args = _parse_args()
 
@@ -97,10 +62,11 @@ def main() -> None:
         load_dotenv(str(env_file), override=False)
         print(f"Loaded .env from {env_file}")
 
-    from uhc_llm import bootstrap_llm_secrets, invoke_model, refresh_model_registry
-    from uhc_llm.gateway import gateway_auth_source, invoke_registry_messages
+    from uhc_llm import bootstrap_llm_secrets, refresh_model_registry
+    from uhc_llm.gateway import gateway_auth_source
     from uhc_llm.keyvault_loader import keyvault_configured
-    from uhc_llm.registry import get_model_spec, load_model_registry
+    from uhc_llm.registry import load_model_registry
+    from uhc_llm.router import invoke_chat, invoke_pdf
 
     if keyvault_configured() or (_REPO_ROOT / ".env.stg").exists():
         print("Loading secrets from Azure Key Vault...")
@@ -135,66 +101,39 @@ def main() -> None:
         if not pdf_path.is_file():
             print(f"ERROR: PDF not found: {pdf_path}")
             sys.exit(1)
-        spec = get_model_spec(model_name)
-        if spec.kind == "bedrock_claude":
-            combined_prompt = (
-                f"System instruction:\n{system_prompt}\n\n"
-                f"User question:\n{user_question}"
-            )
-            content, inp, out = invoke_registry_messages(
-                spec,
-                content_blocks=_pdf_content_blocks(combined_prompt, _pdf_to_b64(pdf_path)),
-                max_tokens=args.max_tokens,
-                agent_name="ask_llm_pdf",
-            )
-            result = {
-                "model": model_name,
-                "content": content,
-                "prompt_tokens": inp,
-                "completion_tokens": out,
-            }
-        else:
-            extracted = _extract_pdf_text(pdf_path)
-            if not extracted:
-                print("ERROR: Could not extract text from PDF for non-bedrock model.")
-                sys.exit(1)
-            print(
-                f"NOTE: Model {model_name!r} (kind={spec.kind!r}) does not support native "
-                "PDF document blocks; using extracted text fallback."
-            )
-            text_prompt = (
-                f"System instruction:\n{system_prompt}\n\n"
-                f"User question:\n{user_question}\n\n"
-                "PDF_TEXT_EXTRACT:\n"
-                f"{extracted}"
-            )
-            result = invoke_model(
-                model_name,
-                messages=[{"role": "user", "content": text_prompt}],
-                max_tokens=args.max_tokens,
-            )
-            if not (result.get("content") or "").strip():
-                extracted_short = extracted[:12000]
-                retry_prompt = (
-                    f"System instruction:\n{system_prompt}\n\n"
-                    f"User question:\n{user_question}\n\n"
-                    "PDF_TEXT_EXTRACT (short retry excerpt):\n"
-                    f"{extracted_short}"
-                )
-                result = invoke_model(
-                    model_name,
-                    messages=[{"role": "user", "content": retry_prompt}],
-                    max_tokens=args.max_tokens,
-                )
+        combined_prompt = (
+            f"System instruction:\n{system_prompt}\n\n"
+            f"User question:\n{user_question}"
+        )
+        resp = invoke_pdf(
+            agent_name="ask_llm_pdf",
+            prompt=combined_prompt,
+            pdf_b64_list=[_pdf_to_b64(pdf_path)],
+            max_tokens=args.max_tokens,
+            model_name=model_name,
+        )
+        result = {
+            "model": resp.model,
+            "content": resp.content,
+            "prompt_tokens": resp.prompt_tokens,
+            "completion_tokens": resp.completion_tokens,
+        }
     else:
-        result = invoke_model(
-            model_name,
+        resp = invoke_chat(
+            agent_name="ask_llm",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_question},
             ],
             max_tokens=args.max_tokens,
+            model_name=model_name,
         )
+        result = {
+            "model": resp.model,
+            "content": resp.content,
+            "prompt_tokens": resp.prompt_tokens,
+            "completion_tokens": resp.completion_tokens,
+        }
 
     print(f"Model used: {result.get('model')}\n")
     print("Answer:")

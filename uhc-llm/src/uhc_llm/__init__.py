@@ -13,16 +13,19 @@ from .registry import (
     resolve_pdf_registry_model_name,
     resolve_registry_model_name,
 )
-from .router import LLMResponse, invoke_prompt
+from .router import LLMResponse, describe_target, invoke_chat, invoke_pdf, invoke_prompt
 
 __all__ = [
     "LLMResponse",
     "agent_map_profile_name",
     "apply_job_llm_env",
     "bootstrap_llm_secrets",
+    "describe_target",
     "get_llm_backend",
     "global_registry_model_name",
+    "invoke_chat",
     "invoke_model",
+    "invoke_pdf",
     "invoke_prompt",
     "is_registry_backend",
     "keyvault_configured",
