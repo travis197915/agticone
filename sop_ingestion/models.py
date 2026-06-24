@@ -250,7 +250,12 @@ class AuditSop(models.Model):
     updated_at     = models.DateTimeField(auto_now=True)
 
     class Meta:
-        unique_together = [("job", "content_hash")]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["job", "content_hash"],
+                name="unique_auditsop_job_hash",
+            ),
+        ]
         ordering        = ["crawl_depth", "crawled_at"]
         verbose_name    = "Audit SOP"
 
@@ -325,7 +330,12 @@ class AuditStep(models.Model):
     narrative_context = models.TextField(blank=True, default="")
 
     class Meta:
-        unique_together = [("sop", "step_number")]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["sop", "step_number"],
+                name="unique_auditstep_sop_number",
+            ),
+        ]
         ordering        = ["step_number"]
         verbose_name    = "Audit Step"
 
@@ -493,7 +503,12 @@ class AuditCode(models.Model):
     confidence      = models.FloatField(default=1.0)
 
     class Meta:
-        unique_together = [("sop", "code_value", "code_type")]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["sop", "code_value", "code_type"],
+                name="unique_auditcode",
+            ),
+        ]
         ordering        = ["code_type", "code_value"]
         verbose_name    = "Audit Code"
 
