@@ -111,6 +111,14 @@ class RuleEvaluation(models.Model):
     tool_results_used = models.JSONField(default=list, blank=True)
     llm_provider = models.CharField(max_length=32, blank=True, default="")
     llm_ms = models.PositiveIntegerField(default=0)
+    # --- human-override / live-execution columns (present in the deployed schema) ---
+    # These exist in the live DB but were missing from this model, so every insert
+    # tripped the NOT-NULL "overridden" constraint and aborted the run. Declared here
+    # (state matches via 0002_ruleeval_override state-only migration) so the ORM
+    # populates them. ``overridden`` is the only NOT-NULL one.
+    live_result = models.JSONField(null=True, blank=True)
+    overridden = models.BooleanField(default=False)
+    injected_context = models.JSONField(null=True, blank=True)
 
     class Meta:
         db_table = "execution_rule_evaluation"

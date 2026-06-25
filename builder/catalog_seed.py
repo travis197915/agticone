@@ -135,6 +135,8 @@ SIDEBAR_NAV = [
     ("Automation",     "workflows",     "Workflows",   "GitBranch",       "/workflows", "MEMBER", 30),
     ("Usage & Cost",   "activity",      "Activity",    "Activity",        "/activity",  "MEMBER", 40),
     ("Usage & Cost",   "ai-usage",      "AI Usage",    "Sparkles",        "/ai-usage",  "MEMBER", 50),
+    ("Configuration",  "field-mapping", "Field Mapping", "Table2",        "/config/field-mapping", "ADMIN", 54),
+    ("Configuration",  "claim-ontology","Claim Ontology","ListTree",      "/config/claim-ontology", "ADMIN", 56),
     ("Account",        "users",         "Users",       "Users",           "/users",     "ADMIN",  60),
     ("Account",        "settings",      "Settings",    "Settings",        "/settings",  "MEMBER", 70),
 ]

@@ -29,3 +29,6 @@ class AgentToolsConfig(AppConfig):
         # Load .env.tools without overriding values that are already in os.environ.
         from . import env as _env
         _env.load_env_tools()
+        # Register signals that invalidate the engine's field-mapping/ontology
+        # cache when those config rows are edited from the UI.
+        from . import signals  # noqa: F401

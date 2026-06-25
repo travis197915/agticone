@@ -5071,3 +5071,214 @@ LINE 1: ...son", "confidence", "reasoning", "decision_type", "verdict",...
 2026-06-11 12:00:14 INFO execution_app.views batch-events: client disconnected batch=9feb9263-ffed-4dbe-91f6-f52af8d60079
 2026-06-11 12:24:15 INFO execution_app.views batch-events: client disconnected batch=11e4ade5-f682-4b0c-949e-a20f6f1546a3
 2026-06-11 12:24:18 INFO execution_app.views batch-events: client disconnected batch=11e4ade5-f682-4b0c-949e-a20f6f1546a3
+2026-06-24 15:32:07 WARNING uhc_execution_engine.field_mapping field_mapping: could not load sop_field_mapping.yaml: [Errno 2] No such file or directory: '/tmp/__no_such_yaml_dir__/sop_field_mapping.yaml'
+2026-06-24 15:32:07 WARNING uhc_execution_engine.field_mapping field_mapping: could not load claim_ontology.yaml: [Errno 2] No such file or directory: '/tmp/__no_such_yaml_dir__/claim_ontology.yaml'
+2026-06-24 16:40:19 INFO uhc_execution_engine.agents.n02_load_bindings load_bindings workflow=ae663a90-4e59-4bdc-9648-8b733ed162e0 claim=25XI31158300 shapes=62 with_rules=62 pre=0 dec=147 tools=217
+2026-06-24 16:41:25 INFO uhc_execution_engine.agents.n02_load_bindings load_bindings workflow=ae663a90-4e59-4bdc-9648-8b733ed162e0 claim=25XI18819100 shapes=62 with_rules=62 pre=0 dec=147 tools=217
+2026-06-24 16:41:42 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:0][p1] tok=24127+867 ms=13906 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:41:58 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:1][p1] tok=24109+687 ms=15460 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:42:08 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:2][p1] tok=24112+520 ms=9720 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:42:26 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:3][p1] tok=28755+1179 ms=17673 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:42:40 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:4][p1] tok=24134+701 ms=14420 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:42:53 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:5][p1] tok=24129+642 ms=12281 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:43:04 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:6][p1] tok=24131+492 ms=10597 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:43:15 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:7][p1] tok=24115+531 ms=11520 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:43:24 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:8][p1] tok=24097+432 ms=8426 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:43:36 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:9][p1] tok=24152+636 ms=11642 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:43:53 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:1:1:0][p1] tok=21186+925 ms=16168 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:44:03 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:1:2:0][p1] tok=21196+447 ms=9345 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:44:16 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:1:3:0][p1] tok=16542+711 ms=11305 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:44:31 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:1:4:0][p1] tok=18330+781 ms=14426 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:44:49 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:1:5:0][p1] tok=16608+1181 ms=17045 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:45:01 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:7:1:0][p1] tok=6906+765 ms=11724 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:45:10 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:7:2:0][p1] tok=7521+520 ms=8239 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:45:21 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:7:3:0][p1] tok=7589+647 ms=10615 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:45:32 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:7:3:1][p1] tok=6997+658 ms=11501 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:45:45 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:7:4:0][p1] tok=7540+823 ms=12688 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:45:58 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:0:0][p1] tok=24785+556 ms=10603 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:46:16 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:0:1][p1] tok=24776+1022 ms=18146 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:46:25 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:3:0][p1] tok=13438+377 ms=7130 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:46:35 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:3:1][p1] tok=13452+533 ms=10259 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:46:42 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:3:2][p1] tok=13444+340 ms=7076 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:46:51 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:3:3][p1] tok=13444+421 ms=8301 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:47:03 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:5:0][p1] tok=13301+559 ms=10729 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:47:21 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:5:1][p1] tok=24315+1078 ms=17828 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:47:36 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:5:2][p1] tok=13443+841 ms=15542 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:47:57 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:5:3][p1] tok=13387+982 ms=20695 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:48:11 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:5:4][p1] tok=13336+674 ms=14040 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:48:20 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:8:0][p1] tok=13244+373 ms=7682 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:48:31 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:8:1:0][p1] tok=6927+673 ms=11379 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:48:38 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:8:2:0][p1] tok=6885+299 ms=6597 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:48:51 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:8:3:0][p1] tok=6932+906 ms=13053 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:49:04 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:8:3:1][p1] tok=6938+761 ms=12811 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:49:14 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:8:4:0][p1] tok=6958+442 ms=9372 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:49:32 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:1:0][p1] tok=25038+844 ms=16956 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:49:51 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:2:0][p1] tok=22114+1163 ms=17839 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:50:12 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:4:0][p1] tok=21893+1185 ms=19684 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:50:30 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:4:1][p1] tok=21891+945 ms=17158 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:50:46 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:4:2][p1] tok=21870+733 ms=15601 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:51:05 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:4:3][p1] tok=21878+1174 ms=19062 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:51:30 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:4:4][p1] tok=21870+1781 ms=25302 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:51:56 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:4:5][p1] tok=22187+1613 ms=25614 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:52:11 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:5:0][p1] tok=21765+628 ms=13746 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:52:32 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:10:0][p1] tok=23151+1077 ms=19276 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:52:46 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:11:0][p1] tok=27107+712 ms=13299 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:53:04 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:12:0][p1] tok=21886+738 ms=16235 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:53:19 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:12:1][p1] tok=21887+786 ms=15373 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:53:46 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:6:17:0][p1] tok=22014+1356 ms=25996 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:54:02 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:0][p1] tok=6951+570 ms=10373 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:54:11 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:1][p1] tok=11657+492 ms=9056 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:54:20 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:2][p1] tok=11659+494 ms=9104 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:54:29 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:3][p1] tok=11658+440 ms=8623 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:54:39 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:4][p1] tok=11655+517 ms=10184 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:54:50 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:5][p1] tok=11661+521 ms=10585 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:55:00 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:6][p1] tok=11656+510 ms=9502 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:55:09 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:7][p1] tok=11656+486 ms=8853 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:55:18 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:8][p1] tok=11659+606 ms=9474 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:55:27 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:9][p1] tok=11659+519 ms=8730 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:55:36 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:10][p1] tok=11655+544 ms=8922 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:55:45 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:11][p1] tok=11655+421 ms=8237 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:55:54 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:12][p1] tok=11657+504 ms=8968 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:56:03 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:13][p1] tok=11657+449 ms=8834 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:56:12 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:14][p1] tok=11658+428 ms=8458 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:56:22 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:15][p1] tok=11658+504 ms=10169 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:56:39 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:16][p1] tok=11657+508 ms=16999 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:56:51 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:17][p1] tok=11658+440 ms=11991 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:57:03 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:18][p1] tok=11656+577 ms=11774 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:57:21 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:19][p1] tok=11660+554 ms=17638 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:57:31 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:0:20][p1] tok=11658+494 ms=10249 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:57:48 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:1:0][p1] tok=13248+372 ms=15448 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:58:02 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:1:1][p1] tok=13183+457 ms=13608 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:58:16 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:1:2][p1] tok=13438+485 ms=13820 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:58:35 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:2:0][p1] tok=7671+1207 ms=18475 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:58:53 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:2:1][p1] tok=7677+1098 ms=18362 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:59:04 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:4:0][p1] tok=11632+447 ms=10737 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:59:20 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:5:0][p1] tok=11657+969 ms=14910 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:59:36 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:6:0][p1] tok=11594+844 ms=15885 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 16:59:56 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:0][p1] tok=11580+811 ms=15544 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:00:10 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:1][p1] tok=11665+761 ms=14018 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:00:26 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:2][p1] tok=11603+709 ms=14783 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:00:45 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:3][p1] tok=11718+702 ms=19240 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:01:00 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:4][p1] tok=11644+550 ms=14726 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:01:16 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:5][p1] tok=11547+484 ms=16053 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:01:29 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:6][p1] tok=11581+493 ms=13127 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:01:44 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:7][p1] tok=11568+673 ms=14622 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:02:02 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:8][p1] tok=11567+678 ms=18102 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:02:13 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:9][p1] tok=11545+473 ms=10041 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:02:24 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:10][p1] tok=11555+642 ms=11265 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:02:37 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:11][p1] tok=11555+723 ms=12914 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:02:53 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:12][p1] tok=11571+686 ms=15467 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:03:02 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:13][p1] tok=11613+498 ms=8694 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:03:17 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:14][p1] tok=11597+932 ms=15449 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:03:31 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:15][p1] tok=11599+829 ms=13712 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:03:44 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:16][p1] tok=11605+663 ms=12268 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:03:53 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:17][p1] tok=11688+506 ms=9379 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:04:12 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:18][p1] tok=11667+925 ms=19147 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:04:29 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:7:19][p1] tok=11786+908 ms=16300 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:04:46 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:8:0][p1] tok=11588+672 ms=14335 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:05:00 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:8:1][p1] tok=11662+645 ms=14134 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:05:08 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:8:2][p1] tok=11607+371 ms=7061 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:05:18 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:8:3][p1] tok=11706+554 ms=10761 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:05:29 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:8:4][p1] tok=11587+513 ms=10580 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:05:40 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:8:5][p1] tok=11607+571 ms=10536 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:05:52 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:8:6][p1] tok=11586+655 ms=11977 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:06:04 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:8:7][p1] tok=11622+585 ms=11536 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:06:21 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:8:8][p1] tok=11591+508 ms=16842 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:06:33 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:8:9][p1] tok=11567+669 ms=12124 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:06:43 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:8:10][p1] tok=11577+480 ms=9883 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:06:51 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:2:9:0][p1] tok=11524+423 ms=8043 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:07:11 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:9:1:0][p1] tok=21369+991 ms=18553 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:07:26 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:9:2:0][p1] tok=21409+700 ms=14219 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:07:36 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:9:3:0][p1] tok=7062+500 ms=9556 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:07:48 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:9:4:0][p1] tok=7070+692 ms=12275 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:08:07 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:9:5:0][p1] tok=7072+1175 ms=18159 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:08:22 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:10:1:0][p1] tok=10081+726 ms=14660 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:08:40 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:10:5:0][p1] tok=6950+1171 ms=18410 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:08:48 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [aggregate_decision] aggregate_decision[p1] tok=12891+187 ms=7244 success=True run=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+2026-06-24 17:08:48 ERROR uhc_execution_engine.agents.n07_persist_respond rule_engine: persist failed for run_id=2d5fdb62-a708-4a07-a6b0-6115e3e32bc8
+Traceback (most recent call last):
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/backends/utils.py", line 105, in _execute
+    return self.cursor.execute(sql, params)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+psycopg2.errors.NotNullViolation: null value in column "overridden" of relation "execution_rule_evaluation" violates not-null constraint
+DETAIL:  Failing row contains (33201, 0, step:4:0:0, DECISION, Subscriber ID AND Subscriber ID from Facets claim summary must m..., Retrieve Subscriber ID from facet_claim_summary
+Retrieve Subscri..., f, 0.95, The rule requires comparing Subscriber ID from FACETS (SBSB_ID) ..., CONDITIONAL, [], ["13a92592-a2a6-4ac2-bfea-03304035927b", "d2740556-1bd6-409a-929..., anthropic, 13906, fef66f2b-88a5-45ab-abfb-e793d9b81cae, 2d5fdb62-a708-4a07-a6b0-6115e3e32bc8, , f, , null, null, null).
+
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-execution-engine/src/uhc_execution_engine/agents/n07_persist_respond.py", line 176, in persist_and_respond
+    _persist(state)
+    ~~~~~~~~^^^^^^^
+  File "/opt/clients/toystack/uhc/agentic_backend/uhc-backend-v2/uhc-execution-engine/src/uhc_execution_engine/agents/n07_persist_respond.py", line 50, in _persist
+    RuleEvaluation.objects.bulk_create([
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+        RuleEvaluation(
+        ^^^^^^^^^^^^^^^
+    ...<19 lines>...
+        for ev in all_evals
+        ^^^^^^^^^^^^^^^^^^^
+    ])
+    ^^
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/models/manager.py", line 87, in manager_method
+    return getattr(self.get_queryset(), name)(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/models/query.py", line 833, in bulk_create
+    returned_columns = self._batched_insert(
+        objs_without_pk,
+    ...<4 lines>...
+        unique_fields=unique_fields,
+    )
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/models/query.py", line 1956, in _batched_insert
+    self._insert(
+    ~~~~~~~~~~~~^
+        item,
+        ^^^^^
+    ...<5 lines>...
+        returning_fields=returning_fields,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/models/query.py", line 1918, in _insert
+    return query.get_compiler(using=using).execute_sql(returning_fields)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/models/sql/compiler.py", line 1925, in execute_sql
+    cursor.execute(sql, params)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/backends/utils.py", line 122, in execute
+    return super().execute(sql, params)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/backends/utils.py", line 79, in execute
+    return self._execute_with_wrappers(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        sql, params, many=False, executor=self._execute
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/backends/utils.py", line 92, in _execute_with_wrappers
+    return executor(sql, params, many, context)
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/backends/utils.py", line 100, in _execute
+    with self.db.wrap_database_errors:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/utils.py", line 94, in __exit__
+    raise dj_exc_value.with_traceback(traceback) from exc_value
+  File "/opt/clients/toystack/uhc/agentic_backend/src/lib/python3.13/site-packages/django/db/backends/utils.py", line 105, in _execute
+    return self.cursor.execute(sql, params)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+django.db.utils.IntegrityError: null value in column "overridden" of relation "execution_rule_evaluation" violates not-null constraint
+DETAIL:  Failing row contains (33201, 0, step:4:0:0, DECISION, Subscriber ID AND Subscriber ID from Facets claim summary must m..., Retrieve Subscriber ID from facet_claim_summary
+Retrieve Subscri..., f, 0.95, The rule requires comparing Subscriber ID from FACETS (SBSB_ID) ..., CONDITIONAL, [], ["13a92592-a2a6-4ac2-bfea-03304035927b", "d2740556-1bd6-409a-929..., anthropic, 13906, fef66f2b-88a5-45ab-abfb-e793d9b81cae, 2d5fdb62-a708-4a07-a6b0-6115e3e32bc8, , f, , null, null, null).
+
+2026-06-24 17:11:25 INFO uhc_execution_engine.agents.n02_load_bindings load_bindings workflow=ae663a90-4e59-4bdc-9648-8b733ed162e0 claim=25XI18819100 shapes=62 with_rules=62 pre=0 dec=147 tools=217
+2026-06-24 17:11:44 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:0][p1] tok=24127+675 ms=14707 success=True run=1ed20369-2906-4242-8413-21714da3ae92
+2026-06-24 17:11:56 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:1][p1] tok=24109+674 ms=11869 success=True run=1ed20369-2906-4242-8413-21714da3ae92
+2026-06-24 17:12:10 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:2][p1] tok=24112+713 ms=14026 success=True run=1ed20369-2906-4242-8413-21714da3ae92
+2026-06-24 17:12:31 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:3][p1] tok=28755+1302 ms=19999 success=True run=1ed20369-2906-4242-8413-21714da3ae92
+2026-06-24 17:12:41 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:4][p1] tok=24134+574 ms=10668 success=True run=1ed20369-2906-4242-8413-21714da3ae92
+2026-06-24 17:12:54 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:5][p1] tok=24129+645 ms=12461 success=True run=1ed20369-2906-4242-8413-21714da3ae92
+2026-06-24 17:13:07 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:6][p1] tok=24131+567 ms=12370 success=True run=1ed20369-2906-4242-8413-21714da3ae92
+2026-06-24 17:13:17 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:7][p1] tok=24115+517 ms=10151 success=True run=1ed20369-2906-4242-8413-21714da3ae92
+2026-06-24 17:13:26 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:4:0:8][p1] tok=24097+475 ms=9265 success=True run=1ed20369-2906-4242-8413-21714da3ae92
+2026-06-25 01:54:59 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:5:2][p1] tok=49180+1269 ms=22579 success=True run=-
+2026-06-25 01:55:19 INFO uhc_execution_engine.llm llm_call anthropic/claude-sonnet-4-5-20250929 [execute_shapes] rule_eval[step:5:5:2][p1] tok=49744+915 ms=19498 success=True run=-

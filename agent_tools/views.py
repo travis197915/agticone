@@ -22,8 +22,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Tool
-from .serializers import ToolSerializer
+from .models import ClaimOntologyField, SopFieldMapping, Tool
+from .serializers import (SYSTEM_LABELS, ClaimOntologyFieldSerializer,
+                          SopFieldMappingSerializer, ToolSerializer)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,129 @@ class ToolListView(APIView):
     def get(self, request, *args, **kwargs):
         qs = Tool.objects.filter(is_active=True).order_by("display_name", "name")
         return Response(ToolSerializer(qs, many=True).data)
+
+
+class FieldMappingMetaView(APIView):
+    """``GET /api/agent-tools/field-mappings/meta/`` — UI helper metadata
+    (the ordered source systems + friendly labels)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        return Response({"systems": SYSTEM_LABELS})
+
+
+class FieldMappingListView(APIView):
+    """``GET`` list / ``POST`` create SOP field mappings."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        qs = SopFieldMapping.objects.all()
+        if request.query_params.get("active_only") in ("1", "true", "True"):
+            qs = qs.filter(is_active=True)
+        return Response(SopFieldMappingSerializer(qs, many=True).data)
+
+    def post(self, request, *args, **kwargs):
+        ser = SopFieldMappingSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data, status=status.HTTP_201_CREATED)
+
+
+class FieldMappingDetailView(APIView):
+    """``GET`` / ``PUT``/``PATCH`` / ``DELETE`` one SOP field mapping."""
+
+    permission_classes = [IsAuthenticated]
+
+    def _get(self, pk):
+        return SopFieldMapping.objects.filter(pk=pk).first()
+
+    def get(self, request, pk, *args, **kwargs):
+        obj = self._get(pk)
+        if not obj:
+            return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(SopFieldMappingSerializer(obj).data)
+
+    def put(self, request, pk, *args, **kwargs):
+        return self._update(request, pk, partial=False)
+
+    def patch(self, request, pk, *args, **kwargs):
+        return self._update(request, pk, partial=True)
+
+    def _update(self, request, pk, *, partial):
+        obj = self._get(pk)
+        if not obj:
+            return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
+        ser = SopFieldMappingSerializer(obj, data=request.data, partial=partial)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data)
+
+    def delete(self, request, pk, *args, **kwargs):
+        obj = self._get(pk)
+        if not obj:
+            return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
+        obj.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class OntologyListView(APIView):
+    """``GET`` list / ``POST`` create claim-ontology fields."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        qs = ClaimOntologyField.objects.all()
+        ns = request.query_params.get("namespace")
+        if ns:
+            qs = qs.filter(namespace=ns)
+        if request.query_params.get("active_only") in ("1", "true", "True"):
+            qs = qs.filter(is_active=True)
+        return Response(ClaimOntologyFieldSerializer(qs, many=True).data)
+
+    def post(self, request, *args, **kwargs):
+        ser = ClaimOntologyFieldSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data, status=status.HTTP_201_CREATED)
+
+
+class OntologyDetailView(APIView):
+    """``GET`` / ``PUT``/``PATCH`` / ``DELETE`` one claim-ontology field."""
+
+    permission_classes = [IsAuthenticated]
+
+    def _get(self, pk):
+        return ClaimOntologyField.objects.filter(pk=pk).first()
+
+    def get(self, request, pk, *args, **kwargs):
+        obj = self._get(pk)
+        if not obj:
+            return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(ClaimOntologyFieldSerializer(obj).data)
+
+    def put(self, request, pk, *args, **kwargs):
+        return self._update(request, pk, partial=False)
+
+    def patch(self, request, pk, *args, **kwargs):
+        return self._update(request, pk, partial=True)
+
+    def _update(self, request, pk, *, partial):
+        obj = self._get(pk)
+        if not obj:
+            return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
+        ser = ClaimOntologyFieldSerializer(obj, data=request.data, partial=partial)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data)
+
+    def delete(self, request, pk, *args, **kwargs):
+        obj = self._get(pk)
+        if not obj:
+            return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
+        obj.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ToolDetailView(APIView):

@@ -274,6 +274,70 @@ def _tool_context_for_rule(rule: dict[str, Any],
     return compact, binding_ids
 
 
+# ── Domain guidance (provider selection) ─────────────────────────────────────
+# The SOP IR flattens the gold provider-selection rules into per-choice rows and
+# loses two things the rules depend on: (1) RULE-000's INN/OON *determination*
+# procedure (a 2-point / 3-point provider match), and (2) the group-model gating
+# that scopes each choice table. Without them the evaluator reads OON literally
+# off CLCL_NTWK_IND / group_model and treats DOC360 box-27 (assignment of
+# benefits) as "individual is billed", which mis-selects the 3rd/4th/5th (deny)
+# choice on clean group-INN claims. This block re-injects that context at
+# execution time, scoped to provider-selection rules so other prompts are
+# unchanged. It is policy guidance only — it never dictates a verdict.
+_PROVSEL_SIGNALS = (
+    "provider entity type", "individual is billed", "network indicator",
+    "group record", "group model", "provider selection",
+    "inn", "oon", "in network", "out of network",
+    "2 point match", "3 point match", "1st choice", "2nd choice", "3rd choice",
+)
+
+_PROVSEL_GUIDANCE = """\
+DOMAIN GUIDANCE — PROVIDER SELECTION (apply before deciding `matched`)
+---------------------------------------------------------------------
+1. INN vs OON is DERIVED, never read literally. Do NOT conclude OON/INN from
+   `CLCL_NTWK_IND` or the facet-extension `group_model` (e.g. "AN" = *Assumed*
+   Non-network is an assumption, not a determination). Instead match the billed
+   provider against the FACETS provider-details records:
+     • multiple records match on 2 points (Tax ID/EIN + NPI)  -> INN
+     • exactly one record matches on all 3 points (Tax ID + NPI + name/address) -> OON
+   Then reconcile with the network indicator. If the provider-details records
+   needed for this match are not present in the tool results, you CANNOT
+   determine OON — set status="Inconclusive" (do NOT default to OON/deny).
+
+2. "Individual is billed" means an INDIVIDUAL/rendering provider appears on the
+   DOC360 claim image: box 24 (Rendering NPI) and/or box 33 (Servicing
+   Physician/Supplier Name) populated with a person. DOC360 box 27
+   ("A/ASSIGNED", "Y/YES ASSIGNED") is ACCEPT-ASSIGNMENT (assignment of
+   benefits) — it is NOT evidence that an individual is billed. Never use box 27
+   to satisfy an "individual is billed" condition.
+
+3. Group-model gating: the choice tables are scoped by the FACETS group model —
+   1A / AN / "No Group Model" -> step 4; 2A / 2I -> step 5; 3A -> step 6;
+   3B -> step 7. Only the table matching THIS claim's group_model applies. If
+   this rule's choice belongs to a different group-model table than the claim's
+   actual group_model, set applicable=false (do NOT mark it Met/Not-Met).
+
+4. A group-billed claim whose provider resolves to INN (group properly located
+   and matched) selects the 1st/2nd choice and is CLEAN — it is NOT a provider-
+   selection defect. Only select a deny choice when the derived determination
+   (per 1-3 above), not a face-value indicator, genuinely supports it.
+"""
+
+
+def _domain_context(rule: dict[str, Any]) -> str:
+    """Return scoped domain guidance for provider-selection rules, else "".
+
+    Detection is text-based (the flattened rule rows don't carry their SOP name),
+    keyed off the distinctive provider-selection vocabulary in the rule's
+    condition/action/section. Additive: non-matching rules get an empty block and
+    their prompt is unchanged.
+    """
+    blob = " ".join(str(rule.get(k, "")) for k in
+                    ("condition", "action", "section_label")).lower()
+    hits = sum(1 for s in _PROVSEL_SIGNALS if s in blob)
+    return f"\n{_PROVSEL_GUIDANCE}" if hits >= 2 else ""
+
+
 def evaluate_one_rule(cfg: EngineConfig, *, rule: dict[str, Any],
                       claim: dict[str, Any],
                       tool_context: list[dict[str, Any]],
@@ -312,6 +376,10 @@ def evaluate_one_rule(cfg: EngineConfig, *, rule: dict[str, Any],
                        "------------------------------------------------------------------\n"
                        + "\n".join(routing_bits) + "\n") if routing_bits else ""
 
+    # Re-inject the determination procedure + field semantics the IR flattening
+    # dropped, scoped to provider-selection rules. Additive elsewhere.
+    domain_section = _domain_context(rule)
+
     prompt = f"""You are a claims-audit policy evaluator. Decide whether the
 following SOP rule applies to the given claim.
 
@@ -323,7 +391,7 @@ section:        {rule.get('section_label', '')}
 decision_type:  {rule.get('decision_type', '')}
 condition:      {rule.get('condition', '')}
 action:         {rule.get('action', '')}
-{mapped_section}{routing_section}
+{mapped_section}{routing_section}{domain_section}
 CLAIM
 -----
 {json.dumps(claim, default=str, indent=2)}

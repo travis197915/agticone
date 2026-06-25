@@ -136,6 +136,75 @@ class McpServerConfig(_UUIDPK, _Timestamps):
         return f"{self.label} ({self.base_url})"
 
 
+class SopFieldMapping(_UUIDPK, _Timestamps):
+    """DB-backed canonical SOP field mapping (replaces ``yaml/sop_field_mapping.yaml``
+    as the runtime source of truth).
+
+    One row per canonical SOP business field ("Provider NPI", "Received Date",
+    …). ``systems`` holds the per-source-system key lists the resolver searches,
+    e.g.::
+
+        {"DOC360": ["24 RENDERING NPI"], "FACETS": ["PRPR_NPI"],
+         "CBS": [], "CBD": [], "NPI": []}
+
+    The execution engine reads active rows via
+    :func:`uhc_execution_engine.field_mapping._load` (DB-first, YAML fallback for
+    standalone/CLI use). Edited from the builder UI; a ``post_save``/``post_delete``
+    signal clears the engine's in-process cache, and a cheap (count, max
+    updated_at) watermark makes edits visible to other processes (Celery workers)
+    without a restart.
+    """
+
+    sop_field = models.CharField(max_length=255, unique=True, db_index=True)
+    # Human-readable business meaning, shown in the UI so a non-engineer
+    # understands what the cryptic source keys (e.g. "24 RENDERING NPI") mean.
+    description = models.TextField(blank=True, default="")
+    # Optional grouping for the UI (e.g. "Provider", "Member", "Coverage").
+    category = models.CharField(max_length=128, blank=True, default="")
+    # {"DOC360": [...], "FACETS": [...], "CBS": [...], "CBD": [...], "NPI": [...]}
+    systems = models.JSONField(default=dict)
+    notes = models.TextField(blank=True, default="")
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        db_table = "sop_field_mapping"
+        ordering = ["category", "sop_field"]
+
+    def __str__(self) -> str:  # pragma: no cover - debug aid
+        return self.sop_field
+
+
+class ClaimOntologyField(_UUIDPK, _Timestamps):
+    """DB-backed CMS-1500 claim ontology (replaces ``yaml/claim_ontology.yaml``).
+
+    One row per canonical claim-image field, grouped by ``namespace`` (the YAML's
+    top-level groups: ``header``, ``person_blocks``, ``addresses`` …). ``aliases``
+    is the list of raw labels the parser normalises onto ``canonical_field``.
+
+    Same DB-first / YAML-fallback + cache-invalidation story as
+    :class:`SopFieldMapping`.
+    """
+
+    namespace = models.CharField(max_length=128, db_index=True)
+    canonical_field = models.CharField(max_length=255, db_index=True)
+    description = models.TextField(blank=True, default="")
+    aliases = models.JSONField(default=list)
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        db_table = "claim_ontology_field"
+        ordering = ["namespace", "canonical_field"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["namespace", "canonical_field"],
+                name="uniq_ontology_namespace_field",
+            ),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover - debug aid
+        return f"{self.namespace}:{self.canonical_field}"
+
+
 # ── Node bindings ─────────────────────────────────────────────────────────────
 
 

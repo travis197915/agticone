@@ -59,4 +59,7 @@ IMG20260607124519.jpg.jpeg
 dispatch_claim_batch.py
 run_claim_audit.py
 seed_claim_to_mock.py
+_rerun_defect_claims.py
+_rerun_one.py
+_test_provsel_rule.py
 docs/data/

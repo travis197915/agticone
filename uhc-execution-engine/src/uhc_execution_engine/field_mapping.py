@@ -57,7 +57,8 @@ def _yaml_dir() -> Path:
 
 
 @functools.lru_cache(maxsize=1)
-def _load() -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_files() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load the mapping + ontology from the repo-root YAMLs (fallback source)."""
     d = _yaml_dir()
     mapping: dict[str, Any] = {}
     ontology: dict[str, Any] = {}
@@ -71,6 +72,147 @@ def _load() -> tuple[dict[str, Any], dict[str, Any]]:
             ontology = yaml.safe_load(fh) or {}
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("field_mapping: could not load claim_ontology.yaml: %s", exc)
+    return mapping, ontology
+
+
+# In-process cache for the DB-backed mapping, keyed by a cheap watermark so
+# edits made in another process (e.g. the web tier) become visible to this one
+# (e.g. a Celery worker) without a restart. ``reset_cache`` clears it eagerly
+# for same-process immediacy (wired to a post_save signal in agent_tools).
+_DB_CACHE: dict[str, Any] = {}
+
+
+def _db_watermark() -> tuple[int, str, int, str] | None:
+    """Cheap change-detector for both config tables:
+    ``(map_count, map_max_updated, ont_count, ont_max_updated)``.
+
+    Returns ``None`` when Django/the tables are unavailable (standalone CLI,
+    app not ready) so callers fall back to the YAMLs.
+    """
+    try:
+        from django.db.models import Count, Max
+
+        from agent_tools.models import ClaimOntologyField, SopFieldMapping
+    except Exception:
+        return None
+    try:
+        m = SopFieldMapping.objects.filter(is_active=True).aggregate(
+            c=Count("id"), u=Max("updated_at")
+        )
+        o = ClaimOntologyField.objects.filter(is_active=True).aggregate(
+            c=Count("id"), u=Max("updated_at")
+        )
+    except Exception:  # pragma: no cover - DB not migrated/reachable
+        return None
+    return (
+        m.get("c") or 0, m["u"].isoformat() if m.get("u") else "",
+        o.get("c") or 0, o["u"].isoformat() if o.get("u") else "",
+    )
+
+
+def _mapping_from_db() -> dict[str, Any]:
+    """Build the ``{"mappings": {field: {systems}}}`` doc from active DB rows."""
+    from agent_tools.models import SopFieldMapping
+
+    rows = SopFieldMapping.objects.filter(is_active=True).values("sop_field", "systems")
+    return {"mappings": {r["sop_field"]: (r["systems"] or {}) for r in rows}}
+
+
+def _ontology_from_db() -> dict[str, Any]:
+    """Build the ``{"namespaces": {ns: {field: {aliases}}}}`` doc from DB rows."""
+    from agent_tools.models import ClaimOntologyField
+
+    rows = ClaimOntologyField.objects.filter(is_active=True).values(
+        "namespace", "canonical_field", "aliases"
+    )
+    namespaces: dict[str, Any] = {}
+    for r in rows:
+        ns = namespaces.setdefault(r["namespace"], {})
+        ns[r["canonical_field"]] = {"aliases": r["aliases"] or []}
+    return {"namespaces": namespaces}
+
+
+# Memoised alias index, keyed by ``id(ontology)`` (ontology dicts are cached, so
+# identity is stable until an edit rebuilds them).
+_ALIAS_CACHE: dict[int, dict[str, list[str]]] = {}
+
+
+def reset_cache() -> None:
+    """Drop the in-process config caches (DB + file). Called by the
+    ``agent_tools`` post_save/post_delete signal so UI edits take effect at
+    once in this process; other processes pick the change up via the watermark."""
+    _DB_CACHE.clear()
+    _ALIAS_CACHE.clear()
+    _load_files.cache_clear()
+
+
+def _norm(s: Any) -> str:
+    """Normalise a label for alias matching: upper-cased, single-spaced."""
+    return " ".join(str(s or "").strip().upper().split())
+
+
+def _alias_index_for(ontology: dict[str, Any]) -> dict[str, list[str]]:
+    """Build (and memoise) ``normalised_term -> [equivalent raw terms]`` from the
+    claim ontology, so a field-mapping source key can be expanded to every label
+    the claim image might actually use for it."""
+    cache_key = id(ontology)
+    cached = _ALIAS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    idx: dict[str, list[str]] = {}
+    namespaces = (ontology or {}).get("namespaces") or {}
+    for fields in namespaces.values():
+        if not isinstance(fields, dict):
+            continue
+        for canonical, spec in fields.items():
+            aliases = spec.get("aliases") if isinstance(spec, dict) else None
+            group = [canonical, *(aliases or [])]
+            for term in group:
+                n = _norm(term)
+                if not n:
+                    continue
+                bucket = idx.setdefault(n, [])
+                for g in group:
+                    if g not in bucket:
+                        bucket.append(g)
+
+    # One ontology is live at a time; keep the cache from growing unbounded.
+    _ALIAS_CACHE.clear()
+    _ALIAS_CACHE[cache_key] = idx
+    return idx
+
+
+def _expand_keys(col: str, alias_index: dict[str, list[str]]) -> list[str]:
+    """``col`` plus every ontology-equivalent label, ``col`` first."""
+    out = [col]
+    for term in alias_index.get(_norm(col), []):
+        if term not in out:
+            out.append(term)
+    return out
+
+
+def _load() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return ``(mapping, ontology)``.
+
+    Both are read **DB-first** (``agent_tools.SopFieldMapping`` /
+    ``ClaimOntologyField``) and fall back to the repo-root YAMLs when the
+    respective table is empty/unavailable (keeps the standalone CLI working).
+    Cached in-process and keyed by a cheap (count, max-updated) watermark so
+    edits made in another process become visible here without a restart.
+    """
+    file_mapping, file_ontology = _load_files()
+    wm = _db_watermark()
+    if wm is None:
+        return file_mapping, file_ontology  # no Django/tables → YAML fallback
+
+    if _DB_CACHE.get("wm") != wm:
+        _DB_CACHE["wm"] = wm
+        _DB_CACHE["mapping"] = _mapping_from_db() if wm[0] > 0 else None
+        _DB_CACHE["ontology"] = _ontology_from_db() if wm[2] > 0 else None
+
+    mapping = _DB_CACHE.get("mapping") or file_mapping
+    ontology = _DB_CACHE.get("ontology") or file_ontology
     return mapping, ontology
 
 
@@ -106,10 +248,15 @@ def resolve_sop_fields(
     for every mapped field a concrete value was found for. Empty dict when the
     mapping YAML is unavailable or nothing resolves.
     """
-    mapping, _ = _load()
+    mapping, ontology = _load()
     mappings = (mapping or {}).get("mappings") or {}
     if not mappings:
         return {}
+
+    # Ontology aliases let a mapping's source key resolve even when the claim
+    # image uses a different raw label for the same box (e.g. "PROVIDER NPI"
+    # instead of "11 NPI"). This is how the ontology participates at runtime.
+    alias_index = _alias_index_for(ontology)
 
     search_spaces: list[Any] = [claim or {}]
     for tc in tool_context or []:
@@ -127,10 +274,16 @@ def resolve_sop_fields(
             for col in cols:
                 if _is_placeholder(col):
                     continue
-                for space in search_spaces:
-                    found = _deep_find(space, col)
-                    if found is not None:
-                        value, where = found, f"{system}:{col}"
+                for key in _expand_keys(col, alias_index):
+                    for space in search_spaces:
+                        found = _deep_find(space, key)
+                        if found is not None:
+                            # Report the canonical mapping key, plus the alias
+                            # actually matched when it differs (audit clarity).
+                            via = f" via {key}" if key != col else ""
+                            value, where = found, f"{system}:{col}{via}"
+                            break
+                    if value is not None:
                         break
                 if value is not None:
                     break
