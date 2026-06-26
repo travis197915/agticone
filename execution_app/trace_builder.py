@@ -33,6 +33,8 @@ SKIPPED_RULE = "Skipped"
 CLEAN = "CLEAN"
 DEFECT = "DEFECT"
 INCONCLUSIVE = "INCONCLUSIVE"
+# Engine still evaluating rules for this claim (``RuleExecutionRun.status == RUNNING``).
+IN_PROGRESS = "IN_PROGRESS"
 
 # Engine decision types that always denote a claim-handling defect / a clean pass.
 _DEFECT_DECISIONS = {"DENY", "STOP", "REFER", "REFERRAL", "PEND", "PENDED"}

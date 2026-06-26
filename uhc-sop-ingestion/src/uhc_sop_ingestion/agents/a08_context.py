@@ -34,13 +34,58 @@ logger = logging.getLogger(__name__)
 _EXTRACTED_FLAG = "_ctx_codes_extracted"
 
 
+def _invoke_json_llm(
+    cfg,
+    *,
+    agent_name: str,
+    prompt: str,
+    max_tokens: int,
+) -> tuple[str, str, str, int, int]:
+    """Return (content, provider, model, prompt_tokens, completion_tokens)."""
+    from uhc_llm import invoke_prompt, is_registry_backend
+
+    if is_registry_backend():
+        resp = invoke_prompt(
+            agent_name=agent_name,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            json_mode=True,
+            cfg=cfg,
+        )
+        return (
+            resp.content,
+            resp.provider,
+            resp.model,
+            resp.prompt_tokens,
+            resp.completion_tokens,
+        )
+
+    from langchain_core.messages import HumanMessage
+
+    llm, prov_name, model_name = _make_json_llm(cfg, max_tokens=max_tokens)
+    resp = llm.invoke([HumanMessage(content=prompt)])
+    usage = getattr(resp, "usage_metadata", None) or {}
+    inp = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+    out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+    content = resp.content if isinstance(resp.content, str) else str(resp.content)
+    return content, prov_name, model_name, inp, out
+
+
 def _make_json_llm(cfg, max_tokens: int):
     """JSON-extraction LLM, honouring the LLM_FORCE_PROVIDER override.
 
     Defaults to OpenAI json_object mode; with ``LLM_FORCE_PROVIDER=anthropic``
     returns Claude instead (caller prompts already demand JSON-only output and
     the response is parsed defensively either way).
+
+    When ``LLM_BACKEND=registry`` (or MODEL_REGISTRY is set), returns a
+    sentinel tuple that tells callers to route through ``uhc_llm.invoke_prompt``.
     """
+    from uhc_llm import is_registry_backend
+
+    if is_registry_backend():
+        return None, "registry", "auto"
+
     from .a07_enrich import _forced_provider
     if _forced_provider() == "anthropic":
         from langchain_anthropic import ChatAnthropic
@@ -99,8 +144,6 @@ def _all_text(state) -> str:
 
 def _llm_extract_codes(cfg, text: str) -> list[dict]:
     """Single JSON-mode LLM call to extract all code types."""
-    from langchain_core.messages import HumanMessage
-
     pg_logger = getattr(cfg, "_pg_logger", None)
     t0 = time.time()
 
@@ -134,8 +177,6 @@ Text to analyse:
 {text}"""
 
     try:
-        llm, prov_name, model_name = _make_json_llm(cfg, max_tokens=4096)
-        # Wrap in object because json_object mode requires an object root
         wrapped_prompt = (
             prompt.replace(
                 "Return JSON (empty array if no codes found):\n[{",
@@ -145,14 +186,17 @@ Text to analyse:
                 "}]}\n\nText"
             )
         )
-        if prov_name == "anthropic":
-            wrapped_prompt += ("\n\nIMPORTANT: Reply with valid JSON only. "
-                               "No markdown, no explanation.")
-        resp  = llm.invoke([HumanMessage(content=wrapped_prompt)])
-        usage = getattr(resp, "usage_metadata", None) or {}
-        inp   = usage.get("input_tokens", 0)
-        out   = usage.get("output_tokens", 0)
-        ms    = int((time.time() - t0) * 1000)
+        wrapped_prompt += (
+            "\n\nIMPORTANT: Reply with valid JSON only. "
+            "No markdown, no explanation."
+        )
+        content, prov_name, model_name, inp, out = _invoke_json_llm(
+            cfg,
+            agent_name="code_detector",
+            prompt=wrapped_prompt,
+            max_tokens=4096,
+        )
+        ms = int((time.time() - t0) * 1000)
 
         if pg_logger:
             pg_logger.log_llm_call(
@@ -166,7 +210,7 @@ Text to analyse:
                 success=True,
             )
 
-        data = _parse_json_relaxed(resp.content)
+        data = _parse_json_relaxed(content)
         # OpenAI json_object mode always wraps in a dict — find the list
         if isinstance(data, dict):
             codes = data.get("codes") or next(
@@ -196,8 +240,6 @@ Text to analyse:
 
 def _llm_extract_list_refs(cfg, text: str) -> list[dict]:
     """JSON-mode LLM call to detect entity list references."""
-    from langchain_core.messages import HumanMessage
-
     t0 = time.time()
     pg_logger = getattr(cfg, "_pg_logger", None)
     prompt = f"""Identify references to external lists, tables, or reference documents in this SOP text.
@@ -216,25 +258,29 @@ Text:
 {text[:3000]}"""
 
     try:
-        llm, prov_name, model_name = _make_json_llm(cfg, max_tokens=2048)
-        if prov_name == "anthropic":
-            prompt += ("\n\nIMPORTANT: Reply with valid JSON only. "
-                       "No markdown, no explanation.")
-        resp  = llm.invoke([HumanMessage(content=prompt)])
-        usage = getattr(resp, "usage_metadata", None) or {}
-        ms    = int((time.time() - t0) * 1000)
+        used_prompt = prompt + (
+            "\n\nIMPORTANT: Reply with valid JSON only. "
+            "No markdown, no explanation."
+        )
+        content, prov_name, model_name, inp, out = _invoke_json_llm(
+            cfg,
+            agent_name="entity_list_ref_detector",
+            prompt=used_prompt,
+            max_tokens=2048,
+        )
+        ms = int((time.time() - t0) * 1000)
         if pg_logger:
             pg_logger.log_llm_call(
                 agent_name="entity_list_ref_detector",
                 stage="context_stage",
                 provider=prov_name,
                 model=model_name,
-                prompt_tokens=usage.get("input_tokens", 0),
-                completion_tokens=usage.get("output_tokens", 0),
+                prompt_tokens=inp,
+                completion_tokens=out,
                 duration_ms=ms,
                 success=True,
             )
-        data = _parse_json_relaxed(resp.content)
+        data = _parse_json_relaxed(content)
         if isinstance(data, dict):
             refs = data.get("refs") or next(
                 (v for v in data.values() if isinstance(v, list)), []

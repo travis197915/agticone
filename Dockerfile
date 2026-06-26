@@ -14,6 +14,7 @@ COPY requirements.txt /app/requirements.txt
 COPY uhc-sop-ingestion /app/uhc-sop-ingestion
 COPY uhc-api-agent /app/uhc-api-agent
 COPY uhc-execution-engine /app/uhc-execution-engine
+COPY uhc-llm /app/uhc-llm
 
 RUN pip install --no-cache-dir -r /app/requirements.txt
 

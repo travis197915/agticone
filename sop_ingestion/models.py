@@ -13,6 +13,12 @@ class JobStatus(models.TextChoices):
     PARTIAL   = "PARTIAL",   "Partial"
 
 
+class TriggerSource(models.TextChoices):
+    API      = "api",      "REST API"
+    WORKFLOW = "workflow", "Workflow builder"
+    CLI      = "cli",      "CLI / script"
+
+
 class IngestionJob(models.Model):
     job_id         = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     # Optional FK to the builder Workflow that triggered this ingestion.
@@ -34,6 +40,12 @@ class IngestionJob(models.Model):
     max_docs       = models.PositiveIntegerField(default=200)
     llm_provider   = models.CharField(max_length=32, default="anthropic")
     llm_model      = models.CharField(max_length=64,  default="claude-sonnet-4-5-20250929")
+    trigger_source = models.CharField(
+        max_length=32,
+        choices=TriggerSource.choices,
+        default=TriggerSource.API,
+        db_index=True,
+    )
     updated_at     = models.DateTimeField(auto_now=True)
     celery_task_id = models.CharField(max_length=255, blank=True)
     created_at     = models.DateTimeField(auto_now_add=True)
@@ -241,9 +253,11 @@ class AuditSop(models.Model):
         # Named constraint (NOT unique_together) — the ingestion writer upserts
         # via ``ON CONFLICT ON CONSTRAINT unique_auditsop_job_hash`` (see
         # a11_write_postgres.py), so this exact name is load-bearing.
-        constraints     = [
-            models.UniqueConstraint(fields=["job", "content_hash"],
-                                    name="unique_auditsop_job_hash"),
+        constraints = [
+            models.UniqueConstraint(
+                fields=["job", "content_hash"],
+                name="unique_auditsop_job_hash",
+            ),
         ]
         ordering        = ["crawl_depth", "crawled_at"]
         verbose_name    = "Audit SOP"
@@ -321,9 +335,11 @@ class AuditStep(models.Model):
     class Meta:
         # Named constraint — writer upserts via
         # ``ON CONFLICT ON CONSTRAINT unique_auditstep_sop_number``.
-        constraints     = [
-            models.UniqueConstraint(fields=["sop", "step_number"],
-                                    name="unique_auditstep_sop_number"),
+        constraints = [
+            models.UniqueConstraint(
+                fields=["sop", "step_number"],
+                name="unique_auditstep_sop_number",
+            ),
         ]
         ordering        = ["step_number"]
         verbose_name    = "Audit Step"
@@ -494,9 +510,11 @@ class AuditCode(models.Model):
     class Meta:
         # Named constraint — writer upserts via
         # ``ON CONFLICT ON CONSTRAINT unique_auditcode``.
-        constraints     = [
-            models.UniqueConstraint(fields=["sop", "code_value", "code_type"],
-                                    name="unique_auditcode"),
+        constraints = [
+            models.UniqueConstraint(
+                fields=["sop", "code_value", "code_type"],
+                name="unique_auditcode",
+            ),
         ]
         ordering        = ["code_type", "code_value"]
         verbose_name    = "Audit Code"

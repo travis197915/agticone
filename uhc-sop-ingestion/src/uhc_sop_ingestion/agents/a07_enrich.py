@@ -212,6 +212,169 @@ def _validate_schema(data: Any, expected_type: type,
     return True
 
 
+def _parse_llm_output(
+    raw_content: str,
+    *,
+    agent_name: str,
+    attempt_label: str,
+    expected_type: type,
+    required_keys: list[str] | None,
+) -> Any:
+    """Parse, salvage, unwrap, and schema-validate one LLM text response."""
+    try:
+        data = _parse_json(raw_content)
+    except json.JSONDecodeError as je:
+        if expected_type is list:
+            salvaged = _salvage_json_array(raw_content)
+        elif expected_type is dict:
+            salvaged = _salvage_json_object(raw_content)
+            if (salvaged and required_keys
+                    and any(k in salvaged for k in required_keys)
+                    and all(isinstance(salvaged[k], list)
+                            for k in required_keys if k in salvaged)):
+                for k in required_keys:
+                    salvaged.setdefault(k, [])
+        else:
+            salvaged = None
+        if not salvaged:
+            raise
+        logger.warning(
+            "llm_call [%s/%s]: salvaged %d objects from truncated JSON (%s)",
+            agent_name, attempt_label, len(salvaged), je,
+        )
+        data = salvaged
+    data = _unwrap_if_needed(data, expected_type)
+    if not _validate_schema(data, expected_type, required_keys):
+        raise ValueError(
+            f"Schema mismatch: expected {expected_type.__name__} "
+            f"with keys {required_keys}, got {type(data).__name__}"
+        )
+    return data
+
+
+def _llm_call_via_registry(
+    cfg,
+    prompt: str,
+    fallback: Any,
+    agent_name: str,
+    *,
+    expected_type: type = dict,
+    required_keys: list[str] | None = None,
+    stage: str = "enrich_stage",
+    max_retries: int = 2,
+    max_tokens: int = 4096,
+) -> Any:
+    """Registry-backend variant of ``_llm_call`` (MODEL_REGISTRY + gateway)."""
+    from uhc_llm import invoke_prompt
+    from uhc_llm.prompts import enrich_for_json
+    from uhc_llm.registry import (
+        load_agent_model_map,
+        load_model_registry,
+        resolve_registry_model_name,
+    )
+    from uhc_llm.router import describe_target
+
+    pg_logger = getattr(cfg, "_pg_logger", None)
+    json_mode = expected_type in (dict, list)
+    prompt = enrich_for_json(
+        prompt,
+        json_mode=json_mode,
+        expects_list=(expected_type is list),
+    )
+
+    def _try_registry(current_prompt: str, attempt_label: str,
+                      *, model_name: str | None = None):
+        t0 = time.time()
+        try:
+            endpoint_hint = describe_target(
+                agent_name,
+                json_mode=json_mode,
+                model_name=model_name,
+                cfg=cfg,
+            )
+        except Exception:
+            endpoint_hint = "unknown endpoint"
+        try:
+            llm_resp = invoke_prompt(
+                agent_name=agent_name,
+                prompt=current_prompt,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+                cfg=cfg,
+                model_name=model_name,
+            )
+            ms = int((time.time() - t0) * 1000)
+            if pg_logger:
+                pg_logger.log_llm_call(
+                    agent_name=f"{agent_name}[{attempt_label}]",
+                    stage=stage,
+                    provider=llm_resp.provider,
+                    model=llm_resp.model,
+                    prompt_tokens=llm_resp.prompt_tokens,
+                    completion_tokens=llm_resp.completion_tokens,
+                    duration_ms=ms,
+                    success=True,
+                )
+            data = _parse_llm_output(
+                llm_resp.content,
+                agent_name=agent_name,
+                attempt_label=attempt_label,
+                expected_type=expected_type,
+                required_keys=required_keys,
+            )
+            return data, None
+        except Exception as exc:
+            ms = int((time.time() - t0) * 1000)
+            logger.warning(
+                "llm_call [%s/%s] → %s: %s",
+                agent_name, attempt_label, endpoint_hint, exc,
+            )
+            if pg_logger:
+                pg_logger.log_llm_call(
+                    agent_name=f"{agent_name}[{attempt_label}]",
+                    stage=stage,
+                    provider="registry",
+                    model=model_name or "auto",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    duration_ms=ms,
+                    success=False,
+                    error_message=f"{endpoint_hint}: {exc}",
+                )
+            return None, str(exc)
+
+    current_prompt = prompt
+    last_error = ""
+    for attempt in range(1, max_retries + 1):
+        if last_error:
+            current_prompt = (
+                f"{prompt}\n\n[Previous attempt failed: {last_error}. "
+                "Fix the JSON format and try again.]"
+            )
+        data, err = _try_registry(current_prompt, f"p{attempt}")
+        if data is not None:
+            return data
+        last_error = err or "unknown error"
+
+    registry_keys = set(load_model_registry().keys())
+    default_model = load_agent_model_map().get("__default__")
+    if default_model and default_model not in registry_keys:
+        default_model = None
+    try:
+        primary_model = resolve_registry_model_name(agent_name)
+    except RuntimeError:
+        primary_model = None
+    if default_model and default_model != primary_model:
+        data, _err = _try_registry(
+            prompt, "default-fallback", model_name=default_model,
+        )
+        if data is not None:
+            return data
+
+    logger.error("llm_call [%s]: registry attempts failed, returning fallback", agent_name)
+    return fallback
+
+
 # ── Core guardrail dispatcher ─────────────────────────────────────────────────
 
 def _llm_call(
@@ -236,6 +399,18 @@ def _llm_call(
       4. Return `fallback` if all fail
     """
     from langchain_core.messages import HumanMessage
+    from uhc_llm import is_registry_backend
+
+    if is_registry_backend():
+        return _llm_call_via_registry(
+            cfg, prompt, fallback, agent_name,
+            expected_type=expected_type,
+            required_keys=required_keys,
+            stage=stage,
+            max_retries=max_retries,
+            max_tokens=max_tokens,
+        )
+
     pg_logger = getattr(cfg, "_pg_logger", None)
 
     forced = _forced_provider()
@@ -256,45 +431,13 @@ def _llm_call(
                     prompt_tokens=inp, completion_tokens=out,
                     duration_ms=ms, success=True,
                 )
-            try:
-                data = _parse_json(resp.content)
-            except json.JSONDecodeError as je:
-                # Output likely truncated at the token cap. Salvage the complete
-                # portion (list elements, or a dict's decoded members) rather
-                # than discarding the whole batch (caller still retries too).
-                if expected_type is list:
-                    salvaged = _salvage_json_array(resp.content)
-                elif expected_type is dict:
-                    salvaged = _salvage_json_object(resp.content)
-                    # Truncation often cuts off a LATER collection key (e.g.
-                    # "edges" after "nodes" in graph-synthesis payloads). When
-                    # the recovered dict already holds list-shaped required
-                    # keys, keep that partial payload and backfill the missing
-                    # collection keys with [] — otherwise the valuable recovered
-                    # nodes would be discarded over a missing trailing array.
-                    if (salvaged and required_keys
-                            and any(k in salvaged for k in required_keys)
-                            and all(isinstance(salvaged[k], list)
-                                    for k in required_keys if k in salvaged)):
-                        for k in required_keys:
-                            salvaged.setdefault(k, [])
-                else:
-                    salvaged = None
-                if not salvaged:
-                    raise
-                logger.warning(
-                    "llm_call [%s/%s]: salvaged %d objects from truncated JSON (%s)",
-                    agent_name, attempt_label, len(salvaged), je,
-                )
-                data = salvaged
-            # OpenAI json_object mode always returns a dict — unwrap if we
-            # expected a list (e.g. {"rules": [...]}) → [...]
-            data = _unwrap_if_needed(data, expected_type)
-            if not _validate_schema(data, expected_type, required_keys):
-                raise ValueError(
-                    f"Schema mismatch: expected {expected_type.__name__} "
-                    f"with keys {required_keys}, got {type(data).__name__}"
-                )
+            data = _parse_llm_output(
+                resp.content,
+                agent_name=agent_name,
+                attempt_label=attempt_label,
+                expected_type=expected_type,
+                required_keys=required_keys,
+            )
             return data, None
         except Exception as exc:
             ms = int((time.time() - t0) * 1000)
@@ -317,12 +460,13 @@ def _llm_call(
     primary_model  = cfg.anthropic_model if provider     == "anthropic" else cfg.openai_model
     fallback_model = cfg.openai_model    if alt_provider == "openai"    else cfg.anthropic_model
 
-    # Provider-specific JSON instructions
+    # Provider-specific JSON instructions (direct API-key path).
+    from uhc_llm.prompts import ARRAY_WRAP_SUFFIX, enrich_for_json
+
     if provider == "anthropic":
-        prompt = prompt + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+        prompt = enrich_for_json(prompt, json_mode=True)
     elif provider == "openai" and expected_type is list:
-        # json_object mode can't return a bare array — ask for a wrapper key
-        prompt = prompt + '\n\nWrap the array in a JSON object: {"items": [...]}'
+        prompt = prompt + ARRAY_WRAP_SUFFIX
 
     current_prompt = prompt
     last_error = ""
@@ -339,9 +483,7 @@ def _llm_call(
         last_error = err or "unknown error"
 
     # Cross-provider fallback
-    fb_prompt = prompt
-    if alt_provider == "anthropic":
-        fb_prompt = prompt + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+    fb_prompt = enrich_for_json(prompt, json_mode=(alt_provider == "anthropic"))
     data, err = _try(fallback_fn, alt_provider, fallback_model, fb_prompt, "fallback")
     if data is not None:
         return data
@@ -351,43 +493,9 @@ def _llm_call(
 
 
 # ── Native-PDF (vision) call path ─────────────────────────────────────────────
-# Anthropic-only variant of `_llm_call` that sends the ACTUAL PDF bytes to Claude
-# as `document` content blocks so the model "sees" the real page layout, tables,
-# redaction boxes and footnotes — exactly like the Claude chat UI. There is no
-# OpenAI fallback here because GPT-4o's API ingests images, not native PDFs; the
-# perception layer's deterministic page list is the safety net instead.
-
-def _make_anthropic_vision_llm(cfg, max_tokens: int = 8192):
-    """A higher-token ChatAnthropic for document perception (pages are dense)."""
-    from langchain_anthropic import ChatAnthropic
-    return ChatAnthropic(
-        model=cfg.anthropic_model,
-        api_key=cfg.anthropic_api_key,
-        max_tokens=max_tokens,
-        temperature=0,
-    )
-
-
-def _pdf_content_blocks(prompt: str, pdf_b64_list: list[str]) -> list[dict]:
-    """Build a langchain Anthropic multimodal message body.
-
-    One `document` block per base64 PDF slice, followed by the text prompt so the
-    instruction comes after the evidence the model just read.
-    """
-    blocks: list[dict] = []
-    for b64 in pdf_b64_list:
-        if not b64:
-            continue
-        blocks.append({
-            "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": "application/pdf",
-                "data": b64,
-            },
-        })
-    blocks.append({"type": "text", "text": prompt})
-    return blocks
+# Registry bedrock models use gateway ``/model/{deployment}/invoke``; direct
+# API-key mode uses Anthropic ``/v1/messages`` with document blocks. Both paths
+# go through ``uhc_llm.router.invoke_pdf``.
 
 
 def _llm_call_pdf(
@@ -402,77 +510,64 @@ def _llm_call_pdf(
     max_retries: int = 2,
     max_tokens: int = 8192,
 ) -> Any:
-    """Native-PDF Claude call with the same guardrails as `_llm_call`.
+    """PDF vision call with the same guardrails as ``_llm_call`` (both backends)."""
+    from uhc_llm.prompts import enrich_for_json
+    from uhc_llm.router import describe_target, invoke_pdf
 
-    Sends `pdf_b64_list` (one or more base64 PDF slices) plus `prompt` to Claude,
-    then runs the identical parse → salvage → schema-validate → retry path. Every
-    attempt is logged to Postgres via cfg._pg_logger. Returns `fallback` on total
-    failure so the perception layer always has a deterministic floor.
-    """
-    from langchain_core.messages import HumanMessage
     pg_logger = getattr(cfg, "_pg_logger", None)
-    model_name = cfg.anthropic_model
-
-    base_prompt = prompt + (
-        "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
-    )
+    base_prompt = enrich_for_json(prompt, json_mode=True)
 
     def _try(current_prompt: str, attempt_label: str):
         t0 = time.time()
         try:
-            llm = _make_anthropic_vision_llm(cfg, max_tokens=max_tokens)
-            content = _pdf_content_blocks(current_prompt, pdf_b64_list)
-            resp = llm.invoke([HumanMessage(content=content)])
-            inp, out = _token_usage(resp)
+            endpoint_hint = describe_target(agent_name, pdf=True, cfg=cfg)
+        except Exception:
+            endpoint_hint = "unknown endpoint"
+        try:
+            llm_resp = invoke_pdf(
+                agent_name=agent_name,
+                prompt=current_prompt,
+                pdf_b64_list=pdf_b64_list,
+                max_tokens=max_tokens,
+                cfg=cfg,
+            )
             ms = int((time.time() - t0) * 1000)
             if pg_logger:
                 pg_logger.log_llm_call(
                     agent_name=f"{agent_name}[{attempt_label}]",
-                    stage=stage, provider="anthropic", model=model_name,
-                    prompt_tokens=inp, completion_tokens=out,
-                    duration_ms=ms, success=True,
+                    stage=stage,
+                    provider=llm_resp.provider,
+                    model=llm_resp.model,
+                    prompt_tokens=llm_resp.prompt_tokens,
+                    completion_tokens=llm_resp.completion_tokens,
+                    duration_ms=ms,
+                    success=True,
                 )
-            try:
-                data = _parse_json(resp.content if isinstance(resp.content, str)
-                                   else _coerce_text_content(resp.content))
-            except json.JSONDecodeError as je:
-                raw = resp.content if isinstance(resp.content, str) \
-                    else _coerce_text_content(resp.content)
-                if expected_type is list:
-                    salvaged = _salvage_json_array(raw)
-                elif expected_type is dict:
-                    salvaged = _salvage_json_object(raw)
-                    if (salvaged and required_keys
-                            and any(k in salvaged for k in required_keys)
-                            and all(isinstance(salvaged[k], list)
-                                    for k in required_keys if k in salvaged)):
-                        for k in required_keys:
-                            salvaged.setdefault(k, [])
-                else:
-                    salvaged = None
-                if not salvaged:
-                    raise
-                logger.warning(
-                    "llm_call_pdf [%s/%s]: salvaged %d objects from truncated JSON (%s)",
-                    agent_name, attempt_label, len(salvaged), je,
-                )
-                data = salvaged
-            data = _unwrap_if_needed(data, expected_type)
-            if not _validate_schema(data, expected_type, required_keys):
-                raise ValueError(
-                    f"Schema mismatch: expected {expected_type.__name__} "
-                    f"with keys {required_keys}, got {type(data).__name__}"
-                )
+            data = _parse_llm_output(
+                llm_resp.content,
+                agent_name=agent_name,
+                attempt_label=attempt_label,
+                expected_type=expected_type,
+                required_keys=required_keys,
+            )
             return data, None
         except Exception as exc:
             ms = int((time.time() - t0) * 1000)
-            logger.warning("llm_call_pdf [%s/%s]: %s", agent_name, attempt_label, exc)
+            logger.warning(
+                "llm_call_pdf [%s/%s] → %s: %s",
+                agent_name, attempt_label, endpoint_hint, exc,
+            )
             if pg_logger:
                 pg_logger.log_llm_call(
                     agent_name=f"{agent_name}[{attempt_label}]",
-                    stage=stage, provider="anthropic", model=model_name,
-                    prompt_tokens=0, completion_tokens=0,
-                    duration_ms=ms, success=False, error_message=str(exc),
+                    stage=stage,
+                    provider="llm",
+                    model="auto",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    duration_ms=ms,
+                    success=False,
+                    error_message=f"{endpoint_hint}: {exc}",
                 )
             return None, str(exc)
 
@@ -491,25 +586,6 @@ def _llm_call_pdf(
 
     logger.error("llm_call_pdf [%s]: all attempts failed, returning fallback", agent_name)
     return fallback
-
-
-def _coerce_text_content(content: Any) -> str:
-    """Flatten Anthropic block-list responses to plain text.
-
-    Some langchain versions return `content` as a list of `{type, text}` blocks
-    rather than a bare string; concatenate the text blocks so JSON parsing works.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for blk in content:
-            if isinstance(blk, dict):
-                parts.append(blk.get("text", "") or "")
-            else:
-                parts.append(str(blk))
-        return "".join(parts)
-    return str(content)
 
 
 # ── 0. StepChecklistReconcilerAgent — Anthropic ───────────────────────────────

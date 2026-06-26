@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 from django.core.exceptions import ObjectDoesNotExist
+from dotenv import load_dotenv
 
 log = logging.getLogger(__name__)
 
@@ -38,8 +39,14 @@ def execute_ingestion_job(job_id: str) -> dict:
     job.mark_started()
     log.info("Pipeline started  job=%s  url=%s", job_id, job.seed_url)
 
-    os.environ["LLM_PROVIDER"] = job.llm_provider
-    os.environ["LLM_MODEL"] = job.llm_model
+    # Ensure subprocess-level env reflects repo .env values even when the
+    # parent shell exported stale LLM_* variables.
+    if _ENV_PATH.exists():
+        load_dotenv(_ENV_PATH, override=True)
+
+    from uhc_llm.backend import apply_job_llm_env
+
+    apply_job_llm_env(llm_provider=job.llm_provider, llm_model=job.llm_model)
 
     try:
         pipeline = SopIngestionPipeline(
