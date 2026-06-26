@@ -23,7 +23,7 @@ from django.db import migrations
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("sop_ingestion", "0018_ingestionjob_trigger_source_state"),
+        ("sop_ingestion", "0016_widen_ingesteddocument_sop_ids"),
     ]
 
     operations = [
