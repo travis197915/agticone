@@ -295,6 +295,17 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
         ON CONFLICT DO NOTHING;
     """
 
+    # Rules already attached to their host step (pdf_exception_attacher) must NOT
+    # be re-emitted as a standalone "Step 0" node — that is exactly the split we
+    # want to avoid. Step 0 is now only built for exception rules with no
+    # confident host step (e.g. other document layouts), so nothing is dropped.
+    def _norm(s: str) -> str:
+        return " ".join((s or "").lower().split())
+
+    attached_sigs = {
+        _norm(s) for s in (state.get("exception_rules_attached") or [])
+    }
+
     # ── Collect all exception-type rules across pre-sections ─────────────────
     exception_decisions: list[dict] = []
 
@@ -325,18 +336,40 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
                 "OVERRIDE",
                 "ELIGIBILITY",
             )
+            if is_exc and _norm(rule.get("condition", "")) in attached_sigs:
+                continue
             if is_exc:
+                subs = [
+                    {
+                        "condition": _s(sr.get("condition", ""), 1000),
+                        "action": _s(sr.get("action", ""), 2000),
+                    }
+                    for sr in (rule.get("sub_rules") or [])
+                    if isinstance(sr, dict)
+                    and (sr.get("condition") or sr.get("action"))
+                ]
                 exception_decisions.append(
                     {
                         "section": section_label,
                         "condition": rule.get("condition", ""),
                         "action": rule.get("action", ""),
                         "dtype": dtype,
+                        "sub_rules": subs,
                     }
                 )
 
     if not exception_decisions:
         return {}
+
+    # De-duplicate: overlapping perception bands frequently yield the SAME
+    # exception rule 2-3 times, each PARAPHRASED differently by the LLM, so an
+    # exact (condition, action) key can't collapse them. dedupe_exception_rules
+    # clusters identifier-list gates by their TIN/NPI set (globally unique per
+    # provider group) and unions their sub-rules, and exact-dedups plain rules —
+    # so Step 0 shows each override (and each provider) exactly once.
+    from .a06e_pdf_synthesis import dedupe_exception_rules
+
+    exception_decisions = dedupe_exception_rules(exception_decisions)
 
     # ── Create Step 0 — Pre-Step Exceptions ──────────────────────────────────
     step0_sql = """
@@ -369,9 +402,12 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
     )
 
     # ── Write each exception rule as an AuditDecision ─────────────────────────
+    # Parent rows RETURN their id so an operative identifier list (e.g. the
+    # excluded-TIN/Provider table) can be written as nested child decisions
+    # (depth=1, parent_id set) — one per provider — instead of being flattened.
     dec_sql = """
         INSERT INTO sop_ingestion_auditdecision
-            (step_id, row_index, condition_if, condition_and, action_text,
+            (step_id, parent_id, row_index, condition_if, condition_and, action_text,
              action_summary, action_line, action_claim,
              decision_type, goto_step, is_final,
              eob_codes, ex_codes, denial_codes, system_actions, all_codes,
@@ -379,10 +415,11 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
              depth, subrule_id, table_name, aggregation, output_text,
              tooling_allowed, is_out_of_scope, mongo_subtree_ref,
              applicable_when)
-        VALUES (%s, %s, %s, '', %s, %s, '', '', %s, NULL, false,
+        VALUES (%s, %s, %s, %s, '', %s, %s, '', '', %s, NULL, false,
                 '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb,
                 '',
-                0, '', '', 'LEAF', '', true, false, '', '');
+                %s, %s, '', 'LEAF', '', true, false, '', '')
+        RETURNING id;
     """
     # Map our LLM-tagged decision types to the schema's allowed CHOICES
     _DTYPE_MAP = {
@@ -398,20 +435,47 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
         "ELIGIBILITY": "CONDITIONAL",
         "NOTE": "CONDITIONAL",
     }
+    total_written = 0
     for i, rule in enumerate(exception_decisions):
         mapped = _DTYPE_MAP.get(rule["dtype"], "CONDITIONAL")
-        _exec(
+        prows = _exec(
             cfg,
             dec_sql,
             (
                 step0_id,
+                None,  # parent_id (top-level)
                 i,
                 _s(rule["condition"], 1000),
                 _s(rule["action"], 2000),
                 _s(f"[{rule['section']}] {rule['action']}", 500)[:500],
                 mapped,
+                0,  # depth
+                "",  # subrule_id
             ),
         )
+        total_written += 1
+        parent_id = prows[0][0] if prows else None
+
+        # Nested provider/identifier entries → child decisions under this rule.
+        for j, sub in enumerate(rule.get("sub_rules") or []):
+            if not parent_id:
+                break
+            _exec(
+                cfg,
+                dec_sql,
+                (
+                    step0_id,
+                    parent_id,
+                    j,
+                    _s(sub.get("condition", ""), 1000),
+                    _s(sub.get("action", ""), 2000),
+                    _s(sub.get("action", ""), 500)[:500],
+                    mapped,
+                    1,  # depth
+                    f"{i}.{j}",  # subrule_id
+                ),
+            )
+            total_written += 1
 
     # Update step_count on the AuditSop to include Step 0
     _exec(
@@ -422,12 +486,13 @@ def pg_precondition_writer(state: "PipelineState", cfg: "PipelineConfig") -> dic
             decision_count = decision_count + %s
         WHERE id = %s
     """,
-        (len(exception_decisions), sop_id),
+        (total_written, sop_id),
     )
 
     log.info(
-        "pg_precondition_writer: wrote Step 0 with %d exception rules",
+        "pg_precondition_writer: wrote Step 0 with %d exception rules (%d rows incl. sub-rules)",
         len(exception_decisions),
+        total_written,
     )
     return {}
 

@@ -126,6 +126,7 @@ from .agents.a06d_pdf_context_graph import (
 from .agents.a06e_pdf_synthesis import (
     pdf_step_synthesizer,
     pdf_presection_synthesizer,
+    pdf_exception_attacher,
     pdf_quality_gate,
 )
 from .agents.a07_enrich import (
@@ -460,6 +461,7 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
             group_rule_extractor,
             date_condition_extractor,
             summary_generator,
+            pdf_exception_attacher,
             cfg=cfg,
             stage_name="enrich_stage",
         ),

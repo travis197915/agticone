@@ -233,6 +233,7 @@ def _materialise_custom_rules(workflow_id: str,
                 host_step = synthetic_step
         manual_oos = bool(props.get("manual_out_of_scope"))
         manual_oos_keys = set(props.get("manual_oos_rule_keys") or [])
+        manual_in_keys = set(props.get("manual_in_scope_rule_keys") or [])
 
         sg = shapes_by_id.get(sid)
         if sg is None:
@@ -250,13 +251,18 @@ def _materialise_custom_rules(workflow_id: str,
         for raw in customs:
             if not raw.get("key"):
                 continue
+            _forced_in = raw.get("key") in manual_in_keys
             rd = _custom_rule_dict(
                 raw, shape_id=sid, sop_id=host_sop_id,
                 step_number=host_step,
-                manual_oos=manual_oos
-                or raw.get("key") in manual_oos_keys
-                or bool(raw.get("manual_out_of_scope")),
+                manual_oos=(not _forced_in) and (
+                    manual_oos
+                    or raw.get("key") in manual_oos_keys
+                    or bool(raw.get("manual_out_of_scope"))
+                ),
             )
+            if _forced_in:
+                rd["is_out_of_scope"] = False
             decisions_out.append(rd)
             sg["rules"].append(rd)
 
@@ -367,10 +373,19 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
         #     this rule's key (covers rules / sub-rules / sub-sub-rules, since
         #     each decision row at any depth has a unique rule_key).
         _shape_props = getattr(rb.shape, "properties", None) or {}
-        rule_dict["manual_oos"] = (
+        #   • force IN scope — ``Shape.properties.manual_in_scope_rule_keys``
+        #     contains this rule's key. This OVERRIDES the SOP-derived
+        #     ``is_out_of_scope`` and any node-level manual OOS, so an
+        #     ingestion-flagged rule the auditor re-enabled is evaluated again.
+        _forced_in = rb.rule_key in set(
+            _shape_props.get("manual_in_scope_rule_keys") or []
+        )
+        rule_dict["manual_oos"] = (not _forced_in) and (
             bool(_shape_props.get("manual_out_of_scope"))
             or rb.rule_key in set(_shape_props.get("manual_oos_rule_keys") or [])
         )
+        if _forced_in:
+            rule_dict["is_out_of_scope"] = False
         if kind == "pre":
             preconds_out.append(rule_dict)
         else:

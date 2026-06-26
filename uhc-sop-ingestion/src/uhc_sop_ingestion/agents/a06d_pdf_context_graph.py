@@ -470,6 +470,140 @@ def pdf_context_validator(state: "PipelineState", cfg: "PipelineConfig") -> dict
 # entities that are not really part of the numbered Step/Action procedure.
 
 
+_HOLISTIC_SCHEMA = json.dumps({
+    "procedures": [{
+        "name": "the procedure's heading verbatim (the section title above its "
+                "Step/Action table); '' if unnamed",
+        "is_primary": "bool — true for the document's MAIN numbered procedure",
+        "steps": [{
+            "step_number": "int — the step's number WITHIN THIS procedure",
+            "question": "the step's lead instruction/heading, verbatim",
+            "pages": "list[int] — EVERY page number whose content (table rows, "
+                     "notes, continuations) belongs to this step",
+        }],
+    }],
+}, indent=2)
+
+
+def _holistic_step_plan(cfg, job_id: str, pages: list[dict]) -> list[dict]:
+    """Whole-document step reconstruction (no hardcoding).
+
+    The page-batched extractor cannot hold a multi-page "Step/Action" table
+    together: its tall rows surface on later pages as separate untitled If/Then
+    tables that LOST the "Step" column, so their owning step number is gone.
+    This pass reasons over the ENTIRE perceived document at once and re-threads
+    every block/row to its owning step — recovering dropped step numbers from
+    the surviving "Step" cells, document order, and the SOP's own "Skip to Step
+    N" routing — and records the exact page set each step's content spans. It
+    also separates independently-numbered sub-procedures (e.g. an "Emergency
+    Response Bulletins" Step/Action table) so their numbers never collide with
+    the main procedure's; non-primary procedures are appended with an offset.
+    """
+    ordered = sorted((p for p in pages if isinstance(p.get("page_number"), int)),
+                     key=lambda p: p["page_number"])
+    if not ordered:
+        return []
+    doc = "\n\n".join(_page_to_text(p) for p in ordered)
+    page_nums = {p["page_number"] for p in ordered}
+
+    prompt = f"""You are reconstructing the numbered procedure(s) of ONE
+claims-audit SOP from its already-perceived, page-by-page content. The
+perception was done page by page, so a single multi-page "Step / Action" table
+is often BROKEN into separate untitled If/Then tables on later pages that LOST
+their "Step" column — you must re-thread those orphaned rows back to the step
+they belong to.
+
+A document may contain MORE THAN ONE numbered procedure (e.g. a main Step/Action
+table plus a separate, independently-numbered sub-procedure such as an
+"Emergency Response Bulletins" Step/Action table). Treat each as its own
+procedure with its own 1..N numbering — never merge two procedures' numbers.
+
+For EACH procedure, list EVERY numbered step in order with NO gaps:
+  • Recover step numbers the perception dropped, using (a) the visible "Step"
+    column integers that survived, (b) document order, and (c) the SOP's
+    explicit routing language ("Proceed to next step", "Skip to Step N").
+  • INCLUDE short final-action steps that have no table (e.g. "(F3) Process the
+    claim", "Resolve any warning/error messages", "(F4) Save the claim").
+  • For each step, list in ``pages`` EVERY page whose content belongs to it — a
+    step's decision-table rows frequently continue across several (even
+    non-adjacent) pages; include all of them.
+  • EXCLUDE non-procedure tables (table-of-contents / main-menu, revision
+    history, business details, code/terminology lists).
+  • But DO keep — on the step they belong to — operative bullet lists that gate
+    the procedure (e.g. "Valid/Invalid POTF attachments", "Eligible/Ineligible
+    services", excluded-provider lists). Add their page to that step's ``pages``;
+    they are decision content, not terminology.
+  • Keep ``question`` verbatim.
+
+Perceived document (pages delimited by '=== PAGE n ==='):
+{doc[:120000]}
+
+Return STRICT JSON matching:
+{_HOLISTIC_SCHEMA}
+"""
+    res = _llm_call(
+        cfg, prompt, fallback={"procedures": []},
+        agent_name="pdf_holistic_step_reconstructor", provider="anthropic",
+        expected_type=dict, required_keys=["procedures"],
+        stage="pdf_contextualize", max_tokens=8192,
+    )
+    procs = (res.get("procedures") if isinstance(res, dict) else None) or []
+    if not procs:
+        return []
+
+    # Primary procedure keeps its own 1..N numbers; later procedures are appended
+    # with a running offset so step-number namespaces never collide.
+    procs_sorted = sorted(procs, key=lambda p: (not p.get("is_primary"),))
+    plan: list[dict] = []
+    offset = 0
+    for pi, proc in enumerate(procs_sorted):
+        # ONLY the first procedure owns the base 1..N namespace. Every later
+        # procedure is offset, regardless of how the LLM flagged ``is_primary``
+        # — if the model mislabels two procedures as primary, deferring to that
+        # flag would give both a 1.. range and the global-number merge below
+        # would silently overwrite the first procedure's tail. Deciding primacy
+        # by position (post primary-first sort) makes collisions impossible.
+        is_primary = pi == 0
+        proc_name = str(proc.get("name") or "")[:200]
+        steps = sorted(
+            (s for s in (proc.get("steps") or [])
+             if isinstance(s, dict) and isinstance(s.get("step_number"), int)),
+            key=lambda s: s["step_number"],
+        )
+        local_max = 0
+        for s in steps:
+            pgs = sorted({pp for pp in (s.get("pages") or []) if pp in page_nums})
+            if not pgs:
+                continue
+            n_local = s["step_number"]
+            local_max = max(local_max, n_local)
+            n_global = n_local if is_primary else offset + n_local
+            plan.append({
+                "step_number": n_global,
+                "question": str(s.get("question") or "")[:500],
+                "pages": pgs,
+                "start_page": pgs[0],
+                "end_page": pgs[-1],
+                "entity_ids": [],
+                "procedure": proc_name,
+                "is_primary": is_primary,
+                "local_step_number": n_local,
+            })
+        offset = (local_max if is_primary else offset + local_max)
+
+    # Collapse any duplicate global numbers, unioning their page sets.
+    merged: dict[int, dict] = {}
+    for s in plan:
+        n = s["step_number"]
+        if n in merged:
+            merged[n]["pages"] = sorted(set(merged[n]["pages"] + s["pages"]))
+            merged[n]["start_page"] = merged[n]["pages"][0]
+            merged[n]["end_page"] = merged[n]["pages"][-1]
+        else:
+            merged[n] = s
+    return [merged[n] for n in sorted(merged)]
+
+
 def _deterministic_step_plan(step_entities: list[dict]) -> list[dict]:
     """LLM-free fallback: merge STEP entities by number. The shortest, most
     header-like text per number becomes the question; all ids are kept."""
@@ -493,11 +627,48 @@ def _deterministic_step_plan(step_entities: list[dict]) -> list[dict]:
 def pdf_step_reconciler(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     job_id = state.get("job_id", "")
     entities = ctx_read(cfg, job_id, "entities", default=[]) or []
-    step_entities = [
-        e
-        for e in entities
+
+    # Preferred path: whole-document reconstruction over the verbatim perception.
+    # It re-threads orphaned rows to their owning step and records each step's
+    # full page span — the only reliable way to recover a multi-page Step/Action
+    # table whose later rows lost their "Step" column. The entity-graph path
+    # below is kept as a fallback for when perception pages are unavailable or
+    # the holistic pass under-delivers.
+    pages_ctx = ctx_read(cfg, job_id, "pages", default=[]) or []
+    detected_nums = {
+        e["step_number"] for e in entities
         if e.get("type") == "STEP" and isinstance(e.get("step_number"), int)
-    ]
+    }
+    if pages_ctx:
+        holistic = _holistic_step_plan(cfg, job_id, pages_ctx)
+        holistic_nums = {s["step_number"] for s in holistic}
+        # Accept the holistic plan when it is at least as complete as what the
+        # extractor confidently numbered (it normally recovers far more).
+        if holistic and not (detected_nums - holistic_nums):
+            ctx_write(cfg, job_id, "step_plan", holistic)
+            logger.info(
+                "pdf_step_reconciler[holistic]: %d steps %s",
+                len(holistic),
+                [(s["step_number"], s.get("pages")) for s in holistic],
+            )
+            return {}
+        logger.warning(
+            "pdf_step_reconciler: holistic plan incomplete (got %s, detected %s)"
+            " — falling back to entity-graph reconciliation",
+            sorted(holistic_nums), sorted(detected_nums),
+        )
+
+    # Consider EVERY STEP-typed entity — NOT only those that already carry an int
+    # step_number. The page-batched extractor routinely recognises a step's
+    # heading text as a STEP entity yet fails to copy the integer out of the
+    # "Step" column (tall multi-page rows, or a number rendered in a separate
+    # cell), leaving step_number=None. Dropping those here is precisely what made
+    # whole steps — including the document's largest decision table — vanish and
+    # forced bogus gap-filled phantom steps downstream. We instead hand the LLM
+    # the FULL step outline (detected numbers AND un-numbered headings) and let
+    # it rebuild the authoritative, contiguous numbering from document order and
+    # the SOP's own "proceed to / skip to Step N" routing language.
+    step_entities = [e for e in entities if e.get("type") == "STEP"]
     if not step_entities:
         return {}
 
@@ -505,24 +676,42 @@ def pdf_step_reconciler(state: "PipelineState", cfg: "PipelineConfig") -> dict:
         {
             "id": e["id"],
             "page": e.get("page"),
-            "step_number": e["step_number"],
+            "detected_step_number": (
+                e["step_number"] if isinstance(e.get("step_number"), int) else None
+            ),
             "text": (e.get("label") or e.get("text") or "")[:240],
         }
         for e in step_entities
     ]
 
     prompt = f"""You are reconciling the numbered procedure steps of ONE claims-audit
-SOP. Below is every entity that was tagged as a STEP across all pages (read in
-independent page-batches). Because of that batching, a SINGLE real step may appear
-as MULTIPLE fragments (same step_number, different pages) and some non-step content
-(exception bullets, notes) may have been mis-tagged with a number.
+SOP. Below is every entity tagged as a STEP across all pages (read in independent
+page-batches), each with the step number the extractor DETECTED (``detected_step_number``,
+which is null when the extractor missed the integer), plus its page and text.
 
-Produce the SINGLE authoritative, ordered list of this document's numbered
-procedure steps:
-  • One entry per real step number. MERGE all fragments of the same step into that
-    one entry and list every contributing entity id in entity_ids.
-  • EXCLUDE entities that are not actually part of the numbered Step/Action
-    procedure table (drop them — do not emit a step for them).
+Two batching artefacts you MUST repair:
+  • FRAGMENTS — a single real step may appear as MULTIPLE entries (same step,
+    different pages). Merge them into one.
+  • MISSING NUMBERS — many real steps have ``detected_step_number: null`` because
+    the extractor failed to read the integer from the "Step" column (this is
+    common for tall rows whose table spans several pages). RECOVER each step's
+    true number from: (a) the document/page order of the entries, (b) the
+    detected numbers that anchor the sequence, and (c) the SOP's own explicit
+    routing language inside the text ("proceed to Step N", "skip to Step N",
+    "continue to step N").
+
+Produce the SINGLE authoritative, ordered, CONTIGUOUS list of this document's
+numbered procedure steps:
+  • One entry per real step number, ascending, with NO gaps. Assign a
+    step_number to EVERY real step, including ones whose detected number was null.
+  • MERGE all fragments of the same step and list every contributing entity id
+    in entity_ids.
+  • INCLUDE short final-action steps that have no table (e.g. "(F3) Process the
+    claim", "(F4) Save the claim", "Resolve any additional warning/error
+    messages") — they are real numbered steps.
+  • EXCLUDE entries that are NOT part of the numbered Step/Action procedure:
+    table-of-contents / main-menu links, section preambles, or notes that merely
+    resemble a step. Drop them and never emit the same real step twice.
   • Keep the step's question/title verbatim (pick the clearest fragment).
 
 STEP entities:
@@ -557,17 +746,23 @@ Return STRICT JSON: {{"steps":[{{"step_number":int,"question":str,"entity_ids":[
             }
         )
 
-    # Guardrail: if the LLM dropped/merged so aggressively that a detected step
-    # number vanished, fall back to the deterministic merge so nothing is lost.
+    # Guardrail: every step the extractor was SURE about (had an int
+    # detected_step_number) must survive. If the LLM dropped one — or produced
+    # nothing — fall back to a deterministic merge of the numbered entities so a
+    # confidently-detected step is never lost. (Un-numbered STEP entities can
+    # only be recovered by the LLM, so they don't gate this fallback.)
     llm_nums = {s["step_number"] for s in clean}
-    all_nums = {e["step_number"] for e in step_entities}
-    if not clean or (all_nums - llm_nums):
+    numbered_entities = [
+        e for e in step_entities if isinstance(e.get("step_number"), int)
+    ]
+    detected_nums = {e["step_number"] for e in numbered_entities}
+    if not clean or (detected_nums - llm_nums):
         logger.warning(
-            "pdf_step_reconciler: LLM plan missing %s — using deterministic "
-            "merge fallback",
-            sorted(all_nums - llm_nums),
+            "pdf_step_reconciler: LLM plan missing detected step(s) %s — using "
+            "deterministic merge fallback",
+            sorted(detected_nums - llm_nums),
         )
-        clean = _deterministic_step_plan(step_entities)
+        clean = _deterministic_step_plan(numbered_entities)
 
     # collapse any accidental duplicate numbers the LLM may still emit
     merged: dict[int, dict] = {}

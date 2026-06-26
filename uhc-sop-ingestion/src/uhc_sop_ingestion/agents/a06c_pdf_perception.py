@@ -35,7 +35,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from .a07_enrich import _llm_call_pdf
+from .a07_enrich import _llm_call_pdf, _llm_call_images
 
 if TYPE_CHECKING:
     from ..state import PipelineState
@@ -101,6 +101,57 @@ def _mongo_persist_perception(cfg, job_id: str, content_hash: str,
         logger.warning("pdf perception mongo persist failed: %s", exc)
 
 
+def render_pdf_page_images(
+    pdf_bytes: bytes,
+    dpi: int = 150,
+    band_px: int = 1900,
+    overlap_px: int = 220,
+    max_images: int = 120,
+) -> list[str]:
+    """Rasterise a PDF to a list of base64 PNG page images for multimodal LLMs.
+
+    This is the any-PDF safety net used when the native-PDF text path is weak
+    (scanned/image-only PDFs, or a single oversized page). Crucially, an
+    abnormally TALL page (e.g. a whole SOP exported as one ~13000pt page) is
+    split into overlapping horizontal BANDS at the IMAGE level with Pillow — far
+    more reliable than cropping a malformed PDF's page box — so each band is a
+    normally-readable image the vision model can transcribe faithfully.
+    """
+    try:
+        from pdf2image import convert_from_bytes
+        import io as _io
+        page_images = convert_from_bytes(pdf_bytes, dpi=dpi)
+    except Exception as exc:
+        logger.warning("render_pdf_page_images: rasterisation failed: %s", exc)
+        return []
+
+    tiles = []
+    for im in page_images:
+        w, h = im.size
+        if h <= int(band_px * 1.4):
+            tiles.append(im)
+        else:
+            y = 0
+            while y < h:
+                top = max(0, y - overlap_px) if y else 0
+                bottom = min(h, y + band_px)
+                tiles.append(im.crop((0, top, w, bottom)))
+                y += band_px
+                if len(tiles) >= max_images:
+                    break
+        if len(tiles) >= max_images:
+            break
+
+    out: list[str] = []
+    for im in tiles[:max_images]:
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        out.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+    logger.info("render_pdf_page_images: %d source page(s) -> %d image tile(s)",
+                len(page_images), len(out))
+    return out
+
+
 # ── 1. pdf_slicer ─────────────────────────────────────────────────────────────
 
 def _encode_pages(reader, start: int, end: int) -> str:
@@ -154,24 +205,44 @@ def pdf_slicer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     b64 = state.get("raw_bytes_b64", "")
     if not b64:
         return {}
+    job_id = state.get("job_id", "")
+
+    # PRIMARY (shared-context engine): rasterise the PDF into readable IMAGE
+    # band-tiles. Each tile is a small, self-contained unit a multimodal model
+    # transcribes COMPLETELY (no truncation, real indentation/nesting visible),
+    # and oversized single pages are split into bands here — the cases that break
+    # text/page slicing. Tiles go on the Redis blackboard so perception can
+    # accumulate page records incrementally and resume after a crash.
+    try:
+        images = render_pdf_page_images(base64.b64decode(b64))
+    except Exception as exc:
+        logger.warning("pdf_slicer: rasterisation error: %s", exc)
+        images = []
+    if images:
+        slices = [
+            {"slice_index": i, "page_start": i + 1, "page_end": i + 1,
+             "image_b64": img}
+            for i, img in enumerate(images)
+        ]
+        ctx_write(cfg, job_id, "slices", slices)
+        logger.info("pdf_slicer[image]: rasterised into %d band-tile(s)", len(slices))
+        return {"pdf_page_count": len(slices), "pdf_slice_count": len(slices),
+                "pdf_image_mode": True}
+
+    # FALLBACK: native-PDF byte slices (used when rasterisation is unavailable,
+    # e.g. poppler not installed). Keeps the pipeline working without images.
     try:
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(base64.b64decode(b64)))
     except Exception as exc:
         logger.warning("pdf_slicer: cannot open PDF: %s", exc)
         return {}
-
     slice_pages = max(1, getattr(cfg, "pdf_slice_pages", 20))
     overlap = max(0, getattr(cfg, "pdf_slice_overlap", 1))
     slices = _build_slices(reader, slice_pages, overlap)
     page_count = len(reader.pages)
-
-    job_id = state.get("job_id", "")
-    # Keep the heavy base64 slices on the Redis blackboard, NOT in LangGraph
-    # state, so they never bloat the master state or leak across BFS documents.
     ctx_write(cfg, job_id, "slices", slices)
-
-    logger.info("pdf_slicer: %d pages -> %d slices (slice_pages=%d overlap=%d)",
+    logger.info("pdf_slicer[pdf]: %d pages -> %d slices (slice_pages=%d overlap=%d)",
                 page_count, len(slices), slice_pages, overlap)
     return {"pdf_page_count": page_count, "pdf_slice_count": len(slices)}
 
@@ -216,10 +287,30 @@ Read EVERY page completely. Transcribe every word, table cell, footnote, warning
 and code VERBATIM — this is a compliance document where a single missed letter is
 a defect. Do not summarise, do not paraphrase, do not skip boilerplate.
 
+CRITICAL FIDELITY RULES (a violation is a defect):
+• TRANSCRIBE, NEVER INVENT. Output only content that is physically printed on the
+  page. Never fabricate a row, cell, note, or step that is not actually there.
+• NEVER SIMPLIFY A TABLE. Reproduce every data row exactly as printed, in order,
+  with its real cell values. Do NOT collapse a multi-row If/And/Then decision
+  table into a generic "if duplicate / if not duplicate" pair or any other
+  summary. If the printed table has ten rows, return ten rows.
+• NO DUPLICATION. Never repeat the same block, note, or table row more than once,
+  and never copy a block/row onto a page where it is not physically printed. Each
+  block and row appears exactly as many times as it does on the page (normally
+  once).
+• PAGE NUMBERING IS STRICT. The slice's first physical page is global page
+  {p_start}; assign the next consecutive global number to each following physical
+  page ({p_start}, {p_start}+1, …). Never reuse, skip, or reorder page numbers,
+  and never move a later page's content onto an earlier page.
+• PRESERVE THE "Step" COLUMN. In a "Step / Action" table, copy the step-number
+  cell for EVERY row — including rows whose action spans many lines or continues
+  onto the next page (such a continuation keeps the SAME step number; do not drop
+  or blank it).
+
 For each page return its structured content. Preserve table structure exactly:
 one entry per row, one cell per column, in reading order. Flag any table or row
-that visually continues from the previous page/row so cross-page rows can be
-re-joined later. Set page_number to the GLOBAL page number.
+that visually continues from the previous page/row (``continues_*``) so cross-page
+rows can be re-joined later. Set page_number to the GLOBAL page number.
 
 Return STRICT JSON matching this contract:
 {_PERCEPTION_SCHEMA_HINT}
@@ -237,6 +328,73 @@ Return STRICT JSON matching this contract:
     return pages or []
 
 
+def _read_one_band(cfg, image_b64: str, band_no: int) -> list[dict]:
+    """Multimodal perception of ONE band-tile image. Returns a single page record
+    (page_number == band_no) holding the band's fully-transcribed blocks/tables.
+
+    A band is small enough that the vision model can transcribe it COMPLETELY —
+    every row, bullet, sub-bullet, note, code and identifier — with the visual
+    indentation/nesting intact. This is the per-unit write into the shared Redis
+    context that the per-step assembler later reads, so nothing is ever truncated
+    by trying to emit a whole document at once.
+    """
+    prompt = f"""You are a meticulous document-perception engine for claims-audit
+SOPs. The attached IMAGE is band #{band_no} — one vertical slice of the document
+(a band may begin or end mid-table/mid-row). Transcribe EVERYTHING visible in this
+band VERBATIM — every word, table cell, bullet, sub-bullet, note, warning, code
+and identifier (TIN/NPI/provider name). This is a compliance document: a single
+missed line is a defect.
+
+CRITICAL FIDELITY RULES:
+• TRANSCRIBE, NEVER INVENT or SIMPLIFY. Reproduce every data row exactly; never
+  collapse a multi-row If/And/Then table into a generic pair. Ten printed rows ->
+  ten rows. Capture operative identifier lists (e.g. excluded-provider TIN tables)
+  row for row.
+• PRESERVE NESTING. Use indentation/bullet level to set ``level`` on blocks and to
+  keep sub-items under their parent; do not flatten nested guidance.
+• PRESERVE THE "Step" COLUMN. In a Step/Action table copy the step-number cell for
+  every row, including multi-line rows and rows continued from a previous band.
+• NO DUPLICATION. Emit each block/row exactly once.
+• Set ``continues_from_prev_page``/``continues_to_next_page``/``continues_from_prev_row``
+  when content is clipped by the band edge, so bands can be re-joined.
+
+Set page_number to {band_no}. Return STRICT JSON matching:
+{_PERCEPTION_SCHEMA_HINT}
+"""
+    result = _llm_call_images(
+        cfg, prompt, [image_b64], fallback={"pages": []},
+        agent_name="pdf_band_reader", provider="openai",
+        expected_type=dict, required_keys=["pages"],
+        stage="pdf_perceive", max_tokens=16384,
+    )
+    raw_pages = (result.get("pages") if isinstance(result, dict) else None) or []
+    # Collapse whatever the model returned into ONE page keyed by this band number
+    # (a band is a sub-region, not a real page boundary).
+    blocks: list[dict] = []
+    tables: list[dict] = []
+    codes: list = []
+    cont_prev = False
+    cont_next = False
+    for pg in raw_pages:
+        if not isinstance(pg, dict):
+            continue
+        cont_prev = cont_prev or bool(pg.get("continues_from_prev_page"))
+        cont_next = bool(pg.get("continues_to_next_page")) or cont_next
+        blocks.extend(pg.get("blocks") or [])
+        tables.extend(pg.get("tables") or [])
+        codes.extend(pg.get("codes") or [])
+    if not (blocks or tables or codes):
+        return []
+    return [{
+        "page_number": band_no,
+        "continues_from_prev_page": cont_prev,
+        "continues_to_next_page": cont_next,
+        "blocks": blocks,
+        "tables": tables,
+        "codes": codes,
+    }]
+
+
 def pdf_page_reader(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     job_id = state.get("job_id", "")
     slices = ctx_read(cfg, job_id, "slices", default=[]) or []
@@ -245,13 +403,19 @@ def pdf_page_reader(state: "PipelineState", cfg: "PipelineConfig") -> dict:
 
     per_slice: list[dict] = []
     for slc in slices:
-        pages = _read_one_slice(cfg, slc)
+        if slc.get("image_b64"):
+            pages = _read_one_band(cfg, slc["image_b64"], slc["page_start"])
+        else:
+            pages = _read_one_slice(cfg, slc)
         per_slice.append({
             "slice_index": slc["slice_index"],
             "page_start": slc["page_start"],
             "page_end": slc["page_end"],
             "pages": pages,
         })
+        # Accumulate into the shared Redis context after EACH unit so partial
+        # perception survives a crash/kill and can resume.
+        ctx_write(cfg, job_id, "slice_perception", per_slice)
 
     ctx_write(cfg, job_id, "slice_perception", per_slice)
     total_pages = sum(len(s["pages"]) for s in per_slice)
