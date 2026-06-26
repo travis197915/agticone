@@ -63,3 +63,7 @@ _rerun_defect_claims.py
 _rerun_one.py
 _test_provsel_rule.py
 docs/data/
+
+docs/*
+
+builder/management/*

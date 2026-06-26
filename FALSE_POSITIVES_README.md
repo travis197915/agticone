@@ -160,8 +160,6 @@ both into Postgres so they deploy, run at execution, and are **UI-editable**.
   `post_save`/`post_delete` **signal** (`agent_tools/signals.py`) eagerly clears
   the cache in the editing process, and Celery workers pick the change up via the
   watermark.
-- **Seed command** `python manage.py seed_field_mapping` imports both YAMLs into
-  the DB to bootstrap an environment.
 - **REST CRUD** (`agent_tools/views.py` + `urls.py`): `…/field-mappings/`,
   `…/claim-ontology/`, plus a meta endpoint for the friendly system labels.
 - **Frontend** (`claims-frontend`): context-driven pages under **Configuration**
@@ -236,7 +234,8 @@ determination procedure.
 - **Edit context (no deploy):** Configuration → Field Mapping / Claim Ontology in
   the frontend. Saves hit `SopFieldMapping` / `ClaimOntologyField`; the engine
   picks changes up live (signal in-process, watermark cross-process).
-- **Bootstrap a new env:** `PYTHONPATH=. python manage.py seed_field_mapping`.
+- **Bootstrap a new env:** populate `SopFieldMapping` / `ClaimOntologyField` via
+  the Configuration UI (or the REST CRUD endpoints).
 - **Re-run a single claim** (≈25 min, 147 live LLM calls): `_rerun_one.py <claim_id>`.
 - **Re-run the defect batch:** `_rerun_defect_claims.py` (long-running).
 - Domain guidance is in code — change `_PROVSEL_GUIDANCE` / `_PROVSEL_SIGNALS` in

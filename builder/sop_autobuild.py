@@ -42,7 +42,7 @@ from uhc_execution_engine.rule_loader import (_hydrate_decision,
 
 log = logging.getLogger(__name__)
 
-# Canvas geometry (mirrors build_claim_audit_workflow spacing).
+# Canvas geometry.
 _COL_W = 360.0
 _ROW_H = 140.0
 _SHAPE_W = 240.0
@@ -114,7 +114,8 @@ def _shape_defs() -> tuple[ShapeDefinition, ShapeDefinition, ShapeDefinition]:
     terminator = ShapeDefinition.objects.filter(slug="round-rectangle").first()
     if rectangle is None:
         raise RuntimeError(
-            "ShapeDefinition 'rectangle' not found — run seed_builder_catalog.")
+            "ShapeDefinition 'rectangle' not found — the builder catalog is "
+            "populated by a data migration; run `python manage.py migrate`.")
     diamond = diamond or rectangle
     terminator = terminator or rectangle
     return rectangle, diamond, terminator
@@ -140,9 +141,8 @@ def _dedupe_by_key(rules: list[dict]) -> list[dict]:
 
 
 def _step_detail(sop: AuditSop, source_ref: str, step, decisions: list) -> str:
-    """Full, untrimmed detail for one step — same composition as the
-    hand-built reference (build_claim_audit_workflow._step_detail) so the
-    inspector shows identical context for auto-built nodes."""
+    """Full, untrimmed detail for one step, so the inspector shows complete
+    context for auto-built nodes."""
     parts = [
         f"SOP: {sop.title}  ·  {source_ref}",
         f"Step {step.step_number}"
