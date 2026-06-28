@@ -136,6 +136,51 @@ class McpServerConfig(_UUIDPK, _Timestamps):
         return f"{self.label} ({self.base_url})"
 
 
+class McpToolContext(_UUIDPK, _Timestamps):
+    """LLM-derived **context store** describing what one MCP tool returns.
+
+    When an MCP tool is tested from the UI, the response payload is sent to an
+    LLM (Claude / OpenAI) which extracts a structured understanding of the
+    shape: a plain-English ``summary`` plus a ``fields`` list (each field's
+    name/path, inferred type, a sample value, and what it *means* in claims
+    terms). The result is cached here keyed one-to-one to the :class:`Tool` so
+    the next time the tool is opened the understanding is shown instantly
+    without re-spending an LLM call, and so the execution engine / agents can
+    reuse the field semantics as runtime context.
+    """
+
+    tool = models.OneToOneField(
+        Tool, on_delete=models.CASCADE, related_name="mcp_context",
+    )
+    server = models.ForeignKey(
+        McpServerConfig, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="tool_contexts",
+    )
+    # Snapshot of the path that produced the analyzed payload.
+    mcp_path = models.CharField(max_length=512, blank=True, default="")
+    # Plain-English description of the whole payload.
+    summary = models.TextField(blank=True, default="")
+    # [{"name", "path", "type", "example", "description"}, ...]
+    fields = models.JSONField(default=list, blank=True)
+    # The (trimmed) representative sample that was actually analyzed, kept so a
+    # reviewer can see what the understanding was derived from.
+    sample_response = models.JSONField(default=dict, blank=True)
+    # When the payload is an array: how many records were detected.
+    record_count = models.IntegerField(null=True, blank=True)
+    # True when the analyzed payload was a truncated / salvaged JSON string.
+    truncated = models.BooleanField(default=False)
+    llm_provider = models.CharField(max_length=32, blank=True, default="")
+    llm_model = models.CharField(max_length=64, blank=True, default="")
+    analyzed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "mcp_tool_context"
+        ordering = ["-analyzed_at", "-updated_at"]
+
+    def __str__(self) -> str:  # pragma: no cover - debug aid
+        return f"context<{self.tool_id}>"
+
+
 class SopFieldMapping(_UUIDPK, _Timestamps):
     """DB-backed canonical SOP field mapping (replaces ``yaml/sop_field_mapping.yaml``
     as the runtime source of truth).

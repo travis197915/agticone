@@ -20,6 +20,7 @@ from pathlib import Path
 from django.conf import settings as djsettings
 from django.shortcuts import get_object_or_404
 from rest_framework import permissions, status, viewsets
+from rest_framework import serializers as drf_serializers
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
@@ -243,6 +244,126 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         except Exception:
             context["oos_keys"] = None
         return Response(WorkflowGraphSerializer(workflow, context=context).data)
+
+    # ── /sop-order — reorder SOP workbench columns ──────────────────────────
+
+    @action(detail=True, methods=["get", "put"], url_path="sop-order")
+    def sop_order(self, request, pk=None):
+        """List / reorder the SOP columns (workbenches) of a workflow.
+
+        GET  → ordered list of workbench columns, one per SOP.
+        PUT  → body ``{"order": [workbench_id, ...]}`` reassigns each
+               ``Workbench.order`` to match the supplied sequence, repositions
+               the shapes so the canvas reflects the new left-to-right order,
+               and rebuilds the SOP→SOP ("then") chain.
+
+        Execution order honours ``Workbench.order`` (see
+        ``uhc_execution_engine.rule_loader``), so this also changes the runtime
+        order in which the SOPs are evaluated.
+        """
+        workflow = self.get_object()
+        if request.method == "PUT":
+            self._reorder_sops(workflow, request.data or {})
+        return Response(self._sop_order_payload(workflow))
+
+    @staticmethod
+    def _sop_order_payload(workflow) -> list[dict]:
+        benches = (
+            Workbench.objects
+            .filter(work_area__workflow=workflow)
+            .order_by("work_area__order", "order", "created_at")
+        )
+        out: list[dict] = []
+        for wb in benches:
+            cfg = wb.config or {}
+            out.append({
+                "workbench_id": str(wb.id),
+                "name":         wb.name or "",
+                "kind":         wb.kind or "",
+                "sop_id":       cfg.get("sop_id"),
+                "sop_title":    cfg.get("sop_title") or cfg.get("does") or wb.name or "",
+                "order":        wb.order,
+                "shape_count":  wb.shapes.count(),
+            })
+        return out
+
+    def _reorder_sops(self, workflow, data: dict) -> None:
+        from django.db import transaction as _txn
+
+        from .sop_autobuild import _COL_W
+
+        requested = [str(x) for x in (data.get("order") or [])]
+        if not requested:
+            raise drf_serializers.ValidationError(
+                {"order": "Provide an ordered list of workbench ids."})
+
+        benches = {
+            str(wb.id): wb
+            for wb in Workbench.objects.filter(work_area__workflow=workflow)
+        }
+        unknown = [wb_id for wb_id in requested if wb_id not in benches]
+        if unknown:
+            raise drf_serializers.ValidationError(
+                {"order": f"Unknown workbench id(s) for this workflow: {unknown}"})
+
+        # Append any workbenches the client did not mention, preserving their
+        # current relative order, so nothing is silently dropped.
+        tail = [
+            str(wb.id)
+            for wb in sorted(benches.values(), key=lambda w: (w.order, str(w.created_at)))
+            if str(wb.id) not in requested
+        ]
+        sequence = requested + tail
+
+        with _txn.atomic():
+            for new_idx, wb_id in enumerate(sequence):
+                wb = benches[wb_id]
+                target_left = new_idx * _COL_W
+                delta = target_left - (wb.position_x or 0.0)
+
+                wb.order = new_idx
+                wb.position_x = target_left
+                m = re.match(r"^\s*\d+\.\s*(.*)$", wb.name or "", re.S)
+                if m:
+                    wb.name = f"{new_idx + 1}. {m.group(1)}"[:255]
+                wb.save(update_fields=["order", "position_x", "name", "updated_at"])
+
+                if delta:
+                    for sh in wb.shapes.all():
+                        sh.position_x = (sh.position_x or 0.0) + delta
+                        sh.save(update_fields=["position_x", "updated_at"])
+
+            self._rebuild_sop_chain(workflow, sequence, benches)
+
+    @staticmethod
+    def _rebuild_sop_chain(workflow, sequence: list[str], benches: dict) -> None:
+        """Re-point the cross-SOP ("then") edges to follow the new column order.
+
+        Intra-SOP ("next") edges are left untouched; only the inter-column
+        chain — last shape of column *i* → first shape of column *i+1* — is
+        rebuilt so the arrows don't cross after a reorder.
+        """
+        from .models import ShapeConnection
+
+        ShapeConnection.objects.filter(
+            source_shape__workbench__work_area__workflow=workflow,
+            label="then",
+        ).delete()
+
+        def _first(wb):
+            return wb.shapes.order_by("order", "created_at").first()
+
+        def _last(wb):
+            return wb.shapes.order_by("-order", "-created_at").first()
+
+        ordered = [benches[wb_id] for wb_id in sequence]
+        for i in range(len(ordered) - 1):
+            last = _last(ordered[i])
+            nxt_first = _first(ordered[i + 1])
+            if last is not None and nxt_first is not None:
+                ShapeConnection.objects.create(
+                    source_shape=last, target_shape=nxt_first, label="then",
+                    source_port="bottom-source", target_port="top-target")
 
     @staticmethod
     def _graph_prefetched(pk):
