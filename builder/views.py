@@ -284,6 +284,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
                 "sop_title":    cfg.get("sop_title") or cfg.get("does") or wb.name or "",
                 "order":        wb.order,
                 "shape_count":  wb.shapes.count(),
+                "extra_context": cfg.get("extra_context") or "",
             })
         return out
 
@@ -364,6 +365,153 @@ class WorkflowViewSet(viewsets.ModelViewSet):
                 ShapeConnection.objects.create(
                     source_shape=last, target_shape=nxt_first, label="then",
                     source_port="bottom-source", target_port="top-target")
+
+    # ── /execution-mode — linear ⇆ parallel SOP execution ───────────────────
+
+    _CONTROL_NODE_KEY = "parallel-control"
+
+    @action(detail=True, methods=["get", "put"], url_path="execution-mode")
+    def execution_mode(self, request, pk=None):
+        """Get / set how the workflow's SOPs execute.
+
+        GET → ``{"mode": "linear"|"parallel"}``.
+        PUT → body ``{"mode": "linear"|"parallel"}``. Persists the mode on
+              ``workflow.metadata`` and transforms the canvas topology:
+
+          * parallel — add a Fork (split) node before all SOP columns and a
+            Verdict (join) node after them; fan Fork→each SOP and each
+            SOP→Verdict; drop the sequential SOP→SOP chain.
+          * linear   — remove the Fork/Verdict nodes and restore the SOP→SOP
+            chain.
+
+        The engine reads this mode (``n02_load_bindings``) to decide whether a
+        DENY/STOP short-circuits the whole claim (linear) or every SOP runs and
+        the verdict is fused by precedence (parallel).
+        """
+        workflow = self.get_object()
+        if request.method == "PUT":
+            mode = str((request.data or {}).get("mode") or "").lower()
+            if mode not in {"linear", "parallel"}:
+                raise drf_serializers.ValidationError(
+                    {"mode": "Must be 'linear' or 'parallel'."})
+            from django.db import transaction as _txn
+            with _txn.atomic():
+                meta = dict(workflow.metadata or {})
+                meta["execution_mode"] = mode
+                workflow.metadata = meta
+                workflow.save(update_fields=["metadata", "updated_at"])
+                if mode == "parallel":
+                    self._build_parallel_topology(workflow)
+                else:
+                    self._build_linear_topology(workflow)
+        return Response({"mode": self._current_mode(workflow)})
+
+    @staticmethod
+    def _current_mode(workflow) -> str:
+        mode = str((workflow.metadata or {}).get("execution_mode") or "linear").lower()
+        return mode if mode in {"linear", "parallel"} else "linear"
+
+    def _sop_benches(self, workflow):
+        """SOP columns (workbenches) of a workflow, excluding the control bench."""
+        return list(
+            Workbench.objects
+            .filter(work_area__workflow=workflow)
+            .exclude(node_key=self._CONTROL_NODE_KEY)
+            .order_by("work_area__order", "order", "created_at")
+        )
+
+    def _build_parallel_topology(self, workflow) -> None:
+        from .models import Shape, ShapeConnection, ShapeDefinition
+        from .sop_autobuild import _COL_W, _ROW_H
+
+        benches = [b for b in self._sop_benches(workflow) if b.shapes.exists()]
+        if len(benches) < 1:
+            return
+        area = benches[0].work_area
+
+        fork_def = ShapeDefinition.objects.filter(slug="parallel-fork").first()
+        verdict_def = ShapeDefinition.objects.filter(slug="verdict").first()
+        if not fork_def or not verdict_def:
+            raise drf_serializers.ValidationError(
+                {"mode": "Parallel control shapes are not seeded (run migrations)."})
+
+        # Control workbench holds the Fork + Verdict structural nodes.
+        control, _ = Workbench.objects.get_or_create(
+            work_area=area, node_key=self._CONTROL_NODE_KEY,
+            defaults=dict(name="Parallel Control", kind="control", order=9999),
+        )
+
+        n = len(benches)
+        center_x = (n - 1) * _COL_W / 2.0
+        max_y = 0.0
+        for b in benches:
+            last = b.shapes.order_by("-position_y").first()
+            if last:
+                max_y = max(max_y, (last.position_y or 0.0) + (last.height or 80))
+
+        fork = control.shapes.filter(definition=fork_def).first()
+        if fork is None:
+            fork = Shape.objects.create(
+                workbench=control, definition=fork_def, label="Parallel Split",
+                description="Fans every SOP out to run simultaneously.",
+                width=fork_def.default_width, height=fork_def.default_height, order=0,
+                properties={"control": "fork"},
+            )
+        fork.position_x = center_x
+        fork.position_y = -_ROW_H * 1.4
+        fork.save(update_fields=["position_x", "position_y", "updated_at"])
+
+        verdict = control.shapes.filter(definition=verdict_def).first()
+        if verdict is None:
+            verdict = Shape.objects.create(
+                workbench=control, definition=verdict_def, label="Verdict",
+                description="Fuses every SOP's outcome into the final verdict "
+                            "(highest-severity disposition wins).",
+                width=verdict_def.default_width, height=verdict_def.default_height,
+                order=1, properties={"control": "verdict"},
+            )
+        verdict.position_x = center_x
+        verdict.position_y = max_y + _ROW_H
+        verdict.save(update_fields=["position_x", "position_y", "updated_at"])
+
+        # Drop the sequential SOP→SOP chain and any prior fork/verdict wiring.
+        ShapeConnection.objects.filter(
+            source_shape__workbench__work_area__workflow=workflow, label="then",
+        ).delete()
+        ShapeConnection.objects.filter(source_shape=fork).delete()
+        ShapeConnection.objects.filter(target_shape=verdict).delete()
+
+        for b in benches:
+            first = b.shapes.order_by("order", "created_at").first()
+            last = b.shapes.order_by("-order", "-created_at").first()
+            if first is not None:
+                ShapeConnection.objects.create(
+                    source_shape=fork, target_shape=first, label="parallel",
+                    source_port="bottom-source", target_port="top-target")
+            if last is not None:
+                ShapeConnection.objects.create(
+                    source_shape=last, target_shape=verdict, label="verdict",
+                    source_port="bottom-source", target_port="top-target")
+
+    def _build_linear_topology(self, workflow) -> None:
+        from .models import Shape, Workbench as _WB
+
+        # Remove the control bench's structural nodes (cascade drops their
+        # fork/verdict connections), then restore the SOP→SOP chain.
+        control = (
+            _WB.objects
+            .filter(work_area__workflow=workflow, node_key=self._CONTROL_NODE_KEY)
+            .first()
+        )
+        if control is not None:
+            Shape.objects.filter(workbench=control).delete()
+            control.delete()
+
+        benches = self._sop_benches(workflow)
+        sequence = [str(b.id) for b in benches]
+        bench_map = {str(b.id): b for b in benches}
+        if len(sequence) >= 2:
+            self._rebuild_sop_chain(workflow, sequence, bench_map)
 
     @staticmethod
     def _graph_prefetched(pk):
@@ -1308,6 +1456,131 @@ class WorkbenchViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         from .serializers import _NestedWorkbenchSerializer
         return _NestedWorkbenchSerializer
+
+    @action(detail=True, methods=["get", "put", "patch"], url_path="context")
+    def context(self, request, pk=None):
+        """GET/PUT the per-SOP **extra context** for one workbench.
+
+        Stored in ``Workbench.config['extra_context']`` (free-form YAML/text)
+        and injected verbatim into every rule-evaluation prompt for this SOP's
+        rules at execution time (see ``uhc_execution_engine.rule_loader`` +
+        ``_eval_common._workbench_context_section``). Merges into ``config`` so
+        other keys (sop_id, sop_title, yaml_ref, …) are preserved.
+        """
+        wb = self.get_object()
+        if request.method in ("PUT", "PATCH"):
+            text = request.data.get("extra_context", "")
+            if not isinstance(text, str):
+                raise drf_serializers.ValidationError(
+                    {"extra_context": "must be a string"})
+            cfg = dict(wb.config or {})
+            cfg["extra_context"] = text.strip()
+            wb.config = cfg
+            wb.save(update_fields=["config", "updated_at"])
+        cfg = wb.config or {}
+        return Response({
+            "workbench_id": str(wb.id),
+            "extra_context": cfg.get("extra_context") or "",
+        })
+
+    # ── YAML ↔ DB rule reconciliation ("Compare with YAML" / SOP versioning) ──
+    def _resolve_sop(self, wb):
+        """Return the ``AuditSop`` this workbench (SOP column) is bound to."""
+        from sop_ingestion.models import AuditSop
+        cfg = wb.config or {}
+        sop_id = cfg.get("sop_id")
+        if not sop_id:
+            return None
+        return AuditSop.objects.filter(pk=sop_id).first()
+
+    @action(detail=True, methods=["get"], url_path="sop-version")
+    def sop_version(self, request, pk=None):
+        """Current SOP version + recent rule-change history (from Mongo)."""
+        from sop_ingestion import rule_reconcile
+        wb = self.get_object()
+        sop = self._resolve_sop(wb)
+        if sop is None:
+            return Response({"detail": "This SOP column is not bound to an "
+                                       "ingested SOP (no sop_id)."}, status=400)
+        return Response(rule_reconcile.version_info(sop))
+
+    @action(detail=True, methods=["post"], url_path="reconcile/analyze")
+    def reconcile_analyze(self, request, pk=None):
+        """Enqueue an AI YAML↔DB comparison on Celery; return a job id.
+
+        The compare loop is LLM-bound and can run for many seconds, so it runs
+        in the Celery worker (queue ``celery``) instead of blocking the request.
+        Poll ``reconcile/status/<job_id>`` for progress + the final findings.
+        """
+        wb = self.get_object()
+        sop = self._resolve_sop(wb)
+        if sop is None:
+            return Response({"detail": "This SOP column is not bound to an "
+                                       "ingested SOP (no sop_id)."}, status=400)
+        yaml_text = request.data.get("yaml") or request.data.get("yaml_text") or ""
+        if not isinstance(yaml_text, str) or not yaml_text.strip():
+            raise drf_serializers.ValidationError({"yaml": "YAML text is required."})
+        source = str(request.data.get("source") or "pasted")
+
+        from sop_ingestion.tasks import reconcile_analyze_task
+        async_result = reconcile_analyze_task.delay(sop.id, yaml_text, source)
+        return Response(
+            {"job_id": async_result.id, "state": "PENDING", "sop_id": sop.id},
+            status=202,
+        )
+
+    @action(detail=True, methods=["get"],
+            url_path=r"reconcile/status/(?P<job_id>[^/.]+)")
+    def reconcile_status(self, request, pk=None, job_id=None):
+        """Poll a queued reconcile-analyze job: progress while running, the
+        findings result on success, or an error message on failure."""
+        from sop_backend.celery import app as celery_app
+
+        res = celery_app.AsyncResult(job_id)
+        state = res.state
+        payload: dict = {"job_id": job_id, "state": state}
+
+        if state == "PROGRESS":
+            info = res.info if isinstance(res.info, dict) else {}
+            payload.update({
+                "processed": info.get("processed", 0),
+                "total": info.get("total", 0),
+                "phase": info.get("phase", "comparing"),
+            })
+        elif state == "SUCCESS":
+            data = res.result if isinstance(res.result, dict) else {}
+            if data.get("error"):
+                payload["state"] = "FAILURE"
+                payload["error"] = data["error"]
+                payload["error_kind"] = data.get("error_kind", "internal")
+            else:
+                payload["result"] = data
+        elif state == "FAILURE":
+            payload["error"] = str(res.info)
+            payload["error_kind"] = "internal"
+        return Response(payload)
+
+    @action(detail=True, methods=["post"], url_path="reconcile/apply")
+    def reconcile_apply(self, request, pk=None):
+        """Apply the auditor-accepted findings to the canonical SOP rules."""
+        from sop_ingestion import rule_reconcile
+        wb = self.get_object()
+        sop = self._resolve_sop(wb)
+        if sop is None:
+            return Response({"detail": "This SOP column is not bound to an "
+                                       "ingested SOP (no sop_id)."}, status=400)
+        accepted = request.data.get("accepted")
+        if not isinstance(accepted, list):
+            raise drf_serializers.ValidationError(
+                {"accepted": "must be a list of accepted findings."})
+        user = getattr(getattr(request, "user", None), "username", "") or "system"
+        result = rule_reconcile.apply(
+            sop, accepted,
+            user=str(user),
+            yaml_source=str(request.data.get("yaml_source") or "pasted"),
+            reconcile_id=str(request.data.get("reconcile_id") or ""),
+        )
+        return Response(result)
 
 
 class ShapeViewSet(viewsets.ModelViewSet):

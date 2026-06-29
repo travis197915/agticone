@@ -324,6 +324,24 @@ DOMAIN GUIDANCE — PROVIDER SELECTION (apply before deciding `matched`)
 """
 
 
+_MATCHING_CONTRACT = """\
+MATCHING CONTRACT (read this BEFORE deciding `matched`)
+-------------------------------------------------------
+1. `matched` is decided SOLELY by whether the rule's `condition` is satisfied by
+   the claim / tool facts. The `action` only describes the CONSEQUENCE when the
+   condition holds — it is NEVER a matching criterion. Do not set matched=true
+   just because the `action` text mentions an error / denial / "should be denied".
+2. Every atomic clause in the `condition` must hold. If your own reasoning
+   establishes a fact that violates ANY clause of the condition (e.g. the
+   condition requires "individual is NOT billed" but you find the individual IS
+   billed), then the rule is NOT matched — set matched=false / status="Not-Met".
+3. If the `condition` and the `action` contradict each other (e.g. condition says
+   "NOT billed" while the action says "if billed → deny"), the `condition` is
+   authoritative for `matched`. Evaluate the condition as written, call out the
+   contradiction in `reasoning`, and lower `confidence`.
+"""
+
+
 def _domain_context(rule: dict[str, Any]) -> str:
     """Return scoped domain guidance for provider-selection rules, else "".
 
@@ -338,11 +356,74 @@ def _domain_context(rule: dict[str, Any]) -> str:
     return f"\n{_PROVSEL_GUIDANCE}" if hits >= 2 else ""
 
 
+def _workbench_context_section(rule: dict[str, Any]) -> str:
+    """Auditor-authored per-SOP context, injected verbatim for this SOP's rules.
+
+    Sourced from ``Workbench.config['extra_context']`` (set in the builder UI)
+    and attached to every rule of that SOP by ``rule_loader``. Layered on top of
+    any hardcoded ``_domain_context`` guidance — it does NOT replace it. Purely
+    additive: rules whose SOP has no context get an empty block and an unchanged
+    prompt. This is interpretive guidance only; it never dictates the verdict.
+    """
+    ctx = str(rule.get("sop_extra_context") or "").strip()
+    if not ctx:
+        return ""
+    return (
+        "\nSOP CONTEXT (auditor-provided guidance for THIS SOP; use it to "
+        "interpret the rule and the claim correctly)\n"
+        "------------------------------------------------------------------"
+        "----------------------------------------\n"
+        f"{ctx}\n"
+    )
+
+
+def _prior_findings_section(prior_findings: list[dict[str, Any]] | None) -> str:
+    """Render the already-evaluated rules of THIS SOP (top-to-bottom) so the
+    current rule can honor precedence (e.g. a prioritized "1st/2nd/3rd choice"
+    ladder). Empty when nothing has been evaluated yet — additive."""
+    if not prior_findings:
+        return ""
+    lines: list[str] = []
+    for f in prior_findings:
+        if f.get("skipped"):
+            verdict_txt = "SKIPPED"
+        elif f.get("matched"):
+            verdict_txt = "MATCHED (condition satisfied)"
+        else:
+            verdict_txt = "not matched"
+        label = str(f.get("label") or "").strip()
+        dt = str(f.get("decision_type") or "").strip()
+        tag = f" [{label}]" if label else ""
+        tag += f" {{{dt}}}" if dt else ""
+        lines.append(f"  - {f.get('key')}{tag} -> {verdict_txt}")
+        reason = str(f.get("reasoning") or "").strip()
+        if reason:
+            lines.append(f"      finding: {reason}")
+    return (
+        "\nPRIOR RULE FINDINGS — already evaluated IN THIS SOP, in order (top-to-bottom)\n"
+        "---------------------------------------------------------------------------\n"
+        + "\n".join(lines)
+        + "\n(Honor precedence: if THIS rule is a lower-priority choice whose condition "
+        "requires that earlier choices were NOT satisfied, and one of those earlier "
+        "choices above is MATCHED, then this rule's condition is NOT satisfied — set "
+        "matched=false. Do NOT contradict a factual determination an earlier sibling "
+        "already made (e.g. if a sibling established the individual IS billed, do not "
+        "now claim the individual is NOT billed).)\n"
+    )
+
+
 def evaluate_one_rule(cfg: EngineConfig, *, rule: dict[str, Any],
                       claim: dict[str, Any],
                       tool_context: list[dict[str, Any]],
-                      stage: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Run one LLM evaluation. Returns (verdict, meta)."""
+                      stage: str,
+                      prior_findings: list[dict[str, Any]] | None = None,
+                      ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run one LLM evaluation. Returns (verdict, meta).
+
+    ``prior_findings`` are the verdicts of rules already evaluated in this SOP
+    (the engine runs a SOP's rules sequentially), surfaced so this rule can
+    respect a prioritized choice ladder.
+    """
     # Compact oversized tool results (e.g. cbd_coverage's coverage grid) so the
     # assembled prompt stays within the model's context window. Without this a
     # single large tool result 400s the call and the rule is never evaluated.
@@ -376,9 +457,25 @@ def evaluate_one_rule(cfg: EngineConfig, *, rule: dict[str, Any],
                        "------------------------------------------------------------------\n"
                        + "\n".join(routing_bits) + "\n") if routing_bits else ""
 
+    # Identified Line of Business for this claim. Surfaced so an LOB-specific
+    # rule (e.g. "Medicaid eligibility") can mark itself applicable=false when
+    # the claim's LOB does not match — without dictating the verdict.
+    lob_label = str(claim.get("line_of_business") or "").strip()
+    lob_section = (
+        f"\nCLAIM LINE OF BUSINESS: {lob_label}\n"
+        "(If this rule applies only to a different Line of Business than the "
+        "claim's, set applicable=false — it is out of scope, NOT Not-Met.)\n"
+    ) if lob_label else ""
+
     # Re-inject the determination procedure + field semantics the IR flattening
     # dropped, scoped to provider-selection rules. Additive elsewhere.
     domain_section = _domain_context(rule)
+    # Auditor-authored per-SOP context from the builder UI (additive, layered on
+    # top of any hardcoded domain guidance above).
+    sop_context_section = _workbench_context_section(rule)
+    # Verdicts of earlier rules in this SOP (sequential evaluation) so this rule
+    # can honor a prioritized choice ladder.
+    prior_section = _prior_findings_section(prior_findings)
 
     prompt = f"""You are a claims-audit policy evaluator. Decide whether the
 following SOP rule applies to the given claim.
@@ -391,7 +488,8 @@ section:        {rule.get('section_label', '')}
 decision_type:  {rule.get('decision_type', '')}
 condition:      {rule.get('condition', '')}
 action:         {rule.get('action', '')}
-{mapped_section}{routing_section}{domain_section}
+
+{_MATCHING_CONTRACT}{mapped_section}{lob_section}{routing_section}{domain_section}{sop_context_section}{prior_section}
 CLAIM
 -----
 {json.dumps(claim, default=str, indent=2)}
@@ -401,7 +499,8 @@ TOOL RESULTS (already fetched on your behalf; may be empty)
 {json.dumps(tool_context, default=str, indent=2)}
 
 Return a JSON object. These keys are REQUIRED:
-  matched     boolean — true iff the rule's condition is satisfied by the claim
+  matched     boolean — true iff the rule's CONDITION is satisfied by the claim
+                (per the MATCHING CONTRACT above; the `action` never makes it true)
   reasoning   string  — concise explanation citing the claim fields / tool results you used
   confidence  number  — 0.0 to 1.0
 
@@ -419,6 +518,15 @@ or leave empty only when you genuinely cannot determine them):
                 ahead (e.g. "proceed to step 8 directly"); "stop" when the path
                 is out of scope / auditing should halt; omit or "next" for the
                 normal sequential flow.
+  network_basis string — PROVIDER-SELECTION rules only: how you determined
+                INN vs OON — "provider_match" (you matched the billed provider
+                against FACETS provider-details records on Tax ID/NPI/name),
+                "literal_indicator" (you used only CLCL_NTWK_IND / group_model
+                face value), "inconclusive" (the provider-details records needed
+                were missing), or "not_applicable". Be honest: if a deny hinges
+                on OON and you did NOT confirm it via a provider-record match,
+                use "literal_indicator" or "inconclusive" — the engine will then
+                route the claim to manual review instead of auto-denying.
   evidence_refs array of strings — dotted paths to the exact claim/tool fields
                 you relied on, with their values, e.g.
                 "facets_get_summary.body.Data.ClaimSummary.REC_CIV8.SBSB_ID=371468948".

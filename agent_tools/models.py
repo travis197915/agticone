@@ -250,6 +250,34 @@ class ClaimOntologyField(_UUIDPK, _Timestamps):
         return f"{self.namespace}:{self.canonical_field}"
 
 
+class CbdToolConfig(_UUIDPK, _Timestamps):
+    """DB-backed override / seed for the CBD coverage tool's Medicare group &
+    plan catalogue (originally ``yaml/config_cbd_tool.yaml``).
+
+    The ``check_medicare_coverage`` tool normally resolves group/plan names live
+    from the CBD customer-info API. When an active row exists here it is the
+    **preferred** source for ``medicare_group_names`` / ``medicare_plan_names``
+    (so the names can be curated/edited from one place and survive the API being
+    unavailable); the tool still falls back to the live API when no active row
+    exists. The most recently updated active row wins.
+    """
+
+    label = models.CharField(max_length=128, default="cbd-medicare-config")
+    # ["Standard Medicare", "AvMed", …]
+    medicare_group_names = models.JSONField(default=list, blank=True)
+    # {"Harvard Pilgrim": ["Medicare Advantage"], …}
+    medicare_plan_names = models.JSONField(default=dict, blank=True)
+    notes = models.TextField(blank=True, default="")
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        db_table = "cbd_tool_config"
+        ordering = ["-is_active", "-updated_at"]
+
+    def __str__(self) -> str:  # pragma: no cover - debug aid
+        return f"{self.label} ({len(self.medicare_group_names or [])} groups)"
+
+
 # ── Node bindings ─────────────────────────────────────────────────────────────
 
 

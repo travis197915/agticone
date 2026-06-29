@@ -25,6 +25,45 @@ def load_bindings(state: ExecutionState) -> dict:
         return {"status": "FAILED", "error_message": f"load_bindings: {exc}",
                 "stages": stages}
 
+    # Workflow-level execution mode drives whether SOPs short-circuit on the
+    # first defect (linear) or all run and the verdict is fused (parallel).
+    # ``supported_lob`` (optional) lets a workflow declare which Lines of
+    # Business it audits; a claim whose LOB is not in that set is out of scope.
+    execution_mode = "linear"
+    supported_lob: list[str] = []
+    try:
+        from builder.models import Workflow
+        wf = Workflow.objects.filter(id=state["workflow_id"]).only("metadata").first()
+        if wf:
+            meta = wf.metadata or {}
+            execution_mode = str(meta.get("execution_mode") or "linear").lower()
+            raw_lob = meta.get("supported_lob") or meta.get("supported_lobs") or []
+            if isinstance(raw_lob, str):
+                raw_lob = [raw_lob]
+            supported_lob = [str(x).strip() for x in raw_lob if str(x).strip()]
+    except Exception:
+        execution_mode = "linear"
+    if execution_mode not in {"linear", "parallel"}:
+        execution_mode = "linear"
+
+    # ── Identify the claim's Line of Business (SOW deliverable) ──────────────
+    # Derived from the already-fetched claim payload (no extra API call) and
+    # surfaced on the claim so every downstream rule-eval prompt sees it.
+    from ..lob import determine_claim_lob
+    claim = dict(state.get("claim") or {})
+    claim_lob = determine_claim_lob(claim, state.get("raw_fetch") or {})
+    claim["line_of_business"] = claim_lob["label"]
+    lob_out_of_scope = bool(
+        supported_lob
+        and claim_lob["product"] not in supported_lob
+        and claim_lob["label"] not in supported_lob
+    )
+    logger.info(
+        "load_bindings claim=%s lob=%s out_of_scope=%s (supported=%s)",
+        state.get("claim_id") or "-", claim_lob["label"], lob_out_of_scope,
+        supported_lob or "all",
+    )
+
     pre = loaded["preconditions"]
     dec = loaded["decisions"]
     shapes = loaded["shapes"]
@@ -70,12 +109,16 @@ def load_bindings(state: ExecutionState) -> dict:
     stages.append({"node": "load_bindings", "status": "OK",
                    "ms": int((time.time() - t0) * 1000),
                    "msg": f"{len(shapes)} shapes / {len(pre)} pre / {len(dec)} dec / "
-                          f"{n_tools} tools"})
+                          f"{n_tools} tools / mode={execution_mode}"})
     return {
         "preconditions": pre,
         "decisions": dec,
         "shapes": shapes,
         "tools_by_rule_key": loaded["tools_by_rule_key"],
         "tools_by_shape": loaded["tools_by_shape"],
+        "execution_mode": execution_mode,
+        "claim": claim,
+        "claim_lob": claim_lob,
+        "lob_out_of_scope": lob_out_of_scope,
         "stages": stages,
     }

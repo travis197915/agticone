@@ -12,6 +12,9 @@ class ExecutionState(TypedDict, total=False):
     raw_fetch: dict[str, Any]                     # raw linx_claim_search output
     batch_id: Optional[str]                       # set when run from BatchRunner
     claim_id: str                                 # the id we keyed off
+    execution_mode: str                           # "linear" (default) | "parallel"
+    claim_lob: dict[str, Any]                     # {product, network, label, source}
+    lob_out_of_scope: bool                        # claim LOB not in workflow's supported set
 
     # load_bindings outputs
     preconditions: list[dict[str, Any]]           # hydrated rule dicts (kept for back-compat)

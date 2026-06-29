@@ -75,6 +75,9 @@ class RuleExecutionRun(_UUIDPK):
     applied_codes = models.JSONField(default=list, blank=True)
     narrative = models.TextField(blank=True, default="")
     error_message = models.TextField(blank=True, default="")
+    # Identified Line of Business for this claim (SOW deliverable):
+    # {"product", "network", "label", "source"}. Empty for legacy/failed runs.
+    claim_lob = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "execution_rule_run"

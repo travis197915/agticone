@@ -143,6 +143,31 @@ def _group_model(claim_number: str) -> dict[str, Any]:
     }
 
 
+def _provider_details(claim_number: str) -> dict[str, Any]:
+    """Resolve PRPR_ID from the claim summary, then fetch the full FACETS
+    provider records (getCompleteList) needed for the provider-selection
+    2-/3-point match (Tax ID/EIN + NPI + name/address → INN vs OON)."""
+    from .facets_tool import _summary as facets_summary
+
+    summary = facets_summary(claim_number).get("body") or {}
+    cs = summary.get("Data", {}).get("ClaimSummary", {})
+    prpr_id = cs.get("PRPR_ID") or summary.get("PRPR_ID")
+    if not prpr_id:
+        return {
+            "success": False,
+            "claim_number": claim_number,
+            "prpr_id": None,
+            "endpoint": "provider_details",
+            "error": "missing PRPR_ID",
+            "message": "Could not resolve PRPR_ID from claim summary",
+        }
+    out = dict(_provider(prpr_id))
+    out["claim_number"] = claim_number
+    out["prpr_id"] = prpr_id
+    out["endpoint"] = "provider_details"
+    return out
+
+
 def build_tools() -> list[StructuredTool]:
     return [
         StructuredTool.from_function(
@@ -150,6 +175,17 @@ def build_tools() -> list[StructuredTool]:
             description="Retrieve full BH provider list for a PRPR ID.",
             func=lambda provider_id: _provider(provider_id),
             args_schema=ProviderInput,
+        ),
+        StructuredTool.from_function(
+            name="facet_ext_portal_provider_details",
+            description=(
+                "Resolve PRPR_ID via Facets summary, then fetch the full FACETS "
+                "provider records (Tax ID/EIN, NPI, name, address, network "
+                "participation) for the claim's billed provider. Use for the "
+                "provider-selection 2-/3-point match that determines INN vs OON."
+            ),
+            func=lambda claim_number: _provider_details(claim_number),
+            args_schema=GroupModelInput,
         ),
         StructuredTool.from_function(
             name="facet_extension_portal_programme",

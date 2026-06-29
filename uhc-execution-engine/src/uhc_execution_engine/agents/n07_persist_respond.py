@@ -43,6 +43,7 @@ def _persist(state: ExecutionState) -> None:
                 applied_codes=state.get("applied_codes") or [],
                 narrative=state.get("narrative") or "",
                 error_message=state.get("error_message") or "",
+                claim_lob=state.get("claim_lob") or {},
             ),
         )
 
@@ -140,6 +141,7 @@ def _build_response(state: ExecutionState) -> dict[str, Any]:
             "confidence": ev["confidence"],
             "reasoning": ev["reasoning"],
             "codes": ev["codes"],
+            "eob_codes": ev.get("eob_codes") or [],
             "tool_results_used": ev["tool_results_used"],
         })
     tools_out = [{
@@ -161,6 +163,7 @@ def _build_response(state: ExecutionState) -> dict[str, Any]:
         "final_decision_type": state.get("final_decision_type") or "",
         "applied_codes": list(state.get("applied_codes") or []),
         "narrative": state.get("narrative") or "",
+        "claim_lob": state.get("claim_lob") or {},
         "terminated_at_shape_id": state.get("terminated_at_shape_id") or "",
         "evaluations": evals_out,
         "tool_invocations": tools_out,

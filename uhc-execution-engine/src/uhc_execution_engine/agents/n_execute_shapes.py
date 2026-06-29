@@ -34,7 +34,11 @@ Forward-only jumps + a visited set + a hop cap guard against loops.
 
 from __future__ import annotations
 
+import concurrent.futures as _cf
+import contextvars
 import logging
+import re
+import threading
 import time
 from typing import Any
 
@@ -49,6 +53,22 @@ logger = logging.getLogger(__name__)
 
 _HALT_DECISION_TYPES = {"DENY", "STOP"}
 _SKIP_TOOLS = {FETCH_TOOL, PARSE_TOOL}
+
+
+class _Sink:
+    """Per-cursor result collector.
+
+    Each SOP cursor (and the precondition phase) writes into its own ``_Sink``
+    so cursors can run on separate threads with no shared-list contention. The
+    sinks are concatenated in canvas order afterwards and ``order_index`` is
+    assigned then, so the persisted/returned ordering is deterministic
+    regardless of thread completion order.
+    """
+
+    __slots__ = ("results",)
+
+    def __init__(self) -> None:
+        self.results: list[dict] = []
 
 
 def _merge_args(template: dict, claim: dict) -> dict:
@@ -67,6 +87,12 @@ def _merge_args(template: dict, claim: dict) -> dict:
     ):
         if key in claim and key not in args:
             args[key] = claim[key]
+    # Canonical claim identifier required by several in-process tools (alias of
+    # claim id); MCP-routed tools ignore the extra arg.
+    if "claim_number" not in args:
+        cn = claim.get("claim_number") or claim.get("claim_id")
+        if cn:
+            args["claim_number"] = cn
     return args
 
 
@@ -109,6 +135,7 @@ def _mk_result(
         "reasoning": (skip_reason if skipped else str(verdict.get("reasoning") or "")),
         "decision_type": rule.get("decision_type", ""),
         "codes": list(rule.get("codes") or []),
+        "eob_codes": list(rule.get("eob_codes") or []),
         "tool_results_used": [],
         "llm_provider": meta.get("provider", ""),
         "llm_ms": int(meta.get("ms") or 0),
@@ -147,6 +174,61 @@ def _coerce_int(v: Any) -> int | None:
         return None
 
 
+_CHOICE_RE = re.compile(
+    r"\b(?:1st|2nd|3rd|4th|5th|6th|7th|8th|9th|first|second|third|fourth|fifth|"
+    r"sixth|seventh)\s+choice\b",
+    re.IGNORECASE,
+)
+
+
+def _is_choice_ladder(rules: list[dict]) -> bool:
+    """True when a step's rules form a prioritized "Nth choice" ladder.
+
+    These MUST be evaluated sequentially with shared verdicts so a matched
+    higher-priority choice suppresses the lower ones (each lower choice's
+    condition requires the earlier choices to be unsatisfied). Genuinely
+    independent siblings (no choice vocabulary) can safely run in parallel.
+    """
+    hits = 0
+    for r in rules:
+        blob = f"{r.get('condition', '')} {r.get('action', '')}"
+        if _CHOICE_RE.search(blob):
+            hits += 1
+            if hits >= 2:
+                return True
+    return False
+
+
+_OON_RE = re.compile(r"\boon\b|out[ -]of[ -]network", re.IGNORECASE)
+
+
+def _is_provsel_oon_deny(rule: dict) -> bool:
+    """True for a provider-selection deny-choice whose match hinges on OON.
+
+    Such a deny is only valid when OON was DERIVED from a provider-record match;
+    if it rests on the literal network indicator we route to manual review
+    instead of auto-denying (see the OON safeguard in ``_evaluate``)."""
+    if rule.get("decision_type") not in _HALT_DECISION_TYPES:
+        return False
+    blob = f"{rule.get('condition', '')} {rule.get('action', '')}"
+    return bool(_OON_RE.search(blob)) and bool(_CHOICE_RE.search(blob))
+
+
+def _finding(rule: dict, verdict: dict) -> dict:
+    """Compact record of an evaluated rule, shared as context with later rules
+    in the same SOP (sequential evaluation)."""
+    return {
+        "key": rule.get("key", ""),
+        "label": rule.get("section_label") or rule.get("step_question") or "",
+        "matched": bool(verdict.get("_matched")),
+        "skipped": bool(verdict.get("_skipped")),
+        "decision_type": rule.get("decision_type", ""),
+        # Share the factual finding (not just matched/not) so a later sibling
+        # cannot contradict an established fact (e.g. "individual is billed").
+        "reasoning": str(verdict.get("reasoning") or "")[:240],
+    }
+
+
 def execute_shapes(state: ExecutionState) -> dict:
     t0 = time.time()
     stages = list(state.get("stages") or [])
@@ -154,6 +236,10 @@ def execute_shapes(state: ExecutionState) -> dict:
         return {}
 
     cfg = get_config()
+    # "parallel" mode runs every SOP to completion and fuses the verdict via
+    # precedence in aggregate_decision; "linear" (default) short-circuits the
+    # whole claim on the first SOP that hits a DENY/STOP and skips later SOPs.
+    parallel = str(state.get("execution_mode") or "linear").lower() == "parallel"
     claim = state.get("claim") or {}
     tools_by_rule = state.get("tools_by_rule_key") or {}
     tools_by_shape = state.get("tools_by_shape") or {}
@@ -166,25 +252,49 @@ def execute_shapes(state: ExecutionState) -> dict:
     shapes = state.get("shapes") or []
     claim_id = state.get("claim_id", "")
 
-    rule_results: list[dict] = []
-    order_box = [0]  # mutable counter shared by the helpers below
     terminated_at_shape_id = ""
+    # LOB scoping inputs. ``lob_product`` is matched against each SOP's optional
+    # ``lob_scope``; ``lob_out_of_scope`` is the whole-claim gate set in
+    # load_bindings when the claim's LOB isn't in the workflow's supported set.
+    claim_lob = state.get("claim_lob") or {}
+    lob_product = str(claim_lob.get("product") or "").strip()
+    lob_label = str(claim_lob.get("label") or "").strip()
+    lob_out_of_scope = bool(state.get("lob_out_of_scope"))
+    # Guards shared mutable tool state when lazy tools are evaluated concurrently
+    # across SOP cursors. With the default pre-fetch (lazy off) this is never
+    # contended, but keep it correct for the RULE_ENGINE_LAZY_TOOLS=1 path.
+    _tool_lock = threading.Lock()
+
+    def _rule_in_lob_scope(rule: dict) -> bool:
+        """False when the rule's SOP is scoped to LOBs that exclude this claim."""
+        scope = rule.get("lob_scope") or []
+        if not scope or not lob_product:
+            return True
+        return lob_product in scope or (lob_label and lob_label in scope)
 
     def _ensure_tools(shape_id: str) -> None:
         """Lazily invoke the EVALUATE-phase tools bound to ``shape_id``.
 
-        No-op when lazy mode is off (n03 already ran them), when the shape has
-        no tools, or when this shape was already serviced. Skipped steps never
-        reach here, so their tools are never called.
+        No-op when lazy mode is off (n03 pre-fetched them all), when the shape
+        has no tools, or when this shape was already serviced. Skipped steps
+        never reach here, so their tools are never called. Thread-safe so it is
+        correct even when SOP cursors run concurrently in lazy mode.
         """
-        if not lazy or not shape_id or shape_id in tools_run_for_shape:
+        if not lazy or not shape_id:
             return
-        tools_run_for_shape.add(shape_id)
-        for tb in tools_by_shape.get(shape_id) or []:
+        with _tool_lock:
+            if shape_id in tools_run_for_shape:
+                return
+            tools_run_for_shape.add(shape_id)
+            pending = list(tools_by_shape.get(shape_id) or [])
+        for tb in pending:
             name = tb.get("tool_name")
             bid = tb.get("binding_id")
-            if not name or name in _SKIP_TOOLS or bid in tool_results:
+            if not name or name in _SKIP_TOOLS:
                 continue
+            with _tool_lock:
+                if bid in tool_results:
+                    continue
             args = _merge_args(tb.get("args_template") or {}, claim)
             out = invoke_tool(name, args)
             record = {
@@ -197,8 +307,9 @@ def execute_shapes(state: ExecutionState) -> dict:
                 "error": out["error"],
                 "duration_ms": out["duration_ms"],
             }
-            tool_invocations.append(record)
-            tool_results[bid] = record
+            with _tool_lock:
+                tool_invocations.append(record)
+                tool_results[bid] = record
 
     if not shapes:
         logger.warning(
@@ -208,19 +319,24 @@ def execute_shapes(state: ExecutionState) -> dict:
         )
 
     # ── helpers ──────────────────────────────────────────────────────────────
-    def _evaluate(rule: dict) -> dict:
+    def _evaluate(rule: dict, sink: _Sink,
+                  prior: list[dict] | None = None) -> dict:
         """Evaluate one rule (one LLM call), append + emit, return verdict.
 
         Returns the verdict dict augmented with ``_matched``/``_skipped`` flags
         the cursor uses for routing. A rule the LLM marks not-applicable is
-        recorded SKIPPED instead of Met/Not-Met.
+        recorded SKIPPED instead of Met/Not-Met. ``order_index`` is a placeholder
+        here (the per-sink position); it is reassigned globally at merge time.
+        ``prior`` carries the verdicts of rules already evaluated earlier in the
+        same SOP so this rule can honor a prioritized choice ladder.
         """
         _ensure_tools(rule.get("shape_id", ""))
         ctx, binding_ids = _tool_context_for_rule(
             rule, tools_by_rule, tools_by_shape, tool_results
         )
         verdict, meta = evaluate_one_rule(
-            cfg, rule=rule, claim=claim, tool_context=ctx, stage="execute_shapes"
+            cfg, rule=rule, claim=claim, tool_context=ctx, stage="execute_shapes",
+            prior_findings=prior,
         )
 
         applicable = bool(verdict.get("applicable", True))
@@ -229,7 +345,7 @@ def execute_shapes(state: ExecutionState) -> dict:
 
         res = _mk_result(
             rule,
-            order_box[0],
+            len(sink.results),
             verdict=verdict,
             meta=meta,
             matched=matched,
@@ -239,7 +355,24 @@ def execute_shapes(state: ExecutionState) -> dict:
             ),
         )
         res["tool_results_used"] = binding_ids
-        rule_results.append(res)
+
+        # OON safeguard: a matched provider-selection deny-choice that hinges on
+        # OON is only a confirmed defect when OON was derived via a provider-
+        # record match. If the model determined OON from the literal indicator
+        # (or couldn't determine it), downgrade DENY/STOP -> PEND so the claim is
+        # routed to manual review instead of auto-denied (per SOP guidance).
+        if matched and not skipped and _is_provsel_oon_deny(rule):
+            basis = str(verdict.get("network_basis") or "").strip().lower()
+            if basis != "provider_match":
+                res["decision_type"] = "PEND"
+                res["reasoning"] = (
+                    "[auto-routed to manual review: OON not confirmed via "
+                    f"provider-record match (basis={basis or 'unspecified'})] "
+                    + res["reasoning"]
+                )
+                res["oon_unconfirmed"] = True
+
+        sink.results.append(res)
 
         publish_event(
             "rule_evaluated",
@@ -261,18 +394,18 @@ def execute_shapes(state: ExecutionState) -> dict:
                 "llm_attempts": int(meta.get("attempts") or 1),
             },
         )
-        order_box[0] += 1
         verdict["_matched"] = matched
         verdict["_skipped"] = skipped
         return verdict
 
-    def _mark_skipped(rules: list[dict], reason: str, step_no: Any) -> None:
+    def _mark_skipped(rules: list[dict], reason: str, step_no: Any,
+                      sink: _Sink) -> None:
         """Record a SKIPPED row per rule and emit a step_skipped SSE — no LLM."""
         for rule in rules:
-            rule_results.append(
+            sink.results.append(
                 _mk_result(
                     rule,
-                    order_box[0],
+                    len(sink.results),
                     verdict=None,
                     meta=None,
                     matched=False,
@@ -280,7 +413,6 @@ def execute_shapes(state: ExecutionState) -> dict:
                     skip_reason=reason,
                 )
             )
-            order_box[0] += 1
         if rules:
             publish_event(
                 "step_skipped",
@@ -303,15 +435,67 @@ def execute_shapes(state: ExecutionState) -> dict:
                 preconditions if rule.get("source") == "precondition" else decisions
             ).append(rule)
 
+    main_sink = _Sink()
+
+    def _merge_and_finish(sop_sinks_in_order: list[_Sink]) -> dict:
+        """Concatenate sinks in canvas order, renumber order_index, finish."""
+        merged: list[dict] = list(main_sink.results)
+        for s in sop_sinks_in_order:
+            merged.extend(s.results)
+        for idx, r in enumerate(merged):
+            r["order_index"] = idx
+        evaluated = sum(1 for r in merged if not r.get("skipped"))
+        skipped_n = sum(1 for r in merged if r.get("skipped"))
+        stages.append(
+            {
+                "node": "execute_shapes:summary",
+                "status": "OK",
+                "ms": int((time.time() - t0) * 1000),
+                "msg": (
+                    f"[{'parallel' if parallel else 'linear'}] lob={lob_label or '-'} "
+                    f"{evaluated} rules evaluated, {skipped_n} skipped"
+                    + (" -> TERMINATED_EARLY" if terminated_at_shape_id else "")
+                ),
+            }
+        )
+        return _finish(
+            merged, stages, terminated_at_shape_id, tool_invocations, tool_results
+        )
+
+    # ── whole-claim LOB gate ──────────────────────────────────────────────────
+    # The claim's Line of Business is not in this workflow's supported set, so
+    # none of its rules apply: skip every rule with NO LLM call and finish as a
+    # clean out-of-scope (not a defect). No-op unless ``supported_lob`` is set
+    # on the workflow.
+    if lob_out_of_scope:
+        for rule in preconditions + decisions:
+            _mark_skipped(
+                [rule],
+                f"out of scope: claim LOB {lob_label or lob_product} not audited by this workflow",
+                rule.get("step_number"),
+                main_sink,
+            )
+        logger.info(
+            "execute_shapes claim=%s LOB %s out of scope — %d rules skipped, no LLM",
+            claim_id or "-", lob_label or lob_product, len(main_sink.results),
+        )
+        return _merge_and_finish([])
+
     # ── phase 1: preconditions, in order; may DENY/STOP halt ──────────────────
     for rule in preconditions:
         # Auditor marked this node out of scope on the canvas — exclude its
         # rules from execution entirely (no LLM call), record as SKIPPED.
         if rule.get("manual_oos"):
-            _mark_skipped([rule], "manually marked out of scope (excluded from execution)", None)
+            _mark_skipped([rule], "manually marked out of scope (excluded from execution)", None, main_sink)
             continue
-        verdict = _evaluate(rule)
-        if verdict["_matched"] and rule.get("decision_type") in _HALT_DECISION_TYPES:
+        verdict = _evaluate(rule, main_sink)
+        # In parallel mode a precondition match is just another contributing
+        # rule (fused later by precedence) — it never halts the whole claim.
+        if (
+            not parallel
+            and verdict["_matched"]
+            and rule.get("decision_type") in _HALT_DECISION_TYPES
+        ):
             terminated_at_shape_id = rule.get("shape_id", "")
             stages.append(
                 {
@@ -321,13 +505,7 @@ def execute_shapes(state: ExecutionState) -> dict:
                     "msg": f"precondition halt at {rule['key']}",
                 }
             )
-            return _finish(
-                rule_results,
-                stages,
-                terminated_at_shape_id,
-                tool_invocations,
-                tool_results,
-            )
+            return _merge_and_finish([])
 
     # ── phase 2: per-SOP step cursors ─────────────────────────────────────────
     # A single workflow may chain several SOPs (e.g. a full claim-audit pipeline
@@ -356,13 +534,26 @@ def execute_shapes(state: ExecutionState) -> dict:
             sop_order.append(sid)
         decisions_by_sop.setdefault(sid, []).append(rule)
 
-    def _run_sop_cursor(sop_decisions: list[dict]) -> tuple[str, bool, int, int]:
+    def _run_sop_cursor(sop_decisions: list[dict], sink: _Sink) -> tuple[str, bool, int, int]:
         """Run one SOP's step cursor. Returns
         ``(halt_shape_id, terminated_clean, visited_count, step_count)``.
 
         ``halt_shape_id`` is non-empty only on a DENY/STOP defect halt, which
-        the caller propagates as a whole-claim TERMINATED_EARLY.
+        the caller propagates as a whole-claim TERMINATED_EARLY. Writes all
+        rows into ``sink`` so cursors can run concurrently without contention.
         """
+        def mark_skipped(rules, reason, step_no):
+            _mark_skipped(rules, reason, step_no, sink)
+
+        # Verdicts of rules already evaluated in THIS SOP, in evaluation order.
+        # Shared into each subsequent rule's prompt so a prioritized choice
+        # ladder is honored (a matched higher choice suppresses lower ones).
+        # Bounded so a long SOP can't blow up the prompt.
+        sop_findings: list[dict] = []
+
+        def _prior_ctx() -> list[dict]:
+            return sop_findings[-20:]
+
         steps_by_num: dict[int, list[dict]] = {}
         step_shape: dict[int, dict] = {}
         for rule in sop_decisions:
@@ -414,38 +605,108 @@ def execute_shapes(state: ExecutionState) -> dict:
                 r.get("aggregation") == "APPLICABLE_ONLY" for r in rules
             )
             verdicts: list[tuple[dict, dict]] = []
-            satisfied_applicable = False
+
+            # Pass 1 — cheap deterministic skips (no LLM). Whatever survives goes
+            # to ``to_eval`` for an actual LLM evaluation.
+            to_eval: list[dict] = []
             for rule in rules:
                 # Auditor manually excluded this node on the canvas: skip every
                 # rule in place (no LLM call) and continue to the next step. This
                 # is a pure exclusion — it never triggers the SOP "out of scope →
                 # stop auditing" clean-stop, so the rest of the SOP still runs.
                 if rule.get("manual_oos"):
-                    _mark_skipped(
+                    mark_skipped(
                         [rule],
                         "manually marked out of scope (excluded from execution)",
                         step_no,
                     )
                     continue
-                # Blank out-of-scope steps (no rule defined — flagged OOS and
-                # non-final by the importer) are excluded from auditing: skip in
-                # place with NO LLM call and continue to the next step. Terminal
-                # OOS exclusions keep is_final=True and fall through to the
-                # match→clean-stop handling below.
-                if rule.get("is_out_of_scope") and not rule.get("is_final"):
-                    _mark_skipped(
+                # SOP scoped to other Lines of Business than this claim's: those
+                # rules are not in scope for this LOB — skip with NO LLM call.
+                if not _rule_in_lob_scope(rule):
+                    mark_skipped(
+                        [rule],
+                        f"out of scope: rule applies to LOB {rule.get('lob_scope')}, "
+                        f"claim is {lob_label or lob_product}",
+                        step_no,
+                    )
+                    continue
+                # Out-of-scope steps WITHOUT an adverse code are excluded from
+                # auditing: skip in place with NO LLM call. Out-of-scope rows
+                # that DO carry codes (e.g. "Deny F24 ... out of scope") are
+                # real findings and still evaluated. Terminal OOS exclusions
+                # keep is_final=True and fall through to the clean-stop handling.
+                if (rule.get("is_out_of_scope") and not rule.get("is_final")
+                        and not rule.get("codes")):
+                    mark_skipped(
                         [rule], "out of scope: no rule defined for this step", step_no
                     )
                     continue
-                if applicable_only and satisfied_applicable:
-                    _mark_skipped(
-                        [rule], "not-applicable: sibling already applicable", step_no
-                    )
-                    continue
-                verdict = _evaluate(rule)
-                verdicts.append((rule, verdict))
-                if applicable_only and verdict["_matched"] and not verdict["_skipped"]:
-                    satisfied_applicable = True
+                to_eval.append(rule)
+
+            # Pass 2 — evaluate the step's rules. Two regimes:
+            #  • SEQUENTIAL (top-to-bottom, shared verdicts) when the step is a
+            #    prioritized "Nth choice" ladder or APPLICABLE_ONLY — a matched
+            #    higher choice must suppress the lower ones, so each rule sees
+            #    the verdicts of the rules already evaluated in this SOP.
+            #  • PARALLEL otherwise — genuinely independent siblings have no
+            #    ordering dependency, so run them concurrently for speed. They
+            #    still receive the pre-step prior context (read-only).
+            # SOPs themselves always run concurrently (see the cursor executor).
+            sequential = applicable_only or _is_choice_ladder(to_eval)
+            if sequential:
+                satisfied_applicable = False
+                for rule in to_eval:
+                    if applicable_only and satisfied_applicable:
+                        mark_skipped(
+                            [rule], "not-applicable: sibling already applicable",
+                            step_no,
+                        )
+                        continue
+                    verdict = _evaluate(rule, sink, prior=_prior_ctx())
+                    verdicts.append((rule, verdict))
+                    sop_findings.append(_finding(rule, verdict))
+                    if (applicable_only and verdict["_matched"]
+                            and not verdict["_skipped"]):
+                        satisfied_applicable = True
+            elif len(to_eval) <= 1:
+                snapshot = _prior_ctx()
+                for rule in to_eval:
+                    verdict = _evaluate(rule, sink, prior=snapshot)
+                    verdicts.append((rule, verdict))
+                    sop_findings.append(_finding(rule, verdict))
+            else:
+                snapshot = _prior_ctx()
+                vmap: dict[int, dict] = {}
+
+                # Worker threads open a thread-local Django connection when they
+                # stamp LLMCallLog; that connection lingers for the thread's life.
+                # Close it on completion so parallel batch runs don't exhaust the
+                # Postgres connection pool (mirrors the SOP-cursor worker below).
+                def _sibling_worker(_rule: Any) -> dict:
+                    try:
+                        return _evaluate(_rule, sink, snapshot)
+                    finally:
+                        try:
+                            from django.db import connections
+                            connections.close_all()
+                        except Exception:  # pragma: no cover — best effort
+                            pass
+
+                with _cf.ThreadPoolExecutor(max_workers=min(len(to_eval), 8)) as sx:
+                    sib_futs = {
+                        sx.submit(
+                            contextvars.copy_context().run,
+                            _sibling_worker, rule,
+                        ): rule
+                        for rule in to_eval
+                    }
+                    for fut in _cf.as_completed(sib_futs):
+                        vmap[id(sib_futs[fut])] = fut.result()
+                for rule in to_eval:  # preserve canvas order
+                    verdict = vmap[id(rule)]
+                    verdicts.append((rule, verdict))
+                    sop_findings.append(_finding(rule, verdict))
 
             # ── resolve routing from the matched, applicable rules ──
             matched = [
@@ -496,7 +757,7 @@ def execute_shapes(state: ExecutionState) -> dict:
                     visited,
                     steps_by_num,
                     "skipped: prior step out of scope — auditing stopped",
-                    _mark_skipped,
+                    mark_skipped,
                 )
                 break
 
@@ -506,7 +767,7 @@ def execute_shapes(state: ExecutionState) -> dict:
                         break
                     if s not in visited:
                         visited.add(s)
-                        _mark_skipped(
+                        mark_skipped(
                             steps_by_num[s],
                             f"skipped: routed from step {step_no} to step {target}",
                             s,
@@ -526,7 +787,7 @@ def execute_shapes(state: ExecutionState) -> dict:
                     visited,
                     steps_by_num,
                     "skipped: claim halted earlier (DENY/STOP)",
-                    _mark_skipped,
+                    mark_skipped,
                 )
                 break
 
@@ -538,7 +799,7 @@ def execute_shapes(state: ExecutionState) -> dict:
                     visited,
                     steps_by_num,
                     "skipped: audit path ended (terminal/stop)",
-                    _mark_skipped,
+                    mark_skipped,
                 )
                 break
 
@@ -552,46 +813,58 @@ def execute_shapes(state: ExecutionState) -> dict:
             )
         return halt_shape_id, terminate_clean, len(visited), len(ordered_steps)
 
-    any_clean_stop = False
-    total_visited = 0
-    total_steps = 0
-    for sid in sop_order:
-        halt_shape_id, clean, n_visited, n_steps = _run_sop_cursor(
-            decisions_by_sop.get(sid) or []
-        )
-        total_visited += n_visited
-        total_steps += n_steps
-        any_clean_stop = any_clean_stop or clean
-        if halt_shape_id:
-            # A DENY/STOP anywhere is a whole-claim defect halt: stop the
-            # pipeline and skip any later SOPs that have not run yet.
-            terminated_at_shape_id = halt_shape_id
-            for later_sid in sop_order[sop_order.index(sid) + 1 :]:
-                _mark_skipped(
-                    decisions_by_sop.get(later_sid) or [],
-                    "skipped: claim halted earlier (DENY/STOP)",
-                    None,
-                )
-            break
+    # One sink per SOP so cursors never share a list.
+    sop_sinks: dict[Any, _Sink] = {sid: _Sink() for sid in sop_order}
 
-    evaluated = sum(1 for r in rule_results if not r.get("skipped"))
-    skipped_n = sum(1 for r in rule_results if r.get("skipped"))
-    stages.append(
-        {
-            "node": "execute_shapes:summary",
-            "status": "OK",
-            "ms": int((time.time() - t0) * 1000),
-            "msg": (
-                f"{evaluated} rules evaluated, {skipped_n} skipped across "
-                f"{total_visited} of {total_steps} steps / {len(sop_order)} sop(s)"
-                + (" -> TERMINATED_EARLY" if terminated_at_shape_id else "")
-                + (" -> stopped (out of scope)" if any_clean_stop else "")
-            ),
-        }
-    )
-    return _finish(
-        rule_results, stages, terminated_at_shape_id, tool_invocations, tool_results
-    )
+    eval_workers = max(1, min(int(getattr(cfg, "sop_eval_workers", 8) or 8),
+                              len(sop_order) or 1))
+
+    if parallel and len(sop_order) > 1 and eval_workers > 1:
+        # PARALLEL: the SOPs are independent, so run their step cursors
+        # concurrently. Each cursor short-circuits internally (skip/goto/stop)
+        # and writes to its own sink; no SOP halts the whole claim, so the
+        # verdict is fused by aggregate_decision. Propagate contextvars so
+        # LLMCallLog stamping + SSE publishing keep working in worker threads,
+        # and close each worker thread's DB connections when it finishes.
+        def _cursor_worker(sid: Any) -> tuple[str, bool, int, int]:
+            try:
+                return _run_sop_cursor(decisions_by_sop.get(sid) or [], sop_sinks[sid])
+            finally:
+                try:
+                    from django.db import connections
+                    connections.close_all()
+                except Exception:  # pragma: no cover — best effort
+                    pass
+
+        # Each SOP gets its OWN copied Context: a single Context cannot be
+        # entered concurrently by multiple threads (RuntimeError), which would
+        # serialize the cursors and block the executor on shutdown.
+        with _cf.ThreadPoolExecutor(max_workers=eval_workers) as ex:
+            futs = {
+                ex.submit(contextvars.copy_context().run, _cursor_worker, sid): sid
+                for sid in sop_order
+            }
+            for fut in _cf.as_completed(futs):
+                fut.result()  # propagate any cursor exception
+    else:
+        # LINEAR (or single SOP): sequential, preserving the whole-claim halt —
+        # a DENY/STOP anywhere stops the pipeline and skips any later SOPs.
+        for idx, sid in enumerate(sop_order):
+            halt_shape_id, _clean, _nv, _ns = _run_sop_cursor(
+                decisions_by_sop.get(sid) or [], sop_sinks[sid]
+            )
+            if halt_shape_id and not parallel:
+                terminated_at_shape_id = halt_shape_id
+                for later_sid in sop_order[idx + 1 :]:
+                    _mark_skipped(
+                        decisions_by_sop.get(later_sid) or [],
+                        "skipped: claim halted earlier (DENY/STOP)",
+                        None,
+                        sop_sinks[later_sid],
+                    )
+                break
+
+    return _merge_and_finish([sop_sinks[sid] for sid in sop_order])
 
 
 def _skip_rest(ordered_steps, i, visited, steps_by_num, reason, mark_skipped):

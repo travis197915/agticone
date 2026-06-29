@@ -34,8 +34,16 @@ class EngineConfig:
     llm_retries: int = 2
     # When true, EVALUATE-phase tool bindings are invoked lazily per step inside
     # execute_shapes (only for steps the router actually reaches) instead of all
-    # upfront in run_tools — so steps the SOP skips spend no tool calls.
-    lazy_tools: bool = True
+    # upfront in run_tools. Default OFF: we now pre-fetch every tool once,
+    # deduped + in parallel, in run_tools so the results are already in context
+    # for rule evaluation (and rule evaluation can run concurrently without
+    # making live tool calls). Set RULE_ENGINE_LAZY_TOOLS=1 to restore the old
+    # per-step lazy behaviour.
+    lazy_tools: bool = False
+    # Upper bound on concurrent tool invocations during the pre-fetch and on
+    # concurrent per-SOP rule-evaluation cursors. Tune via env.
+    tool_prefetch_workers: int = 8
+    sop_eval_workers: int = 8
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -55,5 +63,7 @@ def get_config() -> EngineConfig:
         openai_model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
         llm_max_tokens=int(os.environ.get("RULE_ENGINE_MAX_TOKENS", "4096")),
         llm_retries=int(os.environ.get("RULE_ENGINE_RETRIES", "2")),
-        lazy_tools=_env_bool("RULE_ENGINE_LAZY_TOOLS", True),
+        lazy_tools=_env_bool("RULE_ENGINE_LAZY_TOOLS", False),
+        tool_prefetch_workers=int(os.environ.get("RULE_ENGINE_TOOL_WORKERS", "8")),
+        sop_eval_workers=int(os.environ.get("RULE_ENGINE_SOP_WORKERS", "8")),
     )

@@ -45,6 +45,38 @@ def _split_key(rule_key: str) -> tuple[str, list[str]]:
     return parts[0], parts[1:]
 
 
+def _workbench_extra_context(workbench) -> str:
+    """Auditor-provided free-form context attached to a workbench (SOP column).
+
+    Stored in ``Workbench.config['extra_context']`` via the builder UI and
+    injected verbatim into every rule-evaluation prompt for the rules that
+    belong to this SOP (see ``_eval_common._workbench_context_section``). It is
+    guidance only — it never dictates a verdict — and is additive: an empty
+    string leaves the prompt unchanged.
+    """
+    if workbench is None:
+        return ""
+    cfg = getattr(workbench, "config", None) or {}
+    return str(cfg.get("extra_context") or "").strip()
+
+
+def _workbench_lob_scope(workbench) -> list[str]:
+    """LOBs this SOP (workbench column) applies to, from ``config['lob_scope']``.
+
+    Optional auditor configuration. When non-empty, ``execute_shapes`` skips
+    this SOP's rules (no LLM call) for any claim whose LOB is not listed — the
+    "those rules are not in the workflow for this LOB, don't process" path. An
+    empty list (the default) means the SOP applies to every LOB.
+    """
+    if workbench is None:
+        return []
+    cfg = getattr(workbench, "config", None) or {}
+    raw = cfg.get("lob_scope") or cfg.get("lobs") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
 def _hydrate_precondition(sop, pc, idx: int, override_condition: str,
                           override_action: str) -> dict[str, Any]:
     rules = pc.llm_rules or []
@@ -124,6 +156,10 @@ def _hydrate_decision(sop, step, dec, override_condition: str,
         "decision_type":     dec.decision_type or "",
         "is_exception":      False,
         "codes":             codes,
+        # EOB codes specifically (subset of ``codes``). A matched rule that
+        # references an EOB code is an audit defect (per the verdict policy),
+        # so the engine/aggregator need them called out separately.
+        "eob_codes":         list(dec.eob_codes or []),
         "is_blocking":       dec.is_final,
         # ── Routing metadata consumed by execute_shapes' step cursor ──
         "step_number":       step.step_number,
@@ -263,6 +299,7 @@ def _materialise_custom_rules(workflow_id: str,
             )
             if _forced_in:
                 rd["is_out_of_scope"] = False
+            rd["sop_extra_context"] = _workbench_extra_context(shape.workbench)
             decisions_out.append(rd)
             sg["rules"].append(rd)
 
@@ -363,6 +400,12 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
 
         rule_dict["binding_id"] = str(rb.id)
         rule_dict["shape_id"] = str(rb.shape_id)
+        # Per-SOP auditor context (Workbench.config['extra_context']) — injected
+        # into this rule's eval prompt. ``shape__workbench`` is select_related'd.
+        rule_dict["sop_extra_context"] = _workbench_extra_context(
+            getattr(rb.shape, "workbench", None))
+        rule_dict["lob_scope"] = _workbench_lob_scope(
+            getattr(rb.shape, "workbench", None))
         rule_dict["references"] = list(rb.references_json or [])
         rule_dict["excluded_by"] = list(rb.excluded_by_json or [])
         # Manual out-of-scope exclusion set by the auditor on the canvas. Two

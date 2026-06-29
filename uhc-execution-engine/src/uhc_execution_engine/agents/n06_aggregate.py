@@ -12,12 +12,9 @@ summary from the offending rule without burning an LLM call.
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
 
-from ..config import get_config
-from ..llm import llm_call
 from ..state import ExecutionState
 
 logger = logging.getLogger(__name__)
@@ -64,31 +61,6 @@ def _failed_tools_relied_on(state: ExecutionState) -> tuple[set[str], set[str]]:
     return cov, names - cov
 
 
-def _fallback_aggregate(matched: list[dict]) -> dict:
-    """Deterministic fallback used when the LLM aggregator fails."""
-    if not matched:
-        return {"final_decision_type": "ALLOW",
-                "applied_codes": [],
-                "narrative": "No decision rules matched; defaulting to ALLOW."}
-    by_priority = sorted(
-        matched,
-        key=lambda r: _PRECEDENCE.index(r.get("decision_type", "ALLOW"))
-        if r.get("decision_type") in _PRECEDENCE else len(_PRECEDENCE),
-    )
-    winner = by_priority[0]
-    codes: list[str] = []
-    for r in matched:
-        for c in r.get("codes") or []:
-            if c not in codes:
-                codes.append(c)
-    return {
-        "final_decision_type": winner.get("decision_type") or "ALLOW",
-        "applied_codes": codes,
-        "narrative": f"Deterministic fallback: highest-precedence matched rule "
-                     f"is {winner.get('rule_key')} ({winner.get('decision_type')}).",
-    }
-
-
 def aggregate_decision(state: ExecutionState) -> dict:
     t0 = time.time()
     stages = list(state.get("stages") or [])
@@ -127,12 +99,13 @@ def aggregate_decision(state: ExecutionState) -> dict:
         }
 
     rule_results = state.get("rule_results") or []
-    # Skipped (routed-past / not-applicable) and out-of-scope rules never
-    # contribute to the verdict: a step the SOP told us to skip, or one whose
-    # match means "out of scope / stop", is a clean exclusion, not a defect.
+    # Skipped (routed-past / not-applicable) rules never contribute to the
+    # verdict. An out-of-scope match is normally a clean exclusion — EXCEPT when
+    # it carries a code (e.g. "Deny F24 ... out of scope" or an EOB reference),
+    # which is a real finding and must be able to drive a DEFECT.
     matched = [r for r in rule_results
                if r["matched"] and not r.get("skipped")
-               and not r.get("is_out_of_scope")]
+               and (not r.get("is_out_of_scope") or r.get("codes"))]
     if not matched:
         # No matches → no aggregator LLM call. Distinguish between
         # "evaluator ran rules but nothing matched" (legitimate ALLOW)
@@ -159,15 +132,19 @@ def aggregate_decision(state: ExecutionState) -> dict:
             "stages": stages,
         }
 
-    # Deterministic clean-claim guard. A claim is a defect ONLY when a matched
-    # rule applies an adverse disposition (DENY/STOP/PEND/REFER...). If every
-    # matched rule is routing / data-gathering / pass (CONDITIONAL, SYSTEM,
-    # ALLOW), the verdict is ALLOW — decided here, deterministically, with NO
-    # LLM call. This prevents the aggregator from ever hallucinating a defect
-    # onto a structurally clean claim.
+    # Deterministic clean-claim guard. A claim is a defect when a matched rule
+    # applies an adverse disposition (DENY/STOP/PEND/REFER...) OR references an
+    # EOB code (explicit verdict policy: a matched rule that references an EOB
+    # code is a defect). If every matched rule is routing / data-gathering /
+    # pass (CONDITIONAL, SYSTEM, ALLOW) and references no EOB code, the verdict
+    # is ALLOW — decided here, deterministically, with NO LLM call.
     _ADVERSE = {"DENY", "STOP", "PEND", "REFER", "REFERRAL", "PENDED"}
-    adverse = [r for r in matched
-               if (r.get("decision_type") or "").upper() in _ADVERSE]
+
+    def _is_adverse(r: dict) -> bool:
+        return ((r.get("decision_type") or "").upper() in _ADVERSE
+                or bool(r.get("eob_codes")))
+
+    adverse = [r for r in matched if _is_adverse(r)]
     if not adverse:
         # Auditor guard: before signing off CLEAN, make sure the tools the
         # evaluated steps relied on actually returned. A failed *coverage* tool
@@ -231,49 +208,49 @@ def aggregate_decision(state: ExecutionState) -> dict:
             "stages": stages,
         }
 
-    cfg = get_config()
-    compact = [{
-        "rule_key": r["rule_key"],
-        "decision_type": r["decision_type"],
-        "codes": r["codes"],
-        "reasoning": r["reasoning"],
-        "confidence": r["confidence"],
-    } for r in matched]
+    # ── Deterministic DEFECT verdict ─────────────────────────────────────────
+    # At least one matched rule is adverse (STOP/DENY/PEND/REFER) or references
+    # an EOB code, so the claim is a DEFECT. Resolve the disposition by
+    # precedence with NO LLM call — guaranteed defect + one fewer slow call.
+    def _verdict_type(r: dict) -> str:
+        dt = (r.get("decision_type") or "").upper()
+        if dt in _PRECEDENCE and dt in _ADVERSE:
+            return dt
+        # Qualifies only via an EOB-code reference (or a non-precedence adverse
+        # label) — treat as a DENY-level defect disposition.
+        return "DENY"
 
-    prompt = f"""You are aggregating multiple matched SOP decision rules into one
-final adjudication for a claim.
+    ranked = sorted(adverse, key=lambda r: _PRECEDENCE.index(_verdict_type(r)))
+    winner = ranked[0]
+    final_type = _verdict_type(winner)
 
-PRECEDENCE (most severe → least): {' > '.join(_PRECEDENCE)}
+    codes: list[str] = []
+    for r in adverse:
+        for c in (r.get("codes") or []):
+            if c not in codes:
+                codes.append(c)
+    eob_referenced = sorted({c for r in adverse for c in (r.get("eob_codes") or [])})
 
-MATCHED DECISIONS
------------------
-{json.dumps(compact, indent=2)}
-
-CLAIM (for context only)
-------------------------
-{json.dumps(state.get('claim') or {}, default=str, indent=2)}
-
-Return JSON with exactly:
-  final_decision_type   one of {_PRECEDENCE}
-  applied_codes         deduplicated array of code strings drawn from the matched rules
-  narrative             2-4 sentences explaining the outcome; explicitly call out any
-                        conflicts between matched rules and how precedence resolved them
-"""
-    out, _meta = llm_call(
-        cfg, prompt,
-        agent_name="aggregate_decision",
-        stage="aggregate_decision",
-        fallback=_fallback_aggregate(matched),
-        provider="anthropic",
-        expected_type=dict,
-        required_keys=["final_decision_type", "applied_codes", "narrative"],
+    narrative = (
+        f"DEFECT: {len(adverse)} matched rule(s) applied an adverse disposition "
+        f"or referenced an EOB code. Highest-precedence disposition is "
+        f"{final_type} (rule {winner.get('rule_key')}: {winner.get('reasoning') or ''})."
     )
+    if eob_referenced:
+        narrative += f" EOB code(s) referenced: {', '.join(eob_referenced)}."
 
+    logger.info(
+        "aggregate_decision claim=%s matched=%d adverse=%d -> deterministic %s "
+        "(no LLM); eob=%s",
+        state.get("claim_id") or "-", len(matched), len(adverse), final_type,
+        eob_referenced or "-",
+    )
     stages.append({"node": "aggregate_decision", "status": "OK",
-                   "ms": int((time.time() - t0) * 1000)})
+                   "ms": int((time.time() - t0) * 1000),
+                   "msg": f"deterministic DEFECT ({final_type})"})
     return {
-        "final_decision_type": str(out.get("final_decision_type") or "ALLOW"),
-        "applied_codes": list(out.get("applied_codes") or []),
-        "narrative": str(out.get("narrative") or ""),
+        "final_decision_type": final_type,
+        "applied_codes": codes,
+        "narrative": narrative,
         "stages": stages,
     }

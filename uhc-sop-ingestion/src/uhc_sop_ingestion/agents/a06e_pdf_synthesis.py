@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 from .a07_enrich import _llm_call, _llm_call_pdf, _llm_call_images
@@ -856,6 +857,27 @@ def _norm_txt(s: Any) -> str:
     return " ".join(str(s or "").lower().split())
 
 
+# 9-10 digit Tax-ID / NPI tokens — globally unique to a provider group, so two
+# exception gates that cite the same identifiers ARE the same gate.
+_IDENT_RE = re.compile(r"\b\d{9,10}\b")
+
+
+def _gate_ident_set(rule: dict, subs: list[dict]) -> set:
+    """Identifiers a gate is keyed on. Prefers sub-rule conditions (the clean
+    identifier list) but also mines TIN/NPI tokens from the gate's own
+    condition/action text, so a rule whose ids live in prose still clusters."""
+    ids = {
+        _norm_txt(sr.get("condition"))
+        for sr in subs
+        if _norm_txt(sr.get("condition"))
+    }
+    blob = f"{rule.get('condition', '')} {rule.get('action', '')}"
+    for sr in subs:
+        blob += f" {sr.get('condition', '')} {sr.get('action', '')}"
+    ids |= set(_IDENT_RE.findall(blob))
+    return {i for i in ids if i}
+
+
 def dedupe_exception_rules(rules: list[dict]) -> list[dict]:
     """Collapse band-overlap duplicates of preamble exception/override rules.
 
@@ -885,12 +907,11 @@ def dedupe_exception_rules(rules: list[dict]) -> list[dict]:
             for sr in (d.get("sub_rules") or [])
             if isinstance(sr, dict) and (sr.get("condition") or sr.get("action"))
         ]
-        if subs:
-            ids = {
-                _norm_txt(sr.get("condition"))
-                for sr in subs
-                if _norm_txt(sr.get("condition"))
-            }
+        ids = _gate_ident_set(d, subs)
+        # Use identifier-clustering only for real identifier-list gates: either
+        # explicit sub-rules, or ≥2 TIN/NPI tokens (one incidental code shared
+        # by two narrative rows must NOT collapse them).
+        if subs or len(ids) >= 2:
             # Two gates are the same group when they share a MAJORITY of the
             # smaller identifier set — robust to partial-band copies, but a lone
             # incidental shared TIN won't collapse two genuinely distinct gates.
