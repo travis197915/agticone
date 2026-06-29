@@ -165,7 +165,61 @@ class ToolInvocationRecord(models.Model):
     error = models.TextField(blank=True, default="")
     duration_ms = models.PositiveIntegerField(default=0)
     called_at = models.DateTimeField(auto_now_add=True)
+    # Set when this record was served from ClaimMemory instead of a live call;
+    # points at the run whose live invocation produced the reused result.
+    reused_from_run = models.UUIDField(null=True, blank=True)
 
     class Meta:
         db_table = "execution_tool_invocation"
         ordering = ["run", "called_at"]
+
+
+class ClaimMemory(_UUIDPK):
+    """Persistent per-claim context, scoped per (claim_id, SOP).
+
+    One row per SOP the claim has been audited against — independent of which
+    workflow chained that SOP, so memory survives workflow edits and is shared
+    when the same SOP is attached to several workflows. Rules with no SOP
+    share a single row with ``sop_id=""``.
+
+    Updated after every successful run (n07 in the execution engine). Read at
+    the start of every run to give the agent awareness of prior processing:
+    prior per-rule verdicts + reasoning, prior tool results (reusable within a
+    TTL), and the prior final output. ``drift`` accumulates every structured
+    disagreement between a live evaluation and the remembered one, along with
+    how it was resolved (CLAIM_MEMORY_CONFLICT_POLICY).
+    """
+    claim_id = models.CharField(max_length=128, db_index=True)
+    # str(AuditSop.id) — a plain char column (not an FK) so deleting/re-running
+    # an ingestion job never cascades away a claim's audit memory.
+    sop_id = models.CharField(max_length=64, blank=True, default="")
+    sop_title = models.CharField(max_length=512, blank=True, default="")
+    runs_count = models.PositiveIntegerField(default=0)
+    last_run = models.ForeignKey(
+        RuleExecutionRun, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+",
+    )
+    last_decision_type = models.CharField(max_length=32, blank=True, default="")
+    last_narrative = models.TextField(blank=True, default="")
+    # sha256 of the canonical claim payload from the last run; a mismatch on
+    # the next run means the claim's data changed -> tool reuse + prior-wins
+    # pinning are suspended for that run and memory rebuilds from live results.
+    claim_payload_hash = models.CharField(max_length=64, blank=True, default="")
+    # {rule_key: {matched, skipped, confidence, reasoning, decision_type,
+    #             llm_status, navigation, run_id, at}}
+    rule_memory = models.JSONField(default=dict, blank=True)
+    # {"{tool_name}:{sha256(args)}": {ok, result, phase, run_id, called_at}}
+    tool_memory = models.JSONField(default=dict, blank=True)
+    # compact, append-only: [{run_id, batch_id, workflow_id, status,
+    #                         decision_type, codes, finished_at}]
+    run_history = models.JSONField(default=list, blank=True)
+    # [{run_id, scope: "rule"|"claim", rule_key?, prior, live,
+    #   claim_data_changed, resolution, at}]
+    drift = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "execution_claim_memory"
+        ordering = ["-updated_at"]
+        unique_together = ("claim_id", "sop_id")
