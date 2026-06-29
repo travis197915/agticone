@@ -33,6 +33,8 @@ def serialize_run_summary(run: RuleExecutionRun) -> dict:
         "claim_status": claim_audit_status(run),
         "final_decision_type": run.final_decision_type,
         "applied_codes": run.applied_codes,
+        "claim_lob": run.claim_lob or {},
+        "lob_label": (run.claim_lob or {}).get("label", ""),
         "error_message": run.error_message,
         "started_at": _format_time(run.started_at),
         "started_at_date": (
@@ -104,7 +106,7 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
         fields = ["id", "batch", "workflow", "claim_id", "claim_payload",
                   "raw_fetch", "started_at", "finished_at", "status",
                   "final_decision_type", "applied_codes", "narrative",
-                  "error_message", "review_status", "review_feedback",
+                  "claim_lob", "error_message", "review_status", "review_feedback",
                   "auditor_status", "review_started_at", "reviewed_at",
                   "evaluations", "tool_invocations"]
 

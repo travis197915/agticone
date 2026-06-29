@@ -350,10 +350,49 @@ def cbd_api_info() -> Dict[str, Any]:
     }
 
 
+def _cbd_config_from_db() -> Optional[Dict[str, Any]]:
+    """Return the active ``agent_tools.CbdToolConfig`` row as a config dict, or
+    ``None`` when Django / the table is unavailable (standalone CLI use) or no
+    active row exists. This is the DB-backed seed/override for the Medicare
+    group & plan catalogue; it takes precedence over the live CBD API.
+    """
+    try:
+        from agent_tools.models import CbdToolConfig  # noqa: PLC0415 - optional dep
+    except Exception:
+        return None
+    try:
+        row = (
+            CbdToolConfig.objects.filter(is_active=True)
+            .order_by("-updated_at")
+            .first()
+        )
+    except Exception:
+        return None
+    if not row or not (row.medicare_group_names or row.medicare_plan_names):
+        return None
+    return {
+        "medicare_group_names": row.medicare_group_names or [],
+        "medicare_plan_names": row.medicare_plan_names or {},
+    }
+
+
+# Live CBD API supplies the per-product catalogue used for LOB-specific lookups.
 _cbd_config = cbd_api_info()
 _all_product_configs: Dict[str, Dict[str, Any]] = _cbd_config.get("all_product_configs", {})
-medicare_group_names = _cbd_config.get("medicare_group_names", ["Standard Medicare"])
-medicare_plan_names = _cbd_config.get("medicare_plan_names", {"Standard Medicare": ["Standard Medicare"]})
+# DB row (when present) is the authoritative source for the Medicare group/plan
+# names; otherwise fall back to whatever the live API returned.
+_db_cbd_config = _cbd_config_from_db()
+if _db_cbd_config:
+    logger.info("CBD config: using DB-backed CbdToolConfig override")
+    medicare_group_names = _db_cbd_config.get("medicare_group_names") or _cbd_config.get(
+        "medicare_group_names", ["Standard Medicare"]
+    )
+    medicare_plan_names = _db_cbd_config.get("medicare_plan_names") or _cbd_config.get(
+        "medicare_plan_names", {"Standard Medicare": ["Standard Medicare"]}
+    )
+else:
+    medicare_group_names = _cbd_config.get("medicare_group_names", ["Standard Medicare"])
+    medicare_plan_names = _cbd_config.get("medicare_plan_names", {"Standard Medicare": ["Standard Medicare"]})
 
 # LOB-specific default group/plan names when no similarity match can be found.
 # Standard Default is always Medicare -> Standard Medicare / Standard Medicare.

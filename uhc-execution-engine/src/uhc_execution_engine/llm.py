@@ -16,6 +16,7 @@ import contextvars
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any
@@ -23,6 +24,17 @@ from typing import Any
 from .config import EngineConfig
 
 logger = logging.getLogger(__name__)
+
+# Global cap on concurrent provider invocations. The engine now evaluates SOP
+# cursors AND sibling rules concurrently, so without a ceiling we could fire
+# dozens of simultaneous Anthropic/OpenAI requests and trip provider rate
+# limits. This bounds total in-flight LLM calls across every worker thread;
+# tune via RULE_ENGINE_LLM_CONCURRENCY (default 10).
+try:
+    _LLM_CONCURRENCY = max(1, int(os.environ.get("RULE_ENGINE_LLM_CONCURRENCY", "10")))
+except ValueError:
+    _LLM_CONCURRENCY = 10
+_llm_semaphore = threading.BoundedSemaphore(_LLM_CONCURRENCY)
 
 
 # ── Per-claim / per-batch context vars ───────────────────────────────────────
@@ -376,7 +388,8 @@ def llm_call(
         meta["attempts"] += 1
         try:
             llm = make_fn(cfg, max_tokens)
-            resp = llm.invoke([HumanMessage(content=used_prompt)])
+            with _llm_semaphore:
+                resp = llm.invoke([HumanMessage(content=used_prompt)])
             inp, out = _token_usage(resp)
             ms = int((time.time() - t0) * 1000)
             _log_llm_call(agent_name=f"{agent_name}[{label}]", stage=stage,

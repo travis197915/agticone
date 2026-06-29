@@ -245,6 +245,10 @@ class AuditSop(models.Model):
     # Raw content
     raw_text       = models.TextField(blank=True)
     parse_warnings = models.JSONField(default=list)
+    # Monotonic SOP version, bumped each time a YAML-reconcile batch is applied
+    # to this SOP's rules. Shown in the UI; the per-change audit trail lives in
+    # MongoDB (``sop_rule_change_log``).
+    version        = models.PositiveIntegerField(default=1)
     # Timestamps
     crawled_at     = models.DateTimeField(auto_now_add=True)
     updated_at     = models.DateTimeField(auto_now=True)
@@ -406,6 +410,10 @@ class AuditDecision(models.Model):
     # NULL/blank means all children live relationally here.
     mongo_subtree_ref = models.CharField(max_length=128, blank=True, default="")
     row_index        = models.PositiveSmallIntegerField(default=0)
+    # Per-rule revision, bumped each time this rule is updated by a YAML
+    # reconcile. Lets the UI show "v2" on individual rules; the before/after
+    # of every bump is logged to MongoDB.
+    revision         = models.PositiveIntegerField(default=1)
     # The condition the auditor evaluates
     condition_if     = models.TextField(blank=True)
     condition_and    = models.TextField(blank=True)   # second AND column in 3-col tables

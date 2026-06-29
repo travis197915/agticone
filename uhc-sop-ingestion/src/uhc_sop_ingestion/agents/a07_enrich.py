@@ -388,6 +388,7 @@ def _llm_call(
     stage: str = "enrich_stage",
     max_retries: int = 2,
     max_tokens: int = 4096,
+    retry_on_truncation: bool = False,
 ) -> Any:
     """
     Dual-provider LLM call with guardrails.
@@ -397,6 +398,10 @@ def _llm_call(
       2. Primary provider, attempt 2 (prompt includes previous error)
       3. Fallback provider, attempt 1
       4. Return `fallback` if all fail
+
+    When ``retry_on_truncation`` is set, a response that stops because it hit the
+    output token cap is re-issued with a larger budget (up to the model max)
+    BEFORE any lossy salvage — so dense steps never silently drop rows.
     """
     from langchain_core.messages import HumanMessage
     from uhc_llm import is_registry_backend
@@ -413,15 +418,36 @@ def _llm_call(
 
     pg_logger = getattr(cfg, "_pg_logger", None)
 
+    # claude-sonnet-4-5 / gpt-4o both support large completions; this is the
+    # ceiling we escalate toward when a response is truncated.
+    _MAX_TOKEN_CEILING = 32000
+
     forced = _forced_provider()
     if forced:
         provider = forced
 
+    def _stopped_on_length(resp) -> bool:
+        meta = getattr(resp, "response_metadata", None) or {}
+        reason = str(meta.get("stop_reason") or meta.get("finish_reason") or "").lower()
+        return reason in {"max_tokens", "length"}
+
     def _try(make_llm_fn, prov_name, model_name, current_prompt, attempt_label):
         t0 = time.time()
         try:
-            llm  = make_llm_fn(cfg, max_tokens=max_tokens)
+            budget = max_tokens
+            llm  = make_llm_fn(cfg, max_tokens=budget)
             resp = llm.invoke([HumanMessage(content=current_prompt)])
+            # Escalate the token budget if the model ran out of room mid-JSON,
+            # rather than salvaging a partial (row-dropping) payload.
+            while (retry_on_truncation and _stopped_on_length(resp)
+                   and budget < _MAX_TOKEN_CEILING):
+                budget = min(budget * 2, _MAX_TOKEN_CEILING)
+                logger.warning(
+                    "llm_call [%s/%s]: output hit token cap — retrying at %d tokens",
+                    agent_name, attempt_label, budget,
+                )
+                llm  = make_llm_fn(cfg, max_tokens=budget)
+                resp = llm.invoke([HumanMessage(content=current_prompt)])
             inp, out = _token_usage(resp)
             ms = int((time.time() - t0) * 1000)
             if pg_logger:
@@ -494,8 +520,147 @@ def _llm_call(
 
 # ── Native-PDF (vision) call path ─────────────────────────────────────────────
 # Registry bedrock models use gateway ``/model/{deployment}/invoke``; direct
-# API-key mode uses Anthropic ``/v1/messages`` with document blocks. Both paths
-# go through ``uhc_llm.router.invoke_pdf``.
+# API-key mode uses Anthropic ``/v1/messages`` with document blocks. PDF bytes
+# go through ``uhc_llm.router.invoke_pdf`` (see ``_llm_call_pdf`` below).
+#
+# Page-image raster fallback (scanned PDFs) still uses LangChain vision models
+# directly via ``_llm_call_images`` — there is no registry wrapper for image
+# blocks yet.
+
+
+def _make_anthropic_vision_llm(cfg, max_tokens: int = 8192):
+    """A higher-token ChatAnthropic for document perception (pages are dense)."""
+    from langchain_anthropic import ChatAnthropic
+    return ChatAnthropic(
+        model=cfg.anthropic_model,
+        api_key=cfg.anthropic_api_key,
+        max_tokens=max_tokens,
+        temperature=0,
+    )
+
+
+def _make_openai_vision_llm(cfg, max_tokens: int = 8192):
+    """A higher-token ChatOpenAI (gpt-4o family) for multimodal page-image
+    perception. Keeps json_object mode so the contract matches the text path."""
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(
+        model=cfg.openai_model or "gpt-4o",
+        api_key=cfg.openai_api_key,
+        max_tokens=max_tokens,
+        temperature=0,
+        model_kwargs={"response_format": {"type": "json_object"}},
+    )
+
+
+def _image_content_blocks(prompt: str, image_b64_list: list[str], provider: str) -> list[dict]:
+    """Build a provider-specific multimodal message body: image blocks first,
+    then the instruction text. Anthropic and OpenAI use different image schemas."""
+    blocks: list[dict] = []
+    for b64 in image_b64_list:
+        if not b64:
+            continue
+        if provider == "openai":
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+            })
+        else:
+            blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": b64},
+            })
+    blocks.append({"type": "text", "text": prompt})
+    return blocks
+
+
+def _llm_call_images(
+    cfg,
+    prompt: str,
+    image_b64_list: list[str],
+    fallback: Any,
+    agent_name: str,
+    provider: str = "openai",
+    expected_type: type = dict,
+    required_keys: list[str] | None = None,
+    stage: str = "pdf_perceive",
+    max_tokens: int = 8192,
+) -> Any:
+    """Multimodal (page-image) LLM call with the same guardrails as
+    ``_llm_call_pdf``. Sends rasterised page/band images to a vision model
+    (``provider`` = "openai" gpt-4o, or "anthropic" Claude) and parses → salvages
+    → schema-validates the JSON. This is the any-PDF safety net: it works for
+    scanned/image-only PDFs and oversized pages that the native-PDF text path
+    cannot read. Returns ``fallback`` on total failure.
+    """
+    from langchain_core.messages import HumanMessage
+    pg_logger = getattr(cfg, "_pg_logger", None)
+    if provider not in {"openai", "anthropic"}:
+        provider = "openai"
+    model_name = cfg.openai_model if provider == "openai" else cfg.anthropic_model
+    base_prompt = prompt + (
+        "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+    )
+
+    def _build():
+        return (_make_openai_vision_llm(cfg, max_tokens) if provider == "openai"
+                else _make_anthropic_vision_llm(cfg, max_tokens))
+
+    def _try(current_prompt: str, attempt_label: str):
+        t0 = time.time()
+        try:
+            llm = _build()
+            content = _image_content_blocks(current_prompt, image_b64_list, provider)
+            resp = llm.invoke([HumanMessage(content=content)])
+            inp, out = _token_usage(resp)
+            ms = int((time.time() - t0) * 1000)
+            if pg_logger:
+                pg_logger.log_llm_call(
+                    agent_name=f"{agent_name}[{attempt_label}]",
+                    stage=stage, provider=provider, model=model_name,
+                    prompt_tokens=inp, completion_tokens=out,
+                    duration_ms=ms, success=True,
+                )
+            raw = resp.content if isinstance(resp.content, str) \
+                else _coerce_text_content(resp.content)
+            try:
+                data = _parse_json(raw)
+            except json.JSONDecodeError as je:
+                salvaged = (_salvage_json_object(raw) if expected_type is dict
+                            else _salvage_json_array(raw))
+                if not salvaged:
+                    raise
+                logger.warning("llm_call_images [%s/%s]: salvaged from truncated JSON (%s)",
+                               agent_name, attempt_label, je)
+                data = salvaged
+            data = _unwrap_if_needed(data, expected_type)
+            if not _validate_schema(data, expected_type, required_keys):
+                raise ValueError(
+                    f"Schema mismatch: expected {expected_type.__name__} "
+                    f"with keys {required_keys}"
+                )
+            return data, None
+        except Exception as exc:
+            ms = int((time.time() - t0) * 1000)
+            logger.warning("llm_call_images [%s/%s]: %s", agent_name, attempt_label, exc)
+            if pg_logger:
+                pg_logger.log_llm_call(
+                    agent_name=f"{agent_name}[{attempt_label}]",
+                    stage=stage, provider=provider, model=model_name,
+                    prompt_tokens=0, completion_tokens=0,
+                    duration_ms=ms, success=False, error_message=str(exc),
+                )
+            return None, str(exc)
+
+    last_error = ""
+    for attempt in range(1, 3):
+        label = f"attempt{attempt}"
+        p = base_prompt if attempt == 1 else (
+            base_prompt + f"\n\nYour previous reply failed: {last_error}. Return valid JSON only.")
+        data, err = _try(p, label)
+        if data is not None:
+            return data
+        last_error = err or "unknown"
+    return fallback
 
 
 def _llm_call_pdf(
@@ -756,6 +921,42 @@ Steps:
 
 # ── 1. StepQuestionRefinerAgent — Anthropic ───────────────────────────────────
 
+_QSTOP = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "to", "of", "in", "on",
+    "for", "and", "or", "if", "this", "that", "your", "you", "it", "as", "at",
+    "by", "with", "from", "any", "all", "do", "does", "did", "determine",
+    "perform", "following", "below", "current", "claim", "step", "review",
+}
+
+
+def _q_content_tokens(text: str) -> set[str]:
+    import re as _re
+
+    toks = _re.findall(r"[a-z0-9]+", (text or "").lower())
+    return {t for t in toks if t not in _QSTOP and len(t) > 2}
+
+
+def _safe_question_rewrite(original: str, rewrite: str) -> str:
+    """Accept a refined question ONLY if it introduces no new content word that
+    is absent from the original (prevents hallucinated re-wordings such as
+    "Member county / Applies-To field" -> "member's line of business"). On any
+    drift, fall back to the verbatim original. This is deterministic and never
+    fabricates meaning."""
+    rewrite = (rewrite or "").strip()
+    original = (original or "").strip()
+    if not rewrite:
+        return original
+    orig_tokens = _q_content_tokens(original)
+    new_tokens = _q_content_tokens(rewrite)
+    introduced = new_tokens - orig_tokens
+    # A faithful cleanup may reorder/drop filler but must not invent new content
+    # nouns. Allow at most a single incidental new token (e.g. a pluralisation
+    # the stopword filter missed); reject anything more as a meaning change.
+    if len(introduced) > 1:
+        return original
+    return rewrite
+
+
 def step_question_refiner(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     steps = state.get("steps") or []
     if not steps:
@@ -765,9 +966,18 @@ def step_question_refiner(state: "PipelineState", cfg: "PipelineConfig") -> dict
          "raw": (s.get("question") or s.get("raw_text",""))[:300]}
         for s in steps[:20]
     ]
-    prompt = f"""You are a healthcare claims policy analyst.
-Rewrite each SOP step question to be clear, concise, and in active voice.
-Return JSON array only: [{{"number": N, "question": "rewritten question"}}]
+    prompt = f"""You are a healthcare claims policy analyst tidying SOP step
+questions for display. This is FAITHFUL copy-editing, NOT rewriting.
+
+STRICT RULES (a wrong question is worse than an ugly one):
+• Preserve the EXACT meaning and every specific noun, field name, code, system
+  name, place, and condition from the original.
+• You may only fix capitalization/spacing, drop a redundant leading verb, or
+  turn a fragment into a question. Do NOT introduce ANY word or concept that is
+  not already in the original. Do NOT generalize, guess intent, or invent.
+• If you cannot improve it without changing meaning, return the original verbatim.
+
+Return JSON array only: [{{"number": N, "question": "lightly cleaned question"}}]
 
 Steps:
 {json.dumps(raw_questions, indent=2)}"""
@@ -778,8 +988,11 @@ Steps:
     if not isinstance(result, list):
         return {}
     q_map = {r["number"]: r.get("question", "") for r in result if "number" in r}
-    enriched = [dict(s, question=q_map.get(s["number"], s.get("question", "")))
-                for s in steps]
+    enriched = []
+    for s in steps:
+        original = s.get("question", "")
+        proposed = q_map.get(s["number"], original)
+        enriched.append(dict(s, question=_safe_question_rewrite(original, proposed)))
     return {"enriched_steps": enriched}
 
 
@@ -1027,6 +1240,15 @@ For EACH distinct, actionable rule you find:
 1. Write it as a standalone IF condition → THEN action pair.
 2. Assign decision_type: DENY | ALLOW | BYPASS | OVERRIDE | ELIGIBILITY | REFER | NOTE
 3. Flag is_exception=true if the rule says "exclude", "do not apply", "bypass", or overrides normal steps.
+4. OPERATIVE IDENTIFIER LISTS — DO NOT SUMMARISE. When a rule relies on an explicit
+   list of identifiers (provider TINs/NPIs, provider/facility names, group/plan
+   names, Tax IDs, or codes that are INCLUDED IN or EXCLUDED FROM the process — e.g.
+   a "Virgin Island Providers excluded from cross-billing" TIN/Provider table), you
+   MUST NOT collapse it into "TIN is one of: 128380004, ...". Keep the gate as the
+   parent condition/action, and put EVERY list entry in a ``sub_rules`` array — one
+   object per entry — with the identifier verbatim in ``condition`` and the matching
+   name/value verbatim in ``action`` (e.g. {"condition": "128380004", "action":
+   "NAYER, ANNE D"}). Never drop a provider name and never merge two entries.
 
 Return a JSON array — one object per rule:
 [{
@@ -1034,10 +1256,15 @@ Return a JSON array — one object per rule:
   "condition": "<complete IF condition — be specific, include codes/values>",
   "action": "<complete THEN action — what the auditor must do>",
   "decision_type": "DENY|ALLOW|BYPASS|OVERRIDE|ELIGIBILITY|REFER|NOTE",
-  "is_exception": true/false
+  "is_exception": true/false,
+  "sub_rules": [{"condition": "<identifier verbatim>", "action": "<name/value verbatim>"}]
 }]
+``sub_rules`` is optional — include it ONLY for rules that carry an identifier list;
+omit it (or use []) otherwise.
 
-Only return the JSON array. No prose. Extract every individual rule — do not combine them.
+Only return the JSON array. No prose. Extract every individual rule — do not combine
+them. If the SAME rule appears more than once because the input text is duplicated,
+output that rule only ONCE (do not emit duplicate condition/action pairs).
 
 Sections:
 """

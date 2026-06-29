@@ -280,8 +280,10 @@ execution engine's step cursor:
     from its text), e.g. "Provider is individual". Else "".
   • navigation: when a sub-rule's text says "skip/proceed/go to step N", set
     {{"op":"goto","step_number":N}}. Only use step numbers in {declared}.
-  • is_out_of_scope: true only when the text says the line/claim is out of
-    scope or to stop further auditing.
+  • is_out_of_scope: true ONLY when the text says the line/claim is OUT OF SCOPE
+    / not in scope so the execution engine SKIPS it (no defect, no EOB code). A
+    "stop"/"the process ends" disposition is NOT out of scope — it posts a defect
+    WITH an EOB code, so leave is_out_of_scope false for it.
 
 Return STRICT JSON matching this contract (patches only — omit steps with no
 routing to add):

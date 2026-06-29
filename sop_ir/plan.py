@@ -66,8 +66,11 @@ def _resolve_goto(
 
 
 def _plan_rule(rule: RuleNode, ridx: int) -> dict:
-    rule_id = rule.rule_id
     step_number = rule.step_number if rule.step_number is not None else ridx
+    # Canonical step id: keep the source's verbatim id when present; otherwise
+    # synthesize a stable positional one so EVERY door (YAML / HTML / PDF) emits
+    # the same ``RULE-<step>`` namespace and downstream rows can hang off it.
+    rule_id = rule.rule_id or f"RULE-{step_number:03d}"
 
     description = rule.description
     conditions = list(rule.conditions)
@@ -102,7 +105,8 @@ def _plan_rule(rule: RuleNode, ridx: int) -> dict:
         terminal_action = m.group(1)
 
     children = [
-        _plan_subrule(sr, i, depth=0, parent_oos=step_oos, step_number=step_number)
+        _plan_subrule(sr, i, depth=0, parent_oos=step_oos, step_number=step_number,
+                      parent_id=rule_id)
         for i, sr in enumerate(subrules)
     ]
 
@@ -161,8 +165,14 @@ def _plan_subrule(
     depth: int,
     parent_oos: bool,
     step_number: Optional[int] = None,
+    parent_id: str = "",
 ) -> dict:
-    subrule_id = sr.subrule_id
+    # Canonical, depth-aware id: ``<parent>-001``, ``<parent>-001-002`` … so a
+    # rule → sub-rule → sub-sub-rule tree carries stable positional ids at every
+    # level when the source didn't author its own. Verbatim ids always win.
+    subrule_id = sr.subrule_id or (
+        f"{parent_id}-{idx + 1:03d}" if parent_id else f"RULE-{idx + 1:03d}"
+    )
     description = sr.description
     conditions = list(sr.conditions)
     actions = list(sr.actions)
@@ -181,7 +191,8 @@ def _plan_subrule(
     has_children = bool(sub)
 
     children = [
-        _plan_subrule(s, i, depth=depth + 1, parent_oos=oos, step_number=step_number)
+        _plan_subrule(s, i, depth=depth + 1, parent_oos=oos, step_number=step_number,
+                      parent_id=subrule_id)
         for i, s in enumerate(sub)
     ]
 

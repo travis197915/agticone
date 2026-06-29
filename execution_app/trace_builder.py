@@ -132,16 +132,19 @@ def _status_for_eval(ev: dict[str, Any]) -> str:
 def _eval_applies_defect(ev: dict[str, Any]) -> bool:
     """True only when an evaluation *applies* an adverse disposition.
 
-    A defect is a rule that fired (matched) AND carries an adverse decision
-    type (DENY / REFER / PEND / STOP). A rule whose condition is merely
-    "Not-Met", or that routes the flow ("proceed" / "skip to" → CONDITIONAL),
-    is NOT a defect — that is normal SOP branching. This mirrors the engine's
-    own aggregator, whose ALLOW verdict means "no adverse disposition applied".
+    A defect is a rule that fired (matched) AND either carries an adverse
+    decision type (DENY / REFER / PEND / STOP) OR references an EOB code (per
+    the verdict policy, a matched rule that references an EOB code is a defect).
+    A rule whose condition is merely "Not-Met", or that routes the flow
+    ("proceed" / "skip to" → CONDITIONAL), is NOT a defect — that is normal SOP
+    branching. This mirrors the engine's own aggregator.
     """
     if ev.get("skipped"):
         return False
     if not ev.get("matched"):
         return False
+    if ev.get("eob_codes"):
+        return True
     return (ev.get("decision_type") or "").upper() in _DEFECT_DECISIONS
 
 

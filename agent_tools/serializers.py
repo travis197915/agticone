@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
-from .models import (ClaimOntologyField, NodeRuleBinding, NodeToolBinding,
-                     SopFieldMapping, Tool)
+from .models import (ClaimOntologyField, McpServerConfig, McpToolContext,
+                     NodeRuleBinding, NodeToolBinding, SopFieldMapping, Tool)
 
 # Systems the resolver searches, in preference order, with friendly labels so
 # the UI can explain what each cryptic source actually is.
@@ -37,6 +37,115 @@ class ToolSerializer(serializers.ModelSerializer):
             "metadata",
             "endpoint_id",
             "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+
+class ToolWriteSerializer(serializers.ModelSerializer):
+    """Create/update shape for a *tool call* row (an MCP/API tool the UI manages).
+
+    The MCP route stores only the per-tool path in ``metadata['mcp_path']``; the
+    base endpoint + auth live once in :class:`McpServerConfig`.
+    """
+
+    class Meta:
+        model = Tool
+        fields = [
+            "id",
+            "name",
+            "display_name",
+            "description",
+            "kind",
+            "invoke_url",
+            "args_schema",
+            "metadata",
+            "endpoint_id",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate_metadata(self, value):
+        if value in (None, ""):
+            return {}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("metadata must be a JSON object.")
+        return value
+
+    def validate(self, attrs):
+        # Default invoke_url for tools the engine routes through this app.
+        name = attrs.get("name") or getattr(self.instance, "name", "")
+        if not attrs.get("invoke_url") and name:
+            attrs["invoke_url"] = f"/api/agent-tools/{name}/invoke"
+        if not attrs.get("display_name") and name:
+            attrs["display_name"] = name.replace("_", " ").title()
+        return attrs
+
+
+class McpServerConfigSerializer(serializers.ModelSerializer):
+    """Editable connection config for an external claims MCP/REST server.
+
+    ``api_key`` is write-only; reads expose only ``api_key_set`` so the secret is
+    never shipped to the browser. Leaving ``api_key`` blank on update keeps the
+    stored value.
+    """
+
+    api_key = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, style={"input_type": "password"})
+    api_key_set = serializers.SerializerMethodField()
+
+    class Meta:
+        model = McpServerConfig
+        fields = [
+            "id",
+            "label",
+            "base_url",
+            "auth_header",
+            "api_key",
+            "api_key_set",
+            "http_method",
+            "claim_arg",
+            "timeout_seconds",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "api_key_set", "created_at", "updated_at"]
+
+    def get_api_key_set(self, obj) -> bool:
+        return bool(obj.api_key)
+
+    def update(self, instance, validated_data):
+        # Blank/omitted api_key on update must NOT wipe the stored secret.
+        if validated_data.get("api_key", None) == "":
+            validated_data.pop("api_key", None)
+        return super().update(instance, validated_data)
+
+
+class McpToolContextSerializer(serializers.ModelSerializer):
+    """Read shape for an MCP tool's LLM-derived response understanding."""
+
+    tool_name = serializers.CharField(source="tool.name", read_only=True)
+
+    class Meta:
+        model = McpToolContext
+        fields = [
+            "id",
+            "tool",
+            "tool_name",
+            "server",
+            "mcp_path",
+            "summary",
+            "fields",
+            "sample_response",
+            "record_count",
+            "truncated",
+            "llm_provider",
+            "llm_model",
+            "analyzed_at",
             "created_at",
             "updated_at",
         ]

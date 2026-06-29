@@ -101,14 +101,30 @@ def extract_bindings_from_properties(shape) -> None:
         for r in raw_rules
         if isinstance(r, dict) and r.get("key") and r.get("manual_out_of_scope")
     })
+    # Force-IN-scope override set: rules the auditor pulled back into scope even
+    # though the SOP (or node) flagged them out of scope. This BEATS the SOP flag
+    # during hydration and execution, so an ingestion-out-of-scope rule can be
+    # re-enabled. ``manual_in_scope`` and ``manual_out_of_scope`` are mutually
+    # exclusive per rule (the UI sets one true, the other false).
+    manual_in_keys = sorted({
+        str(r.get("key"))
+        for r in raw_rules
+        if isinstance(r, dict) and r.get("key") and r.get("manual_in_scope")
+    })
+    changed = False
     if (props.get("manual_oos_rule_keys") or []) != manual_oos_keys:
         props["manual_oos_rule_keys"] = manual_oos_keys
+        changed = True
+    if (props.get("manual_in_scope_rule_keys") or []) != manual_in_keys:
+        props["manual_in_scope_rule_keys"] = manual_in_keys
+        changed = True
+    if changed:
         shape.properties = props
         try:
             shape.save(update_fields=["properties"])
         except Exception as exc:
-            logger.warning("agent_tools: could not persist manual_oos_rule_keys "
-                           "(shape=%s): %s", shape.id, exc)
+            logger.warning("agent_tools: could not persist manual scope override "
+                           "keys (shape=%s): %s", shape.id, exc)
 
     NodeRuleBinding.objects.filter(shape=shape).delete()
     rule_binding_by_key: dict[str, Any] = {}
@@ -282,10 +298,15 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
         # rules), persisted on write. Re-emitted per entry so the toggle state
         # round-trips, and OR'd into the effective ``is_out_of_scope``.
         manual_keys = set(props.get("manual_oos_rule_keys") or [])
+        manual_in_keys = set(props.get("manual_in_scope_rule_keys") or [])
 
         def _binding_entry(row) -> dict:
             entry = dict(raw_by_key.get(row.rule_key) or {})
             is_manual = row.rule_key in manual_keys
+            forced_in = row.rule_key in manual_in_keys
+            # Effective scope: manual OOS or SOP-derived OOS, UNLESS the auditor
+            # forced the rule back in scope (force-in wins over everything).
+            effective_oos = (is_manual or (row.rule_key in oos_keys)) and not forced_in
             # Authoritative fields from the binding row always win.
             entry.update({
                 "id":             str(row.id),
@@ -298,7 +319,8 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
                 "html_reference": row.html_reference_json or {},
                 "ordering":       row.ordering,
                 "manual_out_of_scope": is_manual,
-                "is_out_of_scope": (row.rule_key in oos_keys) or is_manual,
+                "manual_in_scope": forced_in,
+                "is_out_of_scope": effective_oos,
             })
             return entry
 
@@ -318,8 +340,12 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
                 entry = dict(raw)
                 entry["is_custom"] = bool(raw.get("is_custom")) or key.startswith("custom:")
                 is_manual = key in manual_keys
+                forced_in = key in manual_in_keys
                 entry["manual_out_of_scope"] = is_manual
-                entry["is_out_of_scope"] = bool(entry.get("is_out_of_scope")) or is_manual
+                entry["manual_in_scope"] = forced_in
+                entry["is_out_of_scope"] = (
+                    (bool(entry.get("is_out_of_scope")) or is_manual) and not forced_in
+                )
                 merged.append(entry)
         # Defensive: surface any binding rows the raw list didn't mention.
         for row in rule_rows:

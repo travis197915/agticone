@@ -100,6 +100,9 @@ class RuleExecutionRun(_UUIDPK):
     )
     review_started_at = models.DateTimeField(null=True, blank=True)
     reviewed_at = models.DateTimeField(null=True, blank=True)
+    # Identified Line of Business for this claim (SOW deliverable):
+    # {"product", "network", "label", "source"}. Empty for legacy/failed runs.
+    claim_lob = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "execution_rule_run"

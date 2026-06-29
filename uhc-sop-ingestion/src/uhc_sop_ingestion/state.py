@@ -65,6 +65,10 @@ class PipelineState(TypedDict, total=False):
 
     # ── LLM enrichment outputs ────────────────────────────────────────────────
     enriched_steps: list[dict]
+    # Normalised conditions of preamble exception/override rules that were
+    # attached to their host step (pdf_exception_attacher) so the Postgres writer
+    # does not also emit them as a standalone "Step 0 — Pre-Step Exceptions" node.
+    exception_rules_attached: list[str]
     enriched_rules: list[dict]
     llm_summary: str
     llm_tokens_used: int
