@@ -91,6 +91,16 @@ from .agents.a03_parse_html import (
     html_sub_procedures,
     html_links,
 )
+from .agents.a03b_html_graph import (
+    html_perceive,
+    html_entity_extractor,
+    html_relation_reasoner,
+    html_context_graph_writer,
+    html_context_validator,
+    html_step_synthesizer,
+    html_presection_synthesizer,
+    html_quality_gate,
+)
 from .agents.a04_parse_docx import (
     docx_metadata,
     docx_headings,
@@ -374,6 +384,40 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
             html_links,
             cfg=cfg,
             stage_name="html_parse",
+        ),
+    )
+    # HTML GRAPH DOOR — the SEPARATE HTML analog of the PDF vision door. Mirrors
+    # PDF's perceive → contextualize → synthesize but is driven by the structured
+    # DOM (deterministic perception). Shares NO code with the PDF agents.
+    # 1) contextualize: DOM -> pages -> entities/relations -> durable Neo4j
+    #    context graph (:HtmlDoc/:HtmlNode), with a per-page coverage retry.
+    g.add_node(
+        "html_contextualize",
+        _stage(
+            html_perceive,
+            html_entity_extractor,
+            html_relation_reasoner,
+            html_context_graph_writer,
+            html_context_validator,
+            cfg=cfg,
+            stage_name="html_contextualize",
+        ),
+    )
+    # 2) synthesize: pages/entities -> canonical steps/pre_sections (nested
+    #    decision rows), then the shared format-agnostic enrichers add group
+    #    rules, date conditions and the summary, then the SopIR quality gate.
+    g.add_node(
+        "html_synthesize",
+        _stage(
+            html_step_synthesizer,
+            html_presection_synthesizer,
+            pre_section_rule_extractor,
+            group_rule_extractor,
+            date_condition_extractor,
+            summary_generator,
+            html_quality_gate,
+            cfg=cfg,
+            stage_name="html_synthesize",
         ),
     )
     g.add_node(
@@ -686,10 +730,16 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
     )
 
     # Parse → enrich → context → validate → write (sequential)
-    # HTML/DOCX/XLSX share the HTML enrich_stage; PDF uses its own pdf_enrich
-    # army so the two flows never mix. Both rejoin at context_stage.
-    for parse_node in ("html_parse", "docx_parse", "xlsx_parse"):
+    # DOCX/XLSX use the shared HTML enrich_stage. HTML and PDF each run their own
+    # dedicated graph-first door (contextualize → synthesize) so the three flows
+    # never mix. All branches rejoin at context_stage.
+    for parse_node in ("docx_parse", "xlsx_parse"):
         g.add_edge(parse_node, "enrich_stage")
+    # HTML door: keep html_parse (metadata/links/DOM-mirror/biz-table) then run
+    # the separate HTML graph door which overwrites steps/pre_sections.
+    g.add_edge("html_parse", "html_contextualize")
+    g.add_edge("html_contextualize", "html_synthesize")
+    g.add_edge("html_synthesize", "context_stage")
     g.add_edge("pdf_perceive", "pdf_contextualize")
     g.add_edge("pdf_contextualize", "pdf_synthesize")
     g.add_edge("enrich_stage", "context_stage")

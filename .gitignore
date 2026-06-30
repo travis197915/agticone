@@ -69,3 +69,8 @@ docs/data/
 docs/*
 
 builder/management/*
+
+scripts/*
+
+# local DB backups
+backups/

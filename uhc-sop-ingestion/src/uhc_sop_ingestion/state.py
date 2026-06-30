@@ -53,6 +53,12 @@ class PipelineState(TypedDict, total=False):
     pdf_page_count: int             # merged page count after perception
     pdf_slice_count: int            # number of native-PDF slices sent to Claude
     pdf_context_graph_id: str       # "{job_id}:{content_hash}" of the Neo4j graph
+    # HTML GRAPH DOOR (a03b_html_graph) — the SEPARATE HTML analog of the PDF
+    # door. Heavy payloads (pages, entities, relations) live on the Redis
+    # blackboard (sop:html:{job_id}:*) and Neo4j (:HtmlDoc/:HtmlNode); state
+    # carries only the light references below.
+    html_page_count: int            # synthetic page-record count after perception
+    html_context_graph_id: str      # "{job_id}:{content_hash}" of the Neo4j graph
     sub_procedures: list[dict]
     reference_tables: list[dict]
     group_rules: list[dict]
