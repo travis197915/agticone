@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from collections import OrderedDict
@@ -1508,7 +1509,7 @@ class ClaimTraceView(APIView):
 def _execution_upload_dir() -> Path:
     """Where the kickoff view stashes the .xlsx for the Celery task to read.
 
-    Sits under MEDIA_ROOT when configured, otherwise under the system temp
+    Sits under MEDIA_ROOT when configured, tempfile.gettempdir() under the system temp
     directory (matches Django's default upload behaviour).
     """
     media = getattr(settings, "MEDIA_ROOT", "") or ""
