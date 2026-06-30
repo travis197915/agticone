@@ -45,6 +45,7 @@ out/
 explainability.json
 trace.json
 uhc-agentic.log
+logs/
 synthetic_claims.xlsx
 synthetic_claims_3.xlsx
 SOP_Rule-to-Tool_Mapping_Report.docx
@@ -74,3 +75,8 @@ docs/data/
 docs/*
 
 builder/management/*
+
+scripts/*
+
+# local DB backups
+backups/
