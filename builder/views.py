@@ -24,6 +24,7 @@ from rest_framework import serializers as drf_serializers
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.renderers import BaseRenderer
 from rest_framework.response import Response
 
 from .models import (
@@ -170,6 +171,17 @@ class DashboardWidgetViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 # ── Workflows ───────────────────────────────────────────────────────────────
+
+
+class _EventStreamRenderer(BaseRenderer):
+    """Advertise ``text/event-stream`` so DRF content negotiation accepts SSE."""
+
+    media_type = "text/event-stream"
+    format = "txt"
+    charset = "utf-8"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):  # pragma: no cover
+        return data
 
 
 class WorkflowViewSet(viewsets.ModelViewSet):
@@ -637,7 +649,8 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             "llm_errors":  llm_errors,
         })
 
-    @action(detail=True, methods=["get"], url_path="build_stream")
+    @action(detail=True, methods=["get"], url_path="build_stream",
+            renderer_classes=[_EventStreamRenderer])
     def build_stream(self, _request, pk=None):
         """Server-Sent Events stream of live pipeline stage logs for the build.
 
