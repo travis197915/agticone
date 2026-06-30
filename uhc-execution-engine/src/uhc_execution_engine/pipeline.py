@@ -5,8 +5,10 @@ import logging
 import uuid
 from typing import Any
 
+from .config import get_config
 from .graph import build_graph
 from .llm import execution_run_context
+from .memory import load_prior_context
 from .state import ExecutionState
 
 logger = logging.getLogger(__name__)
@@ -36,15 +38,29 @@ class RuleEnginePipeline:
         # invocation and reuses it. Lets callers inject already-fetched/cached
         # tool payloads; default empty preserves the original fetch-everything
         # behaviour.
+        resolved_claim_id = claim_id or str(
+            claim.get("claim_id") or claim.get("subscriber_id") or "")
+        # Persistent per-claim context, one memory row per (claim_id, SOP).
+        # Loaded here — the single entry point for every claim run — so batch
+        # and single-claim paths are both memory-aware. Fail-open: {} runs cold.
+        try:
+            prior_context = load_prior_context(
+                get_config(), claim_id=resolved_claim_id, claim=claim or {})
+        except Exception:  # pragma: no cover - memory must never block a run
+            logger.exception("rule_engine: load_prior_context failed; "
+                             "running cold for claim_id=%s", resolved_claim_id)
+            prior_context = {}
         initial: ExecutionState = {
             "workflow_id": str(workflow_id),
             "claim": claim or {},
             "raw_fetch": raw_fetch or {},
-            "claim_id": claim_id or str(claim.get("claim_id") or claim.get("subscriber_id") or ""),
+            "claim_id": resolved_claim_id,
             "batch_id": batch_id,
             "stages": [],
             "tool_invocations": [],
             "tool_results": tool_results or {},
+            "prior_context": prior_context,
+            "drift_entries": [],
             "status": "RUNNING",
             "run_id": run_id,
         }
