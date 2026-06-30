@@ -58,7 +58,7 @@ from .models import (
     AuditDecision, AuditGraphNode, AuditPrecondition, AuditSop, AuditStep,
     SopExclusion,
 )
-from .html_blocks import extract_blocks, fetch_sanitized_html, get_block_by_id
+from .html_blocks import extract_blocks, fetch_sanitized_html, fetch_html_or_fallback, get_block_by_id
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -305,7 +305,7 @@ class SopSourceHtmlView(APIView):
 
     def get(self, _request: Request, sop_id: int) -> Response:
         sop = get_object_or_404(AuditSop, pk=sop_id)
-        html, reason = fetch_sanitized_html(sop)
+        html, reason, is_fallback = fetch_html_or_fallback(sop)
         # Existing user-marked html_block exclusions (target_keys) so the
         # SPA can outline them on load without re-querying /attachable/.
         excluded_keys = list(
@@ -317,9 +317,10 @@ class SopSourceHtmlView(APIView):
             "sop_id":     sop.id,
             "doc_format": sop.doc_format or "HTML",
             "source_url": sop.url or "",
-            "available":  html is not None,
-            "html":       html or "",
+            "available":  bool(html),
+            "html":       html,
             "reason":     reason,
+            "is_fallback": is_fallback,
             "excluded_target_keys": excluded_keys,
         })
 

@@ -45,6 +45,7 @@ class SopIngestionPipeline:
         job_id: Optional[str] = None,
         max_depth: int = 4,
         max_docs: int = 200,
+        trigger_source: str = "manual",
     ) -> dict:
         """Run the full ingestion pipeline from a seed URL.
 
@@ -84,6 +85,8 @@ class SopIngestionPipeline:
             "job_id":    resolved_job_id,
             "max_depth": max_depth,
             "max_docs":  max_docs,
+            "trigger_source": trigger_source or "manual",
+            "requires_human_review": False,
             # Accumulator fields must be initialised as empty lists
             "url_queue":       [],
             "visited_hashes":  [],
@@ -115,6 +118,7 @@ class SopIngestionPipeline:
         job_id: Optional[str] = None,
         max_depth: int = 4,
         max_docs: int = 200,
+        trigger_source: str = "manual",
     ):
         """Stream state updates for live progress monitoring.
 
@@ -137,6 +141,8 @@ class SopIngestionPipeline:
             "job_id":    resolved_job_id,
             "max_depth": max_depth,
             "max_docs":  max_docs,
+            "trigger_source": trigger_source or "manual",
+            "requires_human_review": False,
             "url_queue": [], "visited_hashes": [], "visited_urls": [],
             "all_documents": [], "errors": [], "validation_warnings": [],
             "total_processed": 0,

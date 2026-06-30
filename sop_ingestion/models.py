@@ -48,6 +48,12 @@ class IngestionJob(models.Model):
     )
     updated_at     = models.DateTimeField(auto_now=True)
     celery_task_id = models.CharField(max_length=255, blank=True)
+    trigger_source = models.CharField(
+        max_length=32,
+        default="manual",
+        blank=True,
+        help_text="manual | workflow | revision_check",
+    )
     created_at     = models.DateTimeField(auto_now_add=True)
     started_at     = models.DateTimeField(null=True, blank=True)
     completed_at   = models.DateTimeField(null=True, blank=True)
@@ -204,6 +210,41 @@ class LLMCallLog(models.Model):
 # Neo4j holds the graph edges (Step-[:IF_YES]->Step) for traversal.
 # Postgres holds the full relational record for querying and reporting.
 
+class SopDocument(models.Model):
+    """Stable identity for one SOP URL across ingestion jobs and revisions."""
+
+    canonical_url         = models.TextField(unique=True)
+    title                 = models.TextField(blank=True)
+    latest_revision_date  = models.CharField(max_length=32, blank=True)
+    current_version       = models.ForeignKey(
+        "AuditSop",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="+",
+    )
+    last_revision_check_at      = models.DateTimeField(null=True, blank=True)
+    last_remote_revision_date   = models.CharField(max_length=32, blank=True)
+    last_remote_content_hash    = models.CharField(max_length=64, blank=True)
+    last_revision_check_status  = models.CharField(max_length=32, blank=True)
+    last_revision_check_detail  = models.TextField(blank=True)
+    created_at            = models.DateTimeField(auto_now_add=True)
+    updated_at            = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "SOP Document"
+        ordering     = ["-updated_at"]
+
+    def __str__(self) -> str:
+        return self.title or self.canonical_url[:80]
+
+
+class ActivationStatus(models.TextChoices):
+    ACTIVE         = "active",         "Active"
+    PENDING_REVIEW = "pending_review", "Pending review"
+    REJECTED       = "rejected",       "Rejected"
+    SUPERSEDED     = "superseded",     "Superseded"
+
+
 class AuditSop(models.Model):
     """
     One ingested SOP document.  The root of every audit trail.
@@ -212,6 +253,28 @@ class AuditSop(models.Model):
     """
     job            = models.ForeignKey(IngestionJob, on_delete=models.CASCADE,
                                        related_name="audit_sops")
+    document       = models.ForeignKey(
+        SopDocument,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="versions",
+    )
+    canonical_url  = models.TextField(blank=True, db_index=True)
+    version_number = models.PositiveIntegerField(default=1)
+    is_current     = models.BooleanField(default=True, db_index=True)
+    activation_status = models.CharField(
+        max_length=16,
+        choices=ActivationStatus.choices,
+        default=ActivationStatus.ACTIVE,
+        db_index=True,
+    )
+    supersedes     = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="superseded_by_set",
+    )
+    version_action = models.CharField(max_length=24, blank=True, default="")
     # Identity
     url            = models.TextField()
     content_hash   = models.CharField(max_length=64, db_index=True)
@@ -268,6 +331,47 @@ class AuditSop(models.Model):
 
     def __str__(self):
         return f"{self.title or self.url[:60]}"
+
+
+class SopVersionDiff(models.Model):
+    """Structured diff between two ingested versions of the same SOP document."""
+
+    document           = models.ForeignKey(
+        SopDocument,
+        on_delete=models.CASCADE,
+        related_name="diffs",
+    )
+    from_sop           = models.ForeignKey(
+        AuditSop,
+        on_delete=models.CASCADE,
+        null=True, blank=True,
+        related_name="diffs_from",
+    )
+    to_sop             = models.ForeignKey(
+        AuditSop,
+        on_delete=models.CASCADE,
+        related_name="diffs_to",
+    )
+    from_revision_date = models.CharField(max_length=32, blank=True)
+    to_revision_date   = models.CharField(max_length=32, blank=True)
+    from_content_hash  = models.CharField(max_length=64, blank=True)
+    to_content_hash    = models.CharField(max_length=64, blank=True)
+    summary            = models.JSONField(default=dict)
+    changes            = models.JSONField(default=list)
+    computed_at        = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "SOP Version Diff"
+        ordering     = ["-computed_at"]
+        constraints  = [
+            models.UniqueConstraint(
+                fields=["from_sop", "to_sop"],
+                name="uniq_sop_version_diff_pair",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"diff v{self.from_sop_id}→v{self.to_sop_id}"
 
 
 class AuditPrecondition(models.Model):

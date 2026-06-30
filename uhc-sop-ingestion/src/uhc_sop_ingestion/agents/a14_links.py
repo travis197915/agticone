@@ -155,11 +155,14 @@ def accumulated_doc_appender(state: "PipelineState", cfg: "PipelineConfig") -> d
             "content_hash":   state.get("content_hash",""),
             "doc_format":     state.get("doc_format",""),
             "title":          meta.get("title",""),
+            "revision_date":  meta.get("revision_date",""),
             "crawl_depth":    state.get("current_depth",0),
             "step_count":     len(state.get("steps") or []),
             "rule_count":     sum(len(s.get("decision_rows",[])) for s in (state.get("steps") or [])),
             "code_count":     len(state.get("detected_codes") or []),
             "neo4j_sop_id":   state.get("neo4j_sop_id",""),
-            "postgres_doc_id":state.get("postgres_doc_id"),
+            "postgres_doc_id": state.get("sop_db_id") or state.get("postgres_doc_id"),
+            "version_action": state.get("version_action",""),
+            "version_diff_id": state.get("version_diff_id"),
         }]
     }

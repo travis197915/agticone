@@ -13,6 +13,7 @@ import os
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
+from celery.schedules import crontab
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -223,13 +224,33 @@ if sys.platform == "win32":
 # child OS processes (see sop_ingestion/subprocess_manager.py and
 # execution_app/subprocess_manager.py).
 CELERY_TASK_ROUTES = {
-    "sop_ingestion.run_pipeline":    {"queue": "job_queue"},
+    "sop_ingestion.run_pipeline": {"queue": "job_queue"},
     "execution_app.run_batch_async": {"queue": "job_queue"},
+    "sop_ingestion.check_all_sop_revisions": {"queue": "celery"},
+    "sop_ingestion.check_sop_revision": {"queue": "celery"},
 }
 # Max parallel ingestion subprocesses (master waits for a slot before Popen).
 MAX_PIPELINE_SUBPROCESSES = int(os.environ.get("MAX_PIPELINE_SUBPROCESSES", "10"))
 # Max parallel execution-batch subprocesses (same shape as the ingestion knob).
 MAX_EXECUTION_SUBPROCESSES = int(os.environ.get("MAX_EXECUTION_SUBPROCESSES", "5"))
+
+# ── Scheduled SOP revision checks (Celery Beat) ───────────────────────────────
+SOP_REVISION_CHECK_ENABLED = os.environ.get(
+    "SOP_REVISION_CHECK_ENABLED", "false",
+).lower() in {"1", "true", "yes"}
+SOP_REVISION_CHECK_HOUR = int(os.environ.get("SOP_REVISION_CHECK_HOUR", "2"))
+SOP_REVISION_CHECK_MINUTE = int(os.environ.get("SOP_REVISION_CHECK_MINUTE", "0"))
+
+CELERY_BEAT_SCHEDULE = {}
+if SOP_REVISION_CHECK_ENABLED:
+    CELERY_BEAT_SCHEDULE["sop-revision-check"] = {
+        "task": "sop_ingestion.check_all_sop_revisions",
+        "schedule": crontab(
+            hour=SOP_REVISION_CHECK_HOUR,
+            minute=SOP_REVISION_CHECK_MINUTE,
+        ),
+        "options": {"queue": "celery"},
+    }
 
 # ── Pipeline defaults (picked up by PipelineConfig.from_env()) ────────────────
 SOP_MAX_DEPTH    = int(os.environ.get("MAX_DEPTH",    "4"))

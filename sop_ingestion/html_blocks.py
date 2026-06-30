@@ -122,6 +122,39 @@ def fetch_sanitized_html(sop: AuditSop) -> tuple[str | None, str]:
     return html, ""
 
 
+def fetch_html_or_fallback(sop: AuditSop) -> tuple[str, str, bool]:
+    """Return ``(html, reason, is_fallback)``.
+
+    Tries to serve the live source HTML first. When that is unavailable (the
+    SOP was ingested from DOCX/PDF/XLSX, the URL is localhost, or the remote
+    host is down) it synthesises clean, readable HTML from the already-parsed
+    audit tables that live in the database — so the right-hand panel of the
+    fullscreen picker always has *something* to display.
+
+    ``is_fallback`` is True when synthesised HTML is returned instead of the
+    original source document.
+    """
+    html, reason = fetch_sanitized_html(sop)
+    if html:
+        return html, reason, False
+
+    # Build HTML from the parsed audit tables.
+    blocks = _extract_from_audit_tables(sop)
+    if not blocks:
+        return "", reason or "No content available for this SOP.", False
+
+    title = _e(sop.title or f"SOP #{sop.id}")
+    pieces: list[str] = [
+        f'<div class="sop-synthesised-notice">'
+        f'<strong>Note:</strong> Showing structured data extracted during ingestion from Graph DB.'
+        f'</div>',
+        f'<h1>{title}</h1>',
+    ]
+    for block in blocks:
+        pieces.append(block["html"])
+    return "\n".join(pieces), "", True
+
+
 def get_block_by_id(sop: AuditSop, block_id: str) -> dict | None:
     """Convenience helper for the exclusion writer to auto-fill label/snippet."""
     for b in extract_blocks(sop):
@@ -146,8 +179,31 @@ _BLOCK_TAGS = {
 _SKIP_TAGS = {"script", "style", "noscript", "head", "meta", "link"}
 
 
+def _storage_auth_headers(url: str) -> dict[str, str]:
+    """Return ``X-Storage-Key`` / ``X-Storage-Secret`` headers when ``url``
+    lives on the Toystack file-storage server, otherwise return ``{}``.
+
+    This lets the Django backend fetch SOP HTML that was uploaded during
+    ingestion without a separate proxy — the URL stored in ``sop.url`` is
+    the storage retrieval URL and the auth headers are attached here.
+    """
+    import os
+    storage_base = os.environ.get("STORAGE_URL", "").rstrip("/")
+    if storage_base and url.startswith(storage_base):
+        key = os.environ.get("STORAGE_ACCESS_KEY", "")
+        secret = os.environ.get("STORAGE_SECRET", "")
+        if key and secret:
+            return {"X-Storage-Key": key, "X-Storage-Secret": secret}
+    return {}
+
+
 def _fetch_html(sop: AuditSop) -> str | None:
-    """Fetch the raw HTML for an HTTP-served SOP. Returns None on failure."""
+    """Fetch the raw HTML for an HTTP-served SOP. Returns None on failure.
+
+    Automatically adds Toystack storage auth headers when the URL points to
+    the configured ``STORAGE_URL`` (i.e. an HTML file uploaded during
+    ingestion).
+    """
     url = (sop.url or "").strip()
     if not url or not url.lower().startswith(("http://", "https://")):
         return None
@@ -157,7 +213,8 @@ def _fetch_html(sop: AuditSop) -> str | None:
         return cached
     try:
         import requests
-        r = requests.get(url, timeout=10)
+        headers = _storage_auth_headers(url)
+        r = requests.get(url, headers=headers, timeout=10)
         if r.status_code != 200:
             log.info("html_blocks: %s returned %s", url, r.status_code)
             return None

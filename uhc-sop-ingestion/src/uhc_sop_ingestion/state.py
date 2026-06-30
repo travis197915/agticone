@@ -38,6 +38,17 @@ class PipelineState(TypedDict, total=False):
     is_local: bool
     is_duplicate: bool
 
+    # ── Versioning (revision-date tracking) ───────────────────────────────────
+    canonical_url: str
+    normalized_revision_date: str
+    prior_sop_db_id: Optional[int]
+    version_action: str           # NEW | UNCHANGED | REVISED | CONTENT_CHANGE
+    version_registered: bool
+    version_diff_id: Optional[int]
+    version_diff_summary: dict
+    trigger_source: str           # manual | workflow | revision_check
+    requires_human_review: bool
+
     # ── Parse layer outputs ───────────────────────────────────────────────────
     metadata: dict              # title, effective_date, revision_date, platform…
     pre_sections: list[dict]    # [{name, order, items, annotations}]

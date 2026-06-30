@@ -388,7 +388,11 @@ def html_biz_table(state: "PipelineState", cfg: "PipelineConfig") -> dict:
         # Map header index → field name
         hmap: dict[int, str] = {}
         for i, h in enumerate(headers):
-            if "platform" in h:       hmap[i] = "platform"
+            if "revision" in h and "date" in h:
+                hmap[i] = "revision_date"
+            elif "effective" in h and "date" in h:
+                hmap[i] = "effective_date"
+            elif "platform" in h:       hmap[i] = "platform"
             elif "audience" in h:     hmap[i] = "audience"
             elif "lob" in h or "line of business" in h: hmap[i] = "lob"
             elif "product" in h:      hmap[i] = "product"
