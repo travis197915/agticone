@@ -9,6 +9,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from agent_tools.models import NodeRuleBinding, NodeToolBinding, Tool
+from builder.auth import CorebackendUser
 from builder.models import Shape, ShapeCategory, ShapeDefinition, WorkArea, Workbench, Workflow
 from execution_app.models import BatchExecutionRun, RuleEvaluation, RuleExecutionRun, ToolInvocationRecord
 from sop_ingestion.models import AuditSop, IngestionJob
@@ -17,6 +18,9 @@ from sop_ingestion.models import AuditSop, IngestionJob
 class ClaimProcessingEndpointTests(TestCase):
     def setUp(self) -> None:
         self.client = APIClient()
+        self.client.force_authenticate(
+            user=CorebackendUser(id="test-user", email="t@example.com", role="MEMBER"),
+        )
         self.workflow = Workflow.objects.create(name="WF", slug=f"wf-{uuid.uuid4().hex[:8]}")
         self.batch = BatchExecutionRun.objects.create(
             workflow=self.workflow,

@@ -29,7 +29,6 @@ from django.http import StreamingHttpResponse
 from django.utils import timezone as dj_timezone
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser
-from rest_framework.permissions import AllowAny
 from rest_framework.renderers import BaseRenderer
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -794,8 +793,6 @@ class RunBatchView(APIView):
     finishes — but the work no longer runs inside the gunicorn worker.
     """
     parser_classes = [MultiPartParser]
-    permission_classes = [AllowAny]
-
     # Bound on how long the sync HTTP request will wait. Overridable via env
     # for CI/large batches; align with the gunicorn / proxy timeout in prod.
     _DEFAULT_TIMEOUT_SEC = 600
@@ -875,8 +872,6 @@ class RunBatchView(APIView):
 class BatchLatestView(APIView):
     """GET /api/execute/batches/latest/ — most recent batch from shared DB."""
 
-    permission_classes = [AllowAny]
-
     def get(self, _request: Request) -> Response:
         batch = (
             BatchExecutionRun.objects
@@ -891,8 +886,6 @@ class BatchLatestView(APIView):
 
 
 class BatchDetailView(APIView):
-    permission_classes = [AllowAny]
-
     def get(self, _request: Request, batch_id: str) -> Response:
         try:
             batch = BatchExecutionRun.objects.prefetch_related("runs").get(id=batch_id)
@@ -969,7 +962,6 @@ def _avg_processing_time_min(qs) -> float:
 class RunListView(APIView):
     """GET /api/execute/runs/ — all processed claims across every batch."""
 
-    permission_classes = [AllowAny]
     _DEFAULT_LIMIT = 25
     _MAX_LIMIT = 200
 
@@ -1004,8 +996,6 @@ class RunListView(APIView):
 
 
 class RunDetailView(APIView):
-    permission_classes = [AllowAny]
-
     def get(self, _request: Request, run_id: str) -> Response:
         try:
             run = (RuleExecutionRun.objects
@@ -1122,8 +1112,6 @@ def _apply_review_status(run: RuleExecutionRun, review_status: str) -> RuleExecu
 class RunReviewApproveView(APIView):
     """POST /api/execute/runs/<run_id>/review/approve/"""
 
-    permission_classes = [AllowAny]
-
     def post(self, request: Request, run_id: str) -> Response:
         try:
             run = RuleExecutionRun.objects.get(id=run_id)
@@ -1143,8 +1131,6 @@ class RunReviewApproveView(APIView):
 class RunReviewRejectView(APIView):
     """POST /api/execute/runs/<run_id>/review/reject/"""
 
-    permission_classes = [AllowAny]
-
     def post(self, request: Request, run_id: str) -> Response:
         try:
             run = RuleExecutionRun.objects.get(id=run_id)
@@ -1163,8 +1149,6 @@ class RunReviewRejectView(APIView):
 
 class ClaimReviewApproveView(APIView):
     """POST /api/claims/<claim_id>/review/approve/"""
-
-    permission_classes = [AllowAny]
 
     def post(self, request: Request, claim_id: str) -> Response:
         run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
@@ -1188,8 +1172,6 @@ class ClaimReviewApproveView(APIView):
 
 class ClaimReviewRejectView(APIView):
     """POST /api/claims/<claim_id>/review/reject/"""
-
-    permission_classes = [AllowAny]
 
     def post(self, request: Request, claim_id: str) -> Response:
         run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
@@ -1218,8 +1200,6 @@ class RunReviewStatusView(APIView):
     ``{"reviewStatus": "in_progress"}``).
     """
 
-    permission_classes = [AllowAny]
-
     def patch(self, request: Request, run_id: str) -> Response:
         try:
             run = RuleExecutionRun.objects.get(id=run_id)
@@ -1242,8 +1222,6 @@ class ClaimReviewStatusView(APIView):
     Same as ``RunReviewStatusView`` but resolves the run via ``claim_id`` and
     optional ``?run_id=`` / ``?batch_id=`` query params.
     """
-
-    permission_classes = [AllowAny]
 
     def patch(self, request: Request, claim_id: str) -> Response:
         run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
@@ -1275,8 +1253,6 @@ class RunNodesView(APIView):
 
     No new tables; this is purely a derived view.
     """
-    permission_classes = [AllowAny]
-
     def get(self, _request: Request, run_id: str) -> Response:
         try:
             run = (RuleExecutionRun.objects
@@ -1306,8 +1282,6 @@ class RunNodesView(APIView):
 
 class ClaimSummaryView(APIView):
     """GET /api/claims/<claim_id>/summary/ — header + outer tools + summaries."""
-
-    permission_classes = [AllowAny]
 
     def get(self, request: Request, claim_id: str) -> Response:
         from .models import ClaimTrace
@@ -1351,8 +1325,6 @@ class ClaimSummaryView(APIView):
 class ClaimAgentsView(APIView):
     """GET /api/claims/<claim_id>/agents/ — per-node execution + evaluations."""
 
-    permission_classes = [AllowAny]
-
     def get(self, request: Request, claim_id: str) -> Response:
         from .models import ClaimTrace
 
@@ -1384,8 +1356,6 @@ class ClaimAgentsView(APIView):
 
 class ClaimProcessingView(APIView):
     """GET /api/claims/<claim_id>/processing/ — legacy full snapshot (all tabs)."""
-
-    permission_classes = [AllowAny]
 
     def get(self, request: Request, claim_id: str) -> Response:
         run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
@@ -1468,7 +1438,6 @@ class ClaimTraceView(APIView):
     claim lookup; ``?batch_id=`` scopes it; ``?download=1`` returns the JSON as
     a file attachment. ``kind`` is set per URL route ("trace" | "explainability").
     """
-    permission_classes = [AllowAny]
     kind = "trace"
 
     def get(self, request: Request, claim_id: str) -> Response:
@@ -1536,8 +1505,6 @@ class RunBatchAsyncView(APIView):
     receive per-Shape / per-rule / per-claim events as they happen.
     """
     parser_classes = [MultiPartParser]
-    permission_classes = [AllowAny]
-
     def post(self, request: Request, workflow_id: str) -> Response:
         err, batch_id = _dispatch_batch(request=request, workflow_id=workflow_id)
         if err is not None:
@@ -1604,7 +1571,6 @@ class BatchEventsView(APIView):
     Terminates when a ``summary`` or ``error`` event arrives (the task's
     final publish) or when the client disconnects.
     """
-    permission_classes = [AllowAny]
     renderer_classes = [_EventStreamRenderer]
 
     def get(self, _request: Request, batch_id: str) -> StreamingHttpResponse:
