@@ -17,9 +17,8 @@ def invoke_tool(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Run a single tool by name. Never raises; failures go in the result.
 
     Routing order:
-    1. If an active ``McpServerConfig`` exists and the tool has an
-       ``mcp_path`` in ``Tool.metadata``, call that external endpoint
-       (``base_url + path``) live.
+    1. If ``MCP_SERVER_BASE_URL`` (env) or an active ``McpServerConfig`` (DB)
+       exists and the tool has ``metadata['mcp_path']``, call ``base_url + path``.
     2. Otherwise fall back to the in-process ``agent_tools`` implementation.
     """
     from agent_tools.registry import get_tool
