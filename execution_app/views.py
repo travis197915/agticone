@@ -1482,7 +1482,7 @@ def _execution_upload_dir() -> Path:
     directory (matches Django's default upload behaviour).
     """
     media = getattr(settings, "MEDIA_ROOT", "") or ""
-    base = Path(media) if media else Path("/tmp")
+    base = Path(media) if media else Path(tempfile.gettempdir())
     target = base / "execution_uploads"
     target.mkdir(parents=True, exist_ok=True)
     return target
