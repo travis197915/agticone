@@ -342,6 +342,61 @@ MATCHING CONTRACT (read this BEFORE deciding `matched`)
 """
 
 
+# Output-format contract. This is fully static — it contains no per-call data —
+# so it lives in the (cacheable) system prompt rather than being re-templated
+# into every rule's prompt. Wording that used to say "above" (referring to the
+# old single-string layout) is phrased order-neutrally so it stays accurate now
+# that the RULE / ROUTING sections follow the claim in the user turn.
+_OUTPUT_SCHEMA = """\
+Return a JSON object. These keys are REQUIRED:
+  matched     boolean — true iff the rule's CONDITION is satisfied by the claim
+                (per the MATCHING CONTRACT; the `action` never makes it true)
+  reasoning   string  — concise explanation citing the claim fields / tool results you used
+  confidence  number  — 0.0 to 1.0
+
+You SHOULD also include these OPTIONAL keys to support an audit trail (omit
+or leave empty only when you genuinely cannot determine them):
+  status        string — one of "Met", "Not-Met", "Inconclusive". Use
+                "Inconclusive" when required data is missing and could not be
+                retrieved; "Met" when the condition holds; "Not-Met" otherwise.
+  applicable    boolean — false ONLY when an `applicable_when` was provided for
+                this rule and this claim does not satisfy it (the rule does not
+                apply and should be skipped, NOT marked Not-Met). Defaults to true.
+  navigation    object — where the audit should go next, mirroring the SOP's
+                routing. Shape: {"op": "goto"|"stop"|"next", "step_number": <int>}.
+                Use "goto" with the target step_number when the SOP says to skip
+                ahead (e.g. "proceed to step 8 directly"); "stop" when the path
+                is out of scope / auditing should halt; omit or "next" for the
+                normal sequential flow.
+  network_basis string — PROVIDER-SELECTION rules only: how you determined
+                INN vs OON — "provider_match" (you matched the billed provider
+                against FACETS provider-details records on Tax ID/NPI/name),
+                "literal_indicator" (you used only CLCL_NTWK_IND / group_model
+                face value), "inconclusive" (the provider-details records needed
+                were missing), or "not_applicable". Be honest: if a deny hinges
+                on OON and you did NOT confirm it via a provider-record match,
+                use "literal_indicator" or "inconclusive" — the engine will then
+                route the claim to manual review instead of auto-denying.
+  evidence_refs array of strings — dotted paths to the exact claim/tool fields
+                you relied on, with their values, e.g.
+                "facets_get_summary.body.Data.ClaimSummary.REC_CIV8.SBSB_ID=371468948".
+  conditions    array of objects, one per atomic condition you evaluated, each:
+                {"condition": <text>, "evaluated": <bool>,
+                 "using_fields": [<dotted field paths>],
+                 "values": {<field path>: <value>, "notes": <optional text>}}
+"""
+
+
+# Fully static system prompt: role framing + matching contract + output schema.
+# Identical for every rule of every claim, so on the Anthropic path it is sent
+# once as a cache_control block and billed at the cache rate thereafter.
+_SYSTEM_PROMPT = (
+    "You are a claims-audit policy evaluator. Decide whether the SOP rule "
+    "provided in the next message applies to the given claim.\n\n"
+    f"{_MATCHING_CONTRACT}\n{_OUTPUT_SCHEMA}"
+)
+
+
 def _domain_context(rule: dict[str, Any]) -> str:
     """Return scoped domain guidance for provider-selection rules, else "".
 
@@ -477,10 +532,20 @@ def evaluate_one_rule(cfg: EngineConfig, *, rule: dict[str, Any],
     # can honor a prioritized choice ladder.
     prior_section = _prior_findings_section(prior_findings)
 
-    prompt = f"""You are a claims-audit policy evaluator. Decide whether the
-following SOP rule applies to the given claim.
+    # Prompt is split into three parts so the invariant portions can be cached
+    # by Anthropic (billed at ~10% on repeat calls within one claim's run):
+    #   • system_prompt  — role + matching contract + output schema (fully static)
+    #   • claim_block     — the parsed claim (identical across this claim's rules)
+    #   • tail            — the per-rule content that actually changes each call
+    # The content is byte-for-byte the same as before, only reordered so the
+    # cache prefix is stable; the verdict/rationale is unaffected.
+    claim_block = (
+        "CLAIM\n"
+        "-----\n"
+        f"{json.dumps(claim, default=str, indent=2)}"
+    )
 
-RULE
+    tail = f"""RULE
 ----
 key:            {rule['key']}
 source:         {rule['source']}
@@ -488,55 +553,13 @@ section:        {rule.get('section_label', '')}
 decision_type:  {rule.get('decision_type', '')}
 condition:      {rule.get('condition', '')}
 action:         {rule.get('action', '')}
-
-{_MATCHING_CONTRACT}{mapped_section}{lob_section}{routing_section}{domain_section}{sop_context_section}{prior_section}
-CLAIM
------
-{json.dumps(claim, default=str, indent=2)}
-
+{mapped_section}{lob_section}{routing_section}{domain_section}{sop_context_section}{prior_section}
 TOOL RESULTS (already fetched on your behalf; may be empty)
 -----------------------------------------------------------
-{json.dumps(tool_context, default=str, indent=2)}
+{json.dumps(tool_context, default=str, indent=2)}"""
 
-Return a JSON object. These keys are REQUIRED:
-  matched     boolean — true iff the rule's CONDITION is satisfied by the claim
-                (per the MATCHING CONTRACT above; the `action` never makes it true)
-  reasoning   string  — concise explanation citing the claim fields / tool results you used
-  confidence  number  — 0.0 to 1.0
-
-You SHOULD also include these OPTIONAL keys to support an audit trail (omit
-or leave empty only when you genuinely cannot determine them):
-  status        string — one of "Met", "Not-Met", "Inconclusive". Use
-                "Inconclusive" when required data is missing and could not be
-                retrieved; "Met" when the condition holds; "Not-Met" otherwise.
-  applicable    boolean — false ONLY when an `applicable_when` was given above
-                and this claim does not satisfy it (the rule does not apply and
-                should be skipped, NOT marked Not-Met). Defaults to true.
-  navigation    object — where the audit should go next, mirroring the SOP's
-                routing. Shape: {{"op": "goto"|"stop"|"next", "step_number": <int>}}.
-                Use "goto" with the target step_number when the SOP says to skip
-                ahead (e.g. "proceed to step 8 directly"); "stop" when the path
-                is out of scope / auditing should halt; omit or "next" for the
-                normal sequential flow.
-  network_basis string — PROVIDER-SELECTION rules only: how you determined
-                INN vs OON — "provider_match" (you matched the billed provider
-                against FACETS provider-details records on Tax ID/NPI/name),
-                "literal_indicator" (you used only CLCL_NTWK_IND / group_model
-                face value), "inconclusive" (the provider-details records needed
-                were missing), or "not_applicable". Be honest: if a deny hinges
-                on OON and you did NOT confirm it via a provider-record match,
-                use "literal_indicator" or "inconclusive" — the engine will then
-                route the claim to manual review instead of auto-denying.
-  evidence_refs array of strings — dotted paths to the exact claim/tool fields
-                you relied on, with their values, e.g.
-                "facets_get_summary.body.Data.ClaimSummary.REC_CIV8.SBSB_ID=371468948".
-  conditions    array of objects, one per atomic condition you evaluated, each:
-                {{"condition": <text>, "evaluated": <bool>,
-                 "using_fields": [<dotted field paths>],
-                 "values": {{<field path>: <value>, "notes": <optional text>}}}}
-"""
     verdict, meta = llm_call(
-        cfg, prompt,
+        cfg, tail,
         agent_name=f"rule_eval[{rule['key']}]",
         stage=stage,
         fallback={"matched": False, "reasoning": "LLM fallback — all attempts failed",
@@ -544,5 +567,7 @@ or leave empty only when you genuinely cannot determine them):
         provider="anthropic",
         expected_type=dict,
         required_keys=_EVAL_REQUIRED,
+        system_prompt=_SYSTEM_PROMPT,
+        cache_prefix=claim_block,
     )
     return verdict, meta
