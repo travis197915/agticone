@@ -103,6 +103,15 @@ class RuleExecutionRun(_UUIDPK):
     # Identified Line of Business for this claim (SOW deliverable):
     # {"product", "network", "label", "source"}. Empty for legacy/failed runs.
     claim_lob = models.JSONField(default=dict, blank=True)
+    # LLM cost snapshot for this claim, computed at end of run from
+    # sop_ingestion.LLMCallLog rows tagged with this run_id. Denormalized so
+    # dashboards can sort/filter by spend without scanning the LLMCallLog table.
+    # ``cost_breakdown`` carries {"<provider>/<model>": {"calls", "prompt_tokens",
+    # "completion_tokens", "cost_usd"}} for explainability.
+    total_prompt_tokens = models.BigIntegerField(default=0)
+    total_completion_tokens = models.BigIntegerField(default=0)
+    total_cost_usd = models.DecimalField(max_digits=10, decimal_places=4, default=0)
+    cost_breakdown = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "execution_rule_run"

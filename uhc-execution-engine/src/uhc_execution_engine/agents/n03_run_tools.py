@@ -15,6 +15,7 @@ from typing import Any
 
 from ..claim_fetcher import FETCH_TOOL, PARSE_TOOL
 from ..config import get_config
+from ..memory import lookup_reusable_tool
 from ..state import ExecutionState
 from ..tool_runner import invoke_tool
 
@@ -104,21 +105,46 @@ def run_tools(state: ExecutionState) -> dict:
         args = _merge_args(tb["args_template"], claim)
         groups.setdefault(_dedup_key(tb["tool_name"], args), []).append((tb, args))
 
+    # Persistent per-claim context: serve the result from ClaimMemory when the
+    # same tool+args succeeded for this claim within the TTL. This avoids the
+    # live call entirely — the outcome carries a ``reused_from_run`` marker that
+    # the persist layer writes to ToolInvocationRecord.reused_from_run.
+    prior_context = state.get("prior_context") or {}
+    outcomes: dict[str, dict[str, Any]] = {}
+    live_groups: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    reused_keys: set[str] = set()
+    for key, members in groups.items():
+        rep_tb, rep_args = members[0]
+        remembered = lookup_reusable_tool(cfg, prior_context,
+                                          rep_tb["tool_name"], rep_args)
+        if remembered is not None:
+            outcomes[key] = {
+                "ok": True,
+                "tool": rep_tb["tool_name"],
+                "args": rep_args,
+                "result": remembered["result"],
+                "error": "",
+                "duration_ms": 0,
+                "reused_from_run": remembered.get("run_id") or "",
+            }
+            reused_keys.add(key)
+        else:
+            live_groups[key] = members
+
     def _run_group(rep_tool: str, rep_args: dict[str, Any]) -> dict[str, Any]:
         return invoke_tool(rep_tool, rep_args)
 
-    # Invoke the distinct calls in parallel. Propagate the contextvars (run_id /
-    # batch_id) so LLMCallLog stamping + SSE publishing keep working in workers.
-    # NOTE: each task gets its OWN copied Context — a single Context object
-    # cannot be entered by more than one thread at a time (RuntimeError), which
-    # would otherwise serialize everything.
-    workers = max(1, min(int(getattr(cfg, "tool_prefetch_workers", 8) or 8), len(groups) or 1))
-    outcomes: dict[str, dict[str, Any]] = {}
-    if groups:
-        if workers > 1 and len(groups) > 1:
+    # Invoke the distinct LIVE calls in parallel. Propagate the contextvars
+    # (run_id / batch_id) so LLMCallLog stamping + SSE publishing keep working
+    # in workers. NOTE: each task gets its OWN copied Context — a single Context
+    # object cannot be entered by more than one thread at a time (RuntimeError),
+    # which would otherwise serialize everything.
+    workers = max(1, min(int(getattr(cfg, "tool_prefetch_workers", 8) or 8), len(live_groups) or 1))
+    if live_groups:
+        if workers > 1 and len(live_groups) > 1:
             with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
                 futs = {}
-                for key, members in groups.items():
+                for key, members in live_groups.items():
                     rep_tb, rep_args = members[0]
                     task_ctx = contextvars.copy_context()
                     futs[ex.submit(task_ctx.run, _run_group, rep_tb["tool_name"], rep_args)] = key
@@ -127,12 +153,12 @@ def run_tools(state: ExecutionState) -> dict:
                     try:
                         outcomes[key] = fut.result()
                     except Exception as exc:  # pragma: no cover — defensive
-                        rep_tb, rep_args = groups[key][0]
+                        rep_tb, rep_args = live_groups[key][0]
                         outcomes[key] = {"ok": False, "tool": rep_tb["tool_name"],
                                          "args": rep_args, "result": None,
                                          "error": str(exc), "duration_ms": 0}
         else:
-            for key, members in groups.items():
+            for key, members in live_groups.items():
                 rep_tb, rep_args = members[0]
                 outcomes[key] = _run_group(rep_tb["tool_name"], rep_args)
 
@@ -149,6 +175,7 @@ def run_tools(state: ExecutionState) -> dict:
                 "result": out["result"],
                 "error": out["error"],
                 "duration_ms": out["duration_ms"],
+                "reused_from_run": out.get("reused_from_run") or "",
             }
             invocations.append(record)
             results_by_binding[tb["binding_id"]] = record

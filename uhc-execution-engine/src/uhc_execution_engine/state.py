@@ -23,6 +23,13 @@ class ExecutionState(TypedDict, total=False):
     tools_by_rule_key: dict[str, list[dict[str, Any]]]
     tools_by_shape: dict[str, list[dict[str, Any]]]
 
+    # Persistent per-claim context loaded at pipeline start (see memory.py).
+    # Empty dict when memory is disabled or this claim has no prior runs.
+    prior_context: dict[str, Any]
+    # Structured live-vs-prior disagreements recorded this run; appended to
+    # ClaimMemory.drift on persist.
+    drift_entries: list[dict[str, Any]]
+
     # run_tools outputs (binding_id -> tool result)
     tool_results: dict[str, dict[str, Any]]
     tool_invocations: list[dict[str, Any]]        # ordered log for response/persistence
