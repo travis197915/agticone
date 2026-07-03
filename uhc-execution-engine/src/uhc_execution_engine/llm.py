@@ -36,6 +36,17 @@ except ValueError:
     _LLM_CONCURRENCY = 10
 _llm_semaphore = threading.BoundedSemaphore(_LLM_CONCURRENCY)
 
+# Anthropic prompt caching. When enabled (default), a caller may pass a static
+# ``system_prompt`` and/or a per-claim-invariant ``cache_prefix`` to ``llm_call``;
+# on the direct-Anthropic path those blocks are marked ``cache_control:
+# ephemeral`` so their tokens are billed at the cache rate (~10%) on every call
+# after the first within the 5-minute TTL. This is a pure billing optimization —
+# the model receives byte-identical content, so verdicts/rationale are unchanged.
+# Set RULE_ENGINE_PROMPT_CACHE=0 to disable and fall back to a single flat prompt.
+_PROMPT_CACHE_ENABLED = os.environ.get("RULE_ENGINE_PROMPT_CACHE", "1").strip() not in (
+    "0", "false", "False", "no", "",
+)
+
 
 # ── Per-claim / per-batch context vars ───────────────────────────────────────
 #
@@ -259,22 +270,35 @@ def llm_call(
     expected_type: type = dict,
     required_keys: list[str] | None = None,
     max_tokens: int | None = None,
+    system_prompt: str | None = None,
+    cache_prefix: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Run a guarded LLM call.
 
     Returns ``(parsed_data, meta)`` where ``meta`` carries the provider/model
     that ultimately succeeded plus total duration; useful for `RuleEvaluation`
     persistence rows.
+
+    ``system_prompt`` (fully static across every call) and ``cache_prefix``
+    (invariant across one claim's many rule evaluations) are optional. On the
+    direct-Anthropic path they are sent as ``cache_control: ephemeral`` blocks
+    so their tokens bill at the cache rate on repeat calls; ``prompt`` carries
+    the small per-rule tail that changes each call. Backends that take a single
+    string (registry gateway, OpenAI fallback) receive the three concatenated in
+    the same logical order, so behavior is unchanged when caching is off/unused.
     """
     from uhc_llm import invoke_prompt, is_registry_backend
 
     max_tokens = max_tokens or cfg.llm_max_tokens
     meta: dict[str, Any] = {"provider": "", "model": "", "ms": 0, "attempts": 0}
 
+    # Flat single-string form for backends that don't support cache blocks.
+    flat_prompt = "\n\n".join(p for p in (system_prompt, cache_prefix, prompt) if p)
+
     if is_registry_backend():
         from uhc_llm.registry import load_agent_model_map, resolve_registry_model_name
 
-        used_prompt = prompt + (
+        used_prompt = flat_prompt + (
             "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
         )
         if expected_type is list:
@@ -370,7 +394,7 @@ def llm_call(
         logger.error("llm_call [%s]: registry attempts failed; returning fallback", agent_name)
         return fallback, meta
 
-    from langchain_core.messages import HumanMessage
+    from langchain_core.messages import HumanMessage, SystemMessage
 
     alt_provider = "openai" if provider == "anthropic" else "anthropic"
     primary_fn = _make_anthropic_llm if provider == "anthropic" else _make_openai_llm
@@ -378,18 +402,58 @@ def llm_call(
     primary_model = cfg.anthropic_model if provider == "anthropic" else cfg.openai_model
     fallback_model = cfg.openai_model if alt_provider == "openai" else cfg.anthropic_model
 
+    # ``prompt`` here is the per-rule *tail* (the only part that changes each
+    # call). The JSON-format reminder must stay at the very end, after the tail.
     if provider == "anthropic":
         prompt = prompt + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
     elif provider == "openai" and expected_type is list:
         prompt = prompt + '\n\nWrap the array in a JSON object: {"items": [...]}'
 
-    def _attempt(make_fn, prov, model, used_prompt, label):
+    def _messages_for(prov: str, tail: str):
+        """Build the message list for one attempt.
+
+        On the Anthropic primary path (when caching is enabled and a static
+        system prompt / per-claim prefix was supplied) the invariant blocks are
+        emitted as ``cache_control: ephemeral`` so they bill at the cache rate.
+        Every other path concatenates the pieces into plain text in the same
+        logical order — identical content, no behavioral change.
+        """
+        cache_this = (
+            _PROMPT_CACHE_ENABLED
+            and prov == "anthropic"
+            and bool(system_prompt or cache_prefix)
+        )
+        if cache_this:
+            msgs: list[Any] = []
+            if system_prompt:
+                msgs.append(SystemMessage(content=[{
+                    "type": "text", "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }]))
+            human_blocks: list[dict[str, Any]] = []
+            if cache_prefix:
+                human_blocks.append({
+                    "type": "text", "text": cache_prefix,
+                    "cache_control": {"type": "ephemeral"},
+                })
+            human_blocks.append({"type": "text", "text": tail})
+            msgs.append(HumanMessage(content=human_blocks))
+            return msgs
+        # Flat path: keep system separate but send everything as plain text.
+        msgs = []
+        if system_prompt:
+            msgs.append(SystemMessage(content=system_prompt))
+        human = "\n\n".join(p for p in (cache_prefix, tail) if p)
+        msgs.append(HumanMessage(content=human))
+        return msgs
+
+    def _attempt(make_fn, prov, model, tail, label):
         t0 = time.time()
         meta["attempts"] += 1
         try:
             llm = make_fn(cfg, max_tokens)
             with _llm_semaphore:
-                resp = llm.invoke([HumanMessage(content=used_prompt)])
+                resp = llm.invoke(_messages_for(prov, tail))
             inp, out = _token_usage(resp)
             ms = int((time.time() - t0) * 1000)
             _log_llm_call(agent_name=f"{agent_name}[{label}]", stage=stage,
@@ -412,23 +476,23 @@ def llm_call(
             return None, str(exc)
 
     last_error = ""
-    current_prompt = prompt
+    current_tail = prompt
     for attempt in range(1, cfg.llm_retries + 1):
         if last_error:
-            current_prompt = (
+            current_tail = (
                 f"{prompt}\n\n[Previous attempt failed: {last_error}. "
                 "Fix the JSON format and try again.]"
             )
         data, err = _attempt(primary_fn, provider, primary_model,
-                             current_prompt, f"p{attempt}")
+                             current_tail, f"p{attempt}")
         if data is not None:
             return data, meta
         last_error = err or "unknown error"
 
-    fb_prompt = prompt
+    fb_tail = prompt
     if alt_provider == "anthropic":
-        fb_prompt = prompt + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
-    data, _err = _attempt(fallback_fn, alt_provider, fallback_model, fb_prompt, "fallback")
+        fb_tail = prompt + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+    data, _err = _attempt(fallback_fn, alt_provider, fallback_model, fb_tail, "fallback")
     if data is not None:
         return data, meta
 
