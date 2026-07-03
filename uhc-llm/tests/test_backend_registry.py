@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -149,6 +150,58 @@ def test_no_model_raises_when_agent_map_missing(monkeypatch):
 
     with pytest.raises(RuntimeError, match="No model configured"):
         resolve_registry_model_name("unknown_agent")
+
+
+def test_resolve_api_key_model_from_env(monkeypatch):
+    from uhc_llm.backend import DEFAULT_ANTHROPIC_MODEL, resolve_api_key_model
+
+    monkeypatch.setenv("LLM_BACKEND", "api_key")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-from-env")
+    assert resolve_api_key_model("anthropic") == "claude-from-env"
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    assert resolve_api_key_model("anthropic") == DEFAULT_ANTHROPIC_MODEL
+
+
+def test_resolve_ingestion_job_llm_api_key_anthropic(monkeypatch):
+    from uhc_llm.backend import resolve_ingestion_job_llm
+
+    monkeypatch.setenv("LLM_BACKEND", "api_key")
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-test-model")
+
+    assert resolve_ingestion_job_llm() == ("anthropic", "claude-test-model")
+
+
+def test_resolve_ingestion_job_llm_api_key_openai(monkeypatch):
+    from uhc_llm.backend import resolve_ingestion_job_llm
+
+    monkeypatch.setenv("LLM_BACKEND", "api_key")
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-test")
+
+    assert resolve_ingestion_job_llm() == ("openai", "gpt-test")
+
+
+def test_resolve_ingestion_job_llm_registry(monkeypatch):
+    from uhc_llm.backend import resolve_ingestion_job_llm
+
+    monkeypatch.setenv("LLM_BACKEND", "registry")
+    monkeypatch.setenv("MODEL_REGISTRY_JSON", json.dumps(SAMPLE_REGISTRY))
+    monkeypatch.setenv("LLM_MODEL", "gpt-5-mini")
+
+    assert resolve_ingestion_job_llm() == ("anthropic", "gpt-5-mini")
+
+
+def test_apply_job_llm_env_sets_anthropic_model_in_api_key_mode(monkeypatch):
+    from uhc_llm.backend import apply_job_llm_env
+
+    monkeypatch.setenv("LLM_BACKEND", "api_key")
+    apply_job_llm_env(
+        llm_provider="anthropic",
+        llm_model="claude-job-model",
+    )
+    assert os.environ["ANTHROPIC_MODEL"] == "claude-job-model"
+    assert os.environ["LLM_MODEL"] == "claude-job-model"
 
 
 def test_apply_job_llm_env_skips_provider_model_in_registry_mode(monkeypatch):

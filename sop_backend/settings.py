@@ -253,10 +253,8 @@ if SOP_REVISION_CHECK_ENABLED:
     }
 
 # ── Pipeline defaults (picked up by PipelineConfig.from_env()) ────────────────
-SOP_MAX_DEPTH    = int(os.environ.get("MAX_DEPTH",    "4"))
-SOP_MAX_DOCS     = int(os.environ.get("MAX_DOCS",     "200"))
-SOP_LLM_PROVIDER = os.environ.get("LLM_PROVIDER",    "anthropic")
-SOP_LLM_MODEL    = os.environ.get("LLM_MODEL",        "claude-3-5-sonnet-20241022")
+SOP_MAX_DEPTH = int(os.environ.get("MAX_DEPTH", "4"))
+SOP_MAX_DOCS  = int(os.environ.get("MAX_DOCS", "200"))
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Console + rotating file for the execution engine and execution_app so

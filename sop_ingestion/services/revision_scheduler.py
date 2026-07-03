@@ -47,12 +47,15 @@ def _job_defaults_from_sop(sop: AuditSop | None) -> dict[str, Any]:
             "llm_provider": job.llm_provider,
             "llm_model": job.llm_model,
         }
+    from uhc_llm.backend import resolve_ingestion_job_llm
+
+    llm_provider, llm_model = resolve_ingestion_job_llm()
     return {
         "workflow_id": None,
         "max_depth": getattr(settings, "SOP_MAX_DEPTH", 4),
         "max_docs": getattr(settings, "SOP_MAX_DOCS", 200),
-        "llm_provider": getattr(settings, "SOP_LLM_PROVIDER", "anthropic"),
-        "llm_model": getattr(settings, "SOP_LLM_MODEL", "claude-sonnet-4-5-20250929"),
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
     }
 
 

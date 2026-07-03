@@ -170,6 +170,12 @@ class PipelineConfig:
     @classmethod
     def from_env(cls, env_path: str | Path | None = None) -> "PipelineConfig":
         """Load .env then build config from environment variables."""
+        from uhc_llm.backend import (
+            DEFAULT_ANTHROPIC_MODEL,
+            DEFAULT_OPENAI_MODEL,
+            get_llm_backend,
+        )
+
         load_env(env_path)
         return cls(
             # Postgres
@@ -207,9 +213,9 @@ class PipelineConfig:
             # LLM — dual provider
             openai_api_key=_env("OPENAI_API_KEY"),
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),
-            openai_model=_env("OPENAI_MODEL", "gpt-4o"),
-            anthropic_model=_env("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
-            llm_backend=_env("LLM_BACKEND"),
+            openai_model=_env("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+            anthropic_model=_env("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL),
+            llm_backend=get_llm_backend(),
             llm_model=_env("LLM_MODEL") or _env("REGISTRY_DEFAULT_MODEL"),
             llm_provider=_env("LLM_PROVIDER", "anthropic"),
             # Pipeline
@@ -274,8 +280,10 @@ def get_llm(cfg: PipelineConfig, provider: str | None = None):
             max_tokens=4096,
         )
     from langchain_openai import ChatOpenAI
+    from uhc_llm.backend import DEFAULT_OPENAI_MODEL
+
     return ChatOpenAI(
-        model=cfg.openai_model or "gpt-4o",
+        model=cfg.openai_model or DEFAULT_OPENAI_MODEL,
         api_key=cfg.openai_api_key,
         max_tokens=4096,
     )

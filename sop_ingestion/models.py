@@ -19,6 +19,18 @@ class TriggerSource(models.TextChoices):
     CLI      = "cli",      "CLI / script"
 
 
+def _default_job_llm_provider() -> str:
+    from uhc_llm.backend import resolve_ingestion_job_llm
+
+    return resolve_ingestion_job_llm()[0]
+
+
+def _default_job_llm_model() -> str:
+    from uhc_llm.backend import resolve_ingestion_job_llm
+
+    return resolve_ingestion_job_llm()[1]
+
+
 class IngestionJob(models.Model):
     job_id         = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     # Optional FK to the builder Workflow that triggered this ingestion.
@@ -38,8 +50,8 @@ class IngestionJob(models.Model):
     docs_failed    = models.PositiveIntegerField(default=0)
     max_depth      = models.PositiveSmallIntegerField(default=4)
     max_docs       = models.PositiveIntegerField(default=200)
-    llm_provider   = models.CharField(max_length=32, default="anthropic")
-    llm_model      = models.CharField(max_length=64,  default="claude-sonnet-4-5-20250929")
+    llm_provider   = models.CharField(max_length=32, default=_default_job_llm_provider)
+    llm_model      = models.CharField(max_length=64, default=_default_job_llm_model)
     trigger_source = models.CharField(
         max_length=32,
         choices=TriggerSource.choices,

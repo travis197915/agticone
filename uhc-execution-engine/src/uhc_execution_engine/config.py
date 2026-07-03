@@ -73,12 +73,14 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @lru_cache(maxsize=1)
 def get_config() -> EngineConfig:
+    from uhc_llm.backend import DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL
+
     _load_env()
     return EngineConfig(
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
-        anthropic_model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
+        anthropic_model=os.environ.get("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL),
         openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
-        openai_model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
+        openai_model=os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
         llm_max_tokens=int(os.environ.get("RULE_ENGINE_MAX_TOKENS", "4096")),
         llm_model=os.environ.get("LLM_MODEL", "") or os.environ.get("REGISTRY_DEFAULT_MODEL", ""),
         lazy_tools=_env_bool("RULE_ENGINE_LAZY_TOOLS", False),
