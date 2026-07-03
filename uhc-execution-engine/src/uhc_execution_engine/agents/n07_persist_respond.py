@@ -155,9 +155,6 @@ def _persist(state: ExecutionState) -> None:
                 injected_context=ev.get("injected_context"),
                 llm_provider=ev["llm_provider"],
                 llm_ms=ev["llm_ms"],
-                overridden=bool(ev.get("overridden")),
-                live_result=ev.get("live_result"),
-                injected_context=ev.get("injected_context"),
             )
             for ev in all_evals
         ])
