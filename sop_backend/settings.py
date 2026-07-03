@@ -299,5 +299,11 @@ LOGGING = {
             "level":     "INFO",
             "propagate": False,
         },
+        # In-process agent_tools HTTP helper (timeouts/retries during claim tools).
+        "agent_tools.http": {
+            "handlers":  ["console", "engine_file"],
+            "level":     "INFO",
+            "propagate": False,
+        },
     },
 }

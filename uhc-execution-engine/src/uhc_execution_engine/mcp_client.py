@@ -20,6 +20,8 @@ from typing import Any, Literal
 
 import requests
 
+from .tool_telemetry import classify_tool_error
+
 logger = logging.getLogger(__name__)
 
 ConfigSource = Literal["env", "db", "none"]
@@ -101,6 +103,35 @@ def active_config_source() -> ConfigSource:
     return "none"
 
 
+def mcp_timeout_seconds() -> int:
+    """Configured per-request MCP HTTP timeout (seconds)."""
+    cfg = _active_config()
+    if not cfg:
+        try:
+            return int(os.environ.get("MCP_SERVER_TIMEOUT_SECONDS", "30"))
+        except ValueError:
+            return 30
+    return int(cfg.get("timeout") or 30)
+
+
+def parallel_tool_invoke_timeout_seconds() -> float | None:
+    """Upper bound for one parallel prefetch in ``run_tools``.
+
+    Defaults to ``MCP timeout × max attempts + slack`` so hung MCP calls do
+    not block the whole claim forever. Set ``RULE_ENGINE_TOOL_INVOKE_TIMEOUT_SECONDS=0``
+    to disable (wait indefinitely).
+    """
+    raw = os.environ.get("RULE_ENGINE_TOOL_INVOKE_TIMEOUT_SECONDS", "").strip()
+    if raw.lower() in {"0", "off", "none", "false"}:
+        return None
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return float(mcp_timeout_seconds() * _MCP_MAX_ATTEMPTS + 10)
+
+
 def _active_config() -> dict[str, Any] | None:
     """Env wins over DB so production secrets stay out of Postgres."""
     env_cfg = _config_from_env()
@@ -133,6 +164,10 @@ def _claim_id_from_args(args: dict[str, Any]) -> str:
     return ""
 
 
+def _request_url(cfg: dict[str, Any], path: str) -> str:
+    return f"{cfg['base_url']}{path if path.startswith('/') else '/' + path}"
+
+
 def mcp_invoke(tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
     """Call the external server for ``tool_name``. Returns a tool_runner-shaped
     dict, or ``None`` when routing is not configured for this tool."""
@@ -144,19 +179,32 @@ def mcp_invoke(tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     claim_id = _claim_id_from_args(args)
-    url = f"{cfg['base_url']}{path if path.startswith('/') else '/' + path}"
+    url = _request_url(cfg, path)
     headers = {"Content-Type": "application/json"}
     if cfg["api_key"]:
         headers[cfg["auth_header"]] = cfg["api_key"]
     body = {cfg["claim_arg"]: claim_id}
+    timeout_s = int(cfg["timeout"])
 
     t0 = time.time()
     last_exc: Exception | None = None
+    attempts_used = 0
     for attempt in range(_MCP_MAX_ATTEMPTS):
+        attempts_used = attempt + 1
+        logger.info(
+            "mcp_invoke start tool=%s claim=%s method=%s path=%s timeout_s=%s attempt=%d/%d",
+            tool_name,
+            claim_id or "-",
+            cfg["http_method"],
+            path,
+            timeout_s,
+            attempts_used,
+            _MCP_MAX_ATTEMPTS,
+        )
         try:
             resp = requests.request(
                 cfg["http_method"], url, json=body, headers=headers,
-                timeout=cfg["timeout"],
+                timeout=timeout_s,
             )
             resp.raise_for_status()
             payload = resp.json()
@@ -167,26 +215,78 @@ def mcp_invoke(tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
                     result = inner["body"]
                 else:
                     result = inner
+            duration_ms = int((time.time() - t0) * 1000)
             return {
                 "ok": True, "tool": tool_name, "args": dict(args),
                 "result": result, "error": "",
-                "duration_ms": int((time.time() - t0) * 1000),
+                "duration_ms": duration_ms,
+                "timeout_s": timeout_s,
+                "attempts": attempts_used,
+                "error_kind": "",
             }
         except _RETRYABLE_ERRORS as exc:
             last_exc = exc
-            if attempt + 1 < _MCP_MAX_ATTEMPTS:
+            elapsed_ms = int((time.time() - t0) * 1000)
+            kind = classify_tool_error(exc)
+            if isinstance(exc, requests.exceptions.Timeout):
                 logger.warning(
-                    "mcp_invoke %s transient error (attempt %d/%d): %s",
-                    tool_name, attempt + 1, _MCP_MAX_ATTEMPTS, exc,
+                    "mcp_invoke TIMEOUT tool=%s claim=%s path=%s timeout_s=%s "
+                    "elapsed_ms=%s attempt=%d/%d",
+                    tool_name,
+                    claim_id or "-",
+                    path,
+                    timeout_s,
+                    elapsed_ms,
+                    attempts_used,
+                    _MCP_MAX_ATTEMPTS,
                 )
+            else:
+                logger.warning(
+                    "mcp_invoke %s tool=%s claim=%s path=%s elapsed_ms=%s "
+                    "attempt=%d/%d: %s",
+                    kind,
+                    tool_name,
+                    claim_id or "-",
+                    path,
+                    elapsed_ms,
+                    attempts_used,
+                    _MCP_MAX_ATTEMPTS,
+                    exc,
+                )
+            if attempt + 1 < _MCP_MAX_ATTEMPTS:
                 time.sleep(_MCP_BACKOFF_SECONDS * (attempt + 1))
                 continue
         except Exception as exc:
             last_exc = exc
+            logger.warning(
+                "mcp_invoke failed tool=%s claim=%s path=%s attempt=%d/%d: %s",
+                tool_name,
+                claim_id or "-",
+                path,
+                attempts_used,
+                _MCP_MAX_ATTEMPTS,
+                exc,
+            )
             break
 
+    duration_ms = int((time.time() - t0) * 1000)
+    error_kind = classify_tool_error(last_exc)
+    if error_kind == "timeout":
+        logger.warning(
+            "mcp_invoke TIMEOUT (final) tool=%s claim=%s path=%s timeout_s=%s "
+            "elapsed_ms=%s attempts=%d",
+            tool_name,
+            claim_id or "-",
+            path,
+            timeout_s,
+            duration_ms,
+            attempts_used,
+        )
     return {
         "ok": False, "tool": tool_name, "args": dict(args),
         "result": None, "error": f"mcp call failed: {last_exc}",
-        "duration_ms": int((time.time() - t0) * 1000),
+        "duration_ms": duration_ms,
+        "timeout_s": timeout_s,
+        "attempts": attempts_used,
+        "error_kind": error_kind,
     }

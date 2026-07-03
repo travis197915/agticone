@@ -296,7 +296,12 @@ def execute_shapes(state: ExecutionState) -> dict:
                 if bid in tool_results:
                     continue
             args = _merge_args(tb.get("args_template") or {}, claim)
-            out = invoke_tool(name, args)
+            out = invoke_tool(
+                name, args,
+                phase="EVALUATE",
+                binding_id=bid or "",
+                claim_id=claim_id or "",
+            )
             record = {
                 "binding_id": bid,
                 "tool_name": name,
