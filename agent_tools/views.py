@@ -261,13 +261,23 @@ class ToolDetailView(APIView):
 
 
 class McpServerListView(APIView):
-    """``GET`` list / ``POST`` create external MCP/REST server configs."""
+    """``GET`` list / ``POST`` create external MCP/REST server configs.
+
+    ``GET`` also returns ``runtime_config_source`` (``env`` | ``db`` | ``none``):
+    when ``env``, ``MCP_SERVER_BASE_URL`` in the process environment overrides
+    these DB rows at tool-call time.
+    """
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
+        from uhc_execution_engine.mcp_client import active_config_source
+
         qs = McpServerConfig.objects.all()
-        return Response(McpServerConfigSerializer(qs, many=True).data)
+        return Response({
+            "runtime_config_source": active_config_source(),
+            "servers": McpServerConfigSerializer(qs, many=True).data,
+        })
 
     def post(self, request, *args, **kwargs):
         ser = McpServerConfigSerializer(data=request.data)
@@ -311,6 +321,12 @@ class McpServerDetailView(APIView):
             return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
         obj.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+_MCP_NOT_CONFIGURED = (
+    "no active MCP server configured — set MCP_SERVER_BASE_URL (and MCP_SERVER_API_KEY) "
+    "in the environment, or add/activate a row on the MCP Servers page"
+)
 
 
 class McpServerTestView(APIView):
@@ -469,11 +485,9 @@ class ToolInvokeView(APIView):
                 )
             routed = mcp_invoke(tool.name, args)
             if routed is None:
-                # mcp_path is set but no active MCP server config exists.
                 return Response(
                     {"ok": False, "tool": tool.name,
-                     "error": "no active MCP server configured — add/activate one "
-                              "on the MCP Servers page, or clear this tool's mcp_path "
+                     "error": f"{_MCP_NOT_CONFIGURED}, or clear this tool's mcp_path "
                               "to run the in-process implementation."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
@@ -523,8 +537,7 @@ def _execute_tool(tool: Tool, args: dict[str, Any]) -> dict[str, Any]:
         from uhc_execution_engine.mcp_client import mcp_invoke
         routed = mcp_invoke(tool.name, args)
         if routed is None:
-            return {"ok": False, "result": None,
-                    "error": "no active MCP server configured"}
+            return {"ok": False, "result": None, "error": _MCP_NOT_CONFIGURED}
         return {"ok": bool(routed.get("ok")), "result": routed.get("result"),
                 "error": routed.get("error") or ""}
     from .graphs.single_tool_graph import run_tool

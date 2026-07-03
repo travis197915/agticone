@@ -47,7 +47,7 @@ class ToolWriteSerializer(serializers.ModelSerializer):
     """Create/update shape for a *tool call* row (an MCP/API tool the UI manages).
 
     The MCP route stores only the per-tool path in ``metadata['mcp_path']``; the
-    base endpoint + auth live once in :class:`McpServerConfig`.
+    base endpoint + auth come from ``MCP_SERVER_*`` env vars or :class:`McpServerConfig`.
     """
 
     class Meta:
@@ -87,6 +87,9 @@ class ToolWriteSerializer(serializers.ModelSerializer):
 
 class McpServerConfigSerializer(serializers.ModelSerializer):
     """Editable connection config for an external claims MCP/REST server.
+
+    At runtime, ``MCP_SERVER_BASE_URL`` (when set in the environment) overrides
+    these DB rows — see ``uhc_execution_engine.mcp_client.active_config_source``.
 
     ``api_key`` is write-only; reads expose only ``api_key_set`` so the secret is
     never shipped to the browser. Leaving ``api_key`` blank on update keeps the

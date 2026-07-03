@@ -35,10 +35,7 @@ _ADD_COLUMNS = [
 class Migration(migrations.Migration):
 
     dependencies = [
-        (
-            "execution_app",
-            "0006_rename_execution_c_claim_i_idx_execution_c_claim_i_4d09eb_idx",
-        ),
+        ("execution_app", "0011_merge_20260626_1215"),
     ]
 
     operations = [

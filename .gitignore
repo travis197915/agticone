@@ -3,6 +3,11 @@
 .env.*
 !.env.example
 
+# UHG gateway registry — real endpoints belong in .env / local files only
+uhc-llm/config/registries/uhg-gateway.json
+secrets/
+**/model-registry.local.json
+
 # ── Python bytecode & caches ─────────────────────────────────────────────
 __pycache__/
 *.py[cod]
@@ -40,6 +45,7 @@ out/
 explainability.json
 trace.json
 uhc-agentic.log
+logs/
 synthetic_claims.xlsx
 synthetic_claims_3.xlsx
 SOP_Rule-to-Tool_Mapping_Report.docx
@@ -48,6 +54,7 @@ graphify-out/
 yaml_explained/
 datadump/
 yaml/
+.mypy_cache/
 
 # ── Claim audit scratch data & scripts ───────────────────────────────────
 CBD_Coverage.json
@@ -55,6 +62,8 @@ claimid_*.json
 ClaimPopulation.xlsx
 Copy_final_samples.xlsx
 test_claim_*.xlsx
+25XJ30867500-to-25XI24387800 (1).xlsx
+claims_rationale_dump.xlsx
 IMG20260607124519.jpg.jpeg
 dispatch_claim_batch.py
 run_claim_audit.py
@@ -69,3 +78,8 @@ docs/data/
 docs/*
 
 builder/management/*
+
+scripts/*
+
+# local DB backups
+backups/

@@ -8,6 +8,16 @@ GET  /api/ingest/<job_id>/       — poll a job
 DEL  /api/ingest/<job_id>/       — delete a completed job
 POST /api/ingest/run-sync/       — run pipeline inline (DEBUG only)
 
+Versioning
+----------
+GET  /api/ingest/documents/<document_id>/versions/           — version history
+GET  /api/ingest/documents/<document_id>/affected-workflows/ — workflows using this SOP
+POST /api/ingest/documents/<document_id>/revision-check/     — probe one SOP for drift
+GET  /api/ingest/sops/<sop_id>/diff/                     — diff vs prior revision
+POST /api/ingest/sops/<sop_id>/activate/                 — approve pending version
+POST /api/ingest/sops/<sop_id>/reject/                   — reject pending version
+POST /api/ingest/revision-check/                         — probe all tracked SOPs
+
 HTML viewer
 -----------
 GET  /api/ingest/viewer/                      — job list
@@ -34,7 +44,7 @@ from .models import (IngestionJob, JobStatus,
                      AuditGroupLimit, AuditCode, AuditDateCondition,
                      AuditAnnotation, AuditReference,
                      AuditGraphNode, AuditGraphEdge,
-                     PipelineStageLog, LLMCallLog)
+                     PipelineStageLog, LLMCallLog, SopDocument)
 from .serializers import IngestionJobSerializer, StartJobSerializer
 from .tasks import run_ingestion_pipeline, run_narrative_contextualizer
 
@@ -82,6 +92,13 @@ class HealthView(APIView):
         result["jobs_total"]     = IngestionJob.objects.count()
         result["jobs_running"]   = IngestionJob.objects.filter(
                                        status=JobStatus.RUNNING).count()
+        from django.conf import settings as djsettings
+        result["revision_check"] = {
+            "enabled": getattr(djsettings, "SOP_REVISION_CHECK_ENABLED", False),
+            "schedule_hour_utc": getattr(djsettings, "SOP_REVISION_CHECK_HOUR", 2),
+            "schedule_minute_utc": getattr(djsettings, "SOP_REVISION_CHECK_MINUTE", 0),
+            "tracked_documents": SopDocument.objects.count(),
+        }
         return Response(result)
 
 
@@ -182,10 +199,9 @@ class SyncRunView(APIView):
         )
         job.mark_started()
 
-        # Mirror what tasks.py does: push LLM choice into env so
-        # PipelineConfig.from_env() picks them up when the pipeline initialises.
-        os.environ["LLM_PROVIDER"] = job.llm_provider
-        os.environ["LLM_MODEL"]    = job.llm_model
+        from uhc_llm.backend import apply_job_llm_env
+
+        apply_job_llm_env(llm_provider=job.llm_provider, llm_model=job.llm_model)
 
         try:
             from uhc_sop_ingestion.pipeline import SopIngestionPipeline

@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("sop_ingestion", "0021_alter_auditcode_unique_together_and_more"),
+        ("sop_ingestion", "0018_alter_ctxcode_unique_together_and_more"),
     ]
 
     operations = [

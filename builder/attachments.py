@@ -22,7 +22,7 @@ from typing import Any, Iterable
 
 from django.conf import settings as djsettings
 
-from sop_ingestion.models import IngestionJob
+from sop_ingestion.models import IngestionJob, TriggerSource
 from sop_ingestion.tasks import run_ingestion_pipeline
 
 from .models import Workflow
@@ -49,6 +49,7 @@ def dispatch_sop_ingestions(workflow: Workflow, urls: Iterable[str]) -> list[dic
             job = IngestionJob.objects.create(
                 workflow=workflow,
                 seed_url=url,
+                trigger_source=TriggerSource.WORKFLOW,
             )
             try:
                 task = run_ingestion_pipeline.delay(str(job.job_id))

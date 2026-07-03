@@ -1,30 +1,28 @@
 """Route a tool call to an external claims MCP/REST server.
 
-Storage model:
-* The **base endpoint** + auth live once in ``agent_tools.McpServerConfig``
-  (one active row).
-* Each tool stores **only its path** in ``Tool.metadata['mcp_path']``
-  (e.g. ``/tools/facets_get_summary``).
+Storage model (priority order):
+1. **Environment** — ``MCP_SERVER_BASE_URL`` + optional auth/method vars (prod).
+2. **Database** — one active ``agent_tools.McpServerConfig`` row (builder UI).
 
-At call time we join ``base_url + path`` and POST the claim identifier. The
-server returns a ``ToolCallResult`` envelope; we unwrap ``response.body`` (or
-``response``) as the tool result so downstream rule evaluation sees the same
-shape it would from the in-process tool.
+Each tool stores **only its path** in ``Tool.metadata['mcp_path']``
+(e.g. ``/tools/facets_get_summary``). At call time we join ``base_url + path``.
 
 If there is no active config or the tool has no ``mcp_path`` we return ``None``
 so the caller falls back to the in-process ``agent_tools`` implementation.
-This keeps the whole feature additive / backward compatible.
 """
 from __future__ import annotations
 
 import logging
+import os
 import time
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+ConfigSource = Literal["env", "db", "none"]
 
 # Retry policy for transient network/TLS failures talking to the MCP host.
 _MCP_MAX_ATTEMPTS = 3
@@ -36,9 +34,47 @@ _RETRYABLE_ERRORS = (
 )
 
 
+def _config_dict(
+    *,
+    base_url: str,
+    auth_header: str,
+    api_key: str,
+    http_method: str,
+    claim_arg: str,
+    timeout: int,
+) -> dict[str, Any]:
+    return {
+        "base_url": base_url.rstrip("/"),
+        "auth_header": auth_header or "x-api-key",
+        "api_key": api_key or "",
+        "http_method": (http_method or "POST").upper(),
+        "claim_arg": claim_arg or "claim_number",
+        "timeout": timeout or 30,
+    }
+
+
+def _config_from_env() -> dict[str, Any] | None:
+    """Load MCP server connection from env (12-factor / production default)."""
+    base_url = os.environ.get("MCP_SERVER_BASE_URL", "").strip()
+    if not base_url:
+        return None
+    try:
+        timeout = int(os.environ.get("MCP_SERVER_TIMEOUT_SECONDS", "30"))
+    except ValueError:
+        timeout = 30
+    return _config_dict(
+        base_url=base_url,
+        auth_header=os.environ.get("MCP_SERVER_AUTH_HEADER", "x-api-key"),
+        api_key=os.environ.get("MCP_SERVER_API_KEY", ""),
+        http_method=os.environ.get("MCP_SERVER_HTTP_METHOD", "POST"),
+        claim_arg=os.environ.get("MCP_SERVER_CLAIM_ARG", "claim_number"),
+        timeout=timeout,
+    )
+
+
 @lru_cache(maxsize=1)
-def _active_config() -> dict[str, Any] | None:
-    """Most-recently-updated active McpServerConfig as a plain dict (cached)."""
+def _active_config_from_db() -> dict[str, Any] | None:
+    """Most-recently-updated active McpServerConfig (cached per process)."""
     try:
         from agent_tools.models import McpServerConfig
     except Exception:  # pragma: no cover - app not ready
@@ -46,14 +82,31 @@ def _active_config() -> dict[str, Any] | None:
     cfg = McpServerConfig.objects.filter(is_active=True).order_by("-updated_at").first()
     if not cfg:
         return None
-    return {
-        "base_url": cfg.base_url.rstrip("/"),
-        "auth_header": cfg.auth_header,
-        "api_key": cfg.api_key,
-        "http_method": (cfg.http_method or "POST").upper(),
-        "claim_arg": cfg.claim_arg or "claim_number",
-        "timeout": cfg.timeout_seconds or 30,
-    }
+    return _config_dict(
+        base_url=cfg.base_url,
+        auth_header=cfg.auth_header,
+        api_key=cfg.api_key,
+        http_method=cfg.http_method,
+        claim_arg=cfg.claim_arg,
+        timeout=cfg.timeout_seconds,
+    )
+
+
+def active_config_source() -> ConfigSource:
+    """Where the runtime MCP connection settings come from."""
+    if _config_from_env() is not None:
+        return "env"
+    if _active_config_from_db() is not None:
+        return "db"
+    return "none"
+
+
+def _active_config() -> dict[str, Any] | None:
+    """Env wins over DB so production secrets stay out of Postgres."""
+    env_cfg = _config_from_env()
+    if env_cfg is not None:
+        return env_cfg
+    return _active_config_from_db()
 
 
 def _tool_path(tool_name: str) -> str:
@@ -68,7 +121,8 @@ def _tool_path(tool_name: str) -> str:
 
 
 def reset_cache() -> None:
-    _active_config.cache_clear()
+    """Clear the DB config cache (env is read fresh each call)."""
+    _active_config_from_db.cache_clear()
 
 
 def _claim_id_from_args(args: dict[str, Any]) -> str:
@@ -97,10 +151,6 @@ def mcp_invoke(tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
     body = {cfg["claim_arg"]: claim_id}
 
     t0 = time.time()
-    # Transient TLS/connection blips on the MCP host (e.g. an incomplete cert
-    # chain served mid-deploy, or a dropped connection) must not fail an entire
-    # claim at the fetch step. Retry a few times with a short backoff; only
-    # network-level errors are retried, not HTTP 4xx/5xx responses.
     last_exc: Exception | None = None
     for attempt in range(_MCP_MAX_ATTEMPTS):
         try:
@@ -110,7 +160,6 @@ def mcp_invoke(tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
             )
             resp.raise_for_status()
             payload = resp.json()
-            # Unwrap the ToolCallResult envelope → the data the rules care about.
             result: Any = payload
             if isinstance(payload, dict):
                 inner = payload.get("response", payload)
@@ -132,7 +181,7 @@ def mcp_invoke(tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
                 )
                 time.sleep(_MCP_BACKOFF_SECONDS * (attempt + 1))
                 continue
-        except Exception as exc:  # non-retryable (HTTP error, bad JSON, …)
+        except Exception as exc:
             last_exc = exc
             break
 

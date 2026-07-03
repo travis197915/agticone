@@ -10,8 +10,10 @@ Credentials are read from:
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
+from celery.schedules import crontab
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -26,6 +28,57 @@ if ENV_FILE.exists():
 _TOOLS_ENV_FILE = BASE_DIR / "agent_tools" / ".env.tools"
 if _TOOLS_ENV_FILE.exists():
     load_dotenv(_TOOLS_ENV_FILE, override=False)
+
+# ── Azure Key Vault → os.environ (optional; matches reference ask_llm.py) ───
+# Loads AUTH_URL, CLIENT_ID, CLIENT_SECRET, SCOPE, MODEL_REGISTRY_JSON, etc.
+# from Key Vault when AZURE_KEY_VAULT_URL is set (or .env.stg provides KV creds).
+try:
+    from uhc_llm.keyvault_loader import bootstrap_llm_secrets, keyvault_configured
+
+    if keyvault_configured() or (BASE_DIR / ".env.stg").exists():
+        bootstrap_llm_secrets()
+except Exception as _kv_exc:
+    import logging
+    logging.getLogger(__name__).warning("Key Vault bootstrap skipped: %s", _kv_exc)
+
+# ── Validate LLM registry config early (Option A: MODEL_REGISTRY_JSON) ─────
+if os.environ.get("LLM_BACKEND", "").strip().lower() == "registry":
+    try:
+        from uhc_llm.gateway import gateway_auth_configured, gateway_auth_source, GATEWAY_KEY_ENV_VARS
+        from uhc_llm.oauth import OAUTH_ENV_VARS, oauth_configured
+        from uhc_llm.registry import load_model_registry, registry_profile_name
+        _llm_registry = load_model_registry()
+        if not _llm_registry:
+            import warnings
+            warnings.warn(
+                "LLM_BACKEND=registry but no models loaded. "
+                "Set MODEL_REGISTRY_JSON in .env (see .env.example).",
+                stacklevel=1,
+            )
+        elif not gateway_auth_configured():
+            import warnings
+            from uhc_llm.gateway import GATEWAY_KEY_ENV_VARS
+            from uhc_llm.oauth import OAUTH_ENV_VARS
+            warnings.warn(
+                f"LLM registry loaded from {registry_profile_name()!r} "
+                f"({len(_llm_registry)} models) but no gateway auth is set. "
+                f"Set OAuth ({', '.join(OAUTH_ENV_VARS)}) or "
+                f"API key ({', '.join(GATEWAY_KEY_ENV_VARS)}).",
+                stacklevel=1,
+            )
+        else:
+            import logging
+            auth = gateway_auth_source()
+            logging.getLogger(__name__).info("LLM registry auth via %s", auth)
+            if not oauth_configured() and auth == "OPENAI_API_KEY":
+                logging.getLogger(__name__).warning(
+                    "LLM registry uses OPENAI_API_KEY for gateway auth. "
+                    "api.uhg.com typically requires OAuth "
+                    "(AUTH_URL, CLIENT_ID, CLIENT_SECRET, SCOPE)."
+                )
+    except Exception as _llm_exc:
+        import warnings
+        warnings.warn(f"LLM registry config invalid: {_llm_exc}", stacklevel=1)
 
 # ── Core ──────────────────────────────────────────────────────────────────────
 SECRET_KEY    = os.environ.get("DJANGO_SECRET_KEY", "django-insecure-v2-dev-only")
@@ -162,18 +215,42 @@ CELERY_BROKER_URL      = f"amqp://{_rmq_user}:{_rmq_pass}@{_rmq_host}:{_rmq_port
 CELERY_RESULT_BACKEND  = REDIS_URL
 CELERY_ACCEPT_CONTENT  = ["json"]
 CELERY_TASK_SERIALIZER = "json"
+# Windows: prefork pool breaks task registry in worker child processes.
+# Override with CELERY_WORKER_POOL=threads|eventlet if needed for local dev.
+if sys.platform == "win32":
+    CELERY_WORKER_POOL = os.environ.get("CELERY_WORKER_POOL", "solo")
 
 # Ingestion + execution: thin masters on job_queue; LangGraph runs in
 # child OS processes (see sop_ingestion/subprocess_manager.py and
 # execution_app/subprocess_manager.py).
 CELERY_TASK_ROUTES = {
-    "sop_ingestion.run_pipeline":    {"queue": "job_queue"},
+    "sop_ingestion.run_pipeline": {"queue": "job_queue"},
     "execution_app.run_batch_async": {"queue": "job_queue"},
+    "sop_ingestion.check_all_sop_revisions": {"queue": "celery"},
+    "sop_ingestion.check_sop_revision": {"queue": "celery"},
 }
 # Max parallel ingestion subprocesses (master waits for a slot before Popen).
 MAX_PIPELINE_SUBPROCESSES = int(os.environ.get("MAX_PIPELINE_SUBPROCESSES", "10"))
 # Max parallel execution-batch subprocesses (same shape as the ingestion knob).
 MAX_EXECUTION_SUBPROCESSES = int(os.environ.get("MAX_EXECUTION_SUBPROCESSES", "5"))
+
+# ── Scheduled SOP revision checks (Celery Beat) ───────────────────────────────
+SOP_REVISION_CHECK_ENABLED = os.environ.get(
+    "SOP_REVISION_CHECK_ENABLED", "false",
+).lower() in {"1", "true", "yes"}
+SOP_REVISION_CHECK_HOUR = int(os.environ.get("SOP_REVISION_CHECK_HOUR", "2"))
+SOP_REVISION_CHECK_MINUTE = int(os.environ.get("SOP_REVISION_CHECK_MINUTE", "0"))
+
+CELERY_BEAT_SCHEDULE = {}
+if SOP_REVISION_CHECK_ENABLED:
+    CELERY_BEAT_SCHEDULE["sop-revision-check"] = {
+        "task": "sop_ingestion.check_all_sop_revisions",
+        "schedule": crontab(
+            hour=SOP_REVISION_CHECK_HOUR,
+            minute=SOP_REVISION_CHECK_MINUTE,
+        ),
+        "options": {"queue": "celery"},
+    }
 
 # ── Pipeline defaults (picked up by PipelineConfig.from_env()) ────────────────
 SOP_MAX_DEPTH    = int(os.environ.get("MAX_DEPTH",    "4"))

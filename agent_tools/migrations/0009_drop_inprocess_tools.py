@@ -19,10 +19,16 @@ from django.db import migrations
 
 def _drop_inprocess(apps, _schema_editor):
     Tool = apps.get_model("agent_tools", "Tool")
+    NodeToolBinding = apps.get_model("agent_tools", "NodeToolBinding")
     for tool in Tool.objects.filter(kind="langchain"):
         meta = tool.metadata if isinstance(tool.metadata, dict) else {}
-        if not meta.get("mcp_path"):
-            tool.delete()
+        if meta.get("mcp_path"):
+            continue
+        # Canvas bindings PROTECT the Tool row — skip in-use tools so workflows
+        # keep working; only prune orphaned registry mirror rows.
+        if NodeToolBinding.objects.filter(tool_id=tool.id).exists():
+            continue
+        tool.delete()
 
 
 def _reseed(_apps, _schema_editor):
@@ -33,7 +39,7 @@ def _reseed(_apps, _schema_editor):
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("agent_tools", "0008_rename_agent_tools_nrb_shape_ord_idx_node_rule_b_shape_i_2fc2b1_idx_and_more"),
+        ("agent_tools", "0009_merge_20260626_1215"),
     ]
 
     operations = [

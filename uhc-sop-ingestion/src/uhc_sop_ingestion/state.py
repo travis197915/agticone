@@ -38,6 +38,17 @@ class PipelineState(TypedDict, total=False):
     is_local: bool
     is_duplicate: bool
 
+    # ── Versioning (revision-date tracking) ───────────────────────────────────
+    canonical_url: str
+    normalized_revision_date: str
+    prior_sop_db_id: Optional[int]
+    version_action: str           # NEW | UNCHANGED | REVISED | CONTENT_CHANGE
+    version_registered: bool
+    version_diff_id: Optional[int]
+    version_diff_summary: dict
+    trigger_source: str           # manual | workflow | revision_check
+    requires_human_review: bool
+
     # ── Parse layer outputs ───────────────────────────────────────────────────
     metadata: dict              # title, effective_date, revision_date, platform…
     pre_sections: list[dict]    # [{name, order, items, annotations}]
@@ -53,6 +64,12 @@ class PipelineState(TypedDict, total=False):
     pdf_page_count: int             # merged page count after perception
     pdf_slice_count: int            # number of native-PDF slices sent to Claude
     pdf_context_graph_id: str       # "{job_id}:{content_hash}" of the Neo4j graph
+    # HTML GRAPH DOOR (a03b_html_graph) — the SEPARATE HTML analog of the PDF
+    # door. Heavy payloads (pages, entities, relations) live on the Redis
+    # blackboard (sop:html:{job_id}:*) and Neo4j (:HtmlDoc/:HtmlNode); state
+    # carries only the light references below.
+    html_page_count: int            # synthetic page-record count after perception
+    html_context_graph_id: str      # "{job_id}:{content_hash}" of the Neo4j graph
     sub_procedures: list[dict]
     reference_tables: list[dict]
     group_rules: list[dict]

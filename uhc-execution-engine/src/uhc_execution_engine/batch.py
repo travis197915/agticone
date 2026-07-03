@@ -20,8 +20,8 @@ from typing import Any, Iterator
 
 from django.utils import timezone
 
-from .claim_fetcher import (fetch_claim, parse_claim, workflow_fetch_tool,
-                            workflow_uses_parser)
+from .claim_fetcher import (fetch_claim, fetch_tool_error, parse_claim,
+                            resolve_fetch_tool, workflow_uses_parser)
 from .pipeline import RuleEnginePipeline
 from .rule_loader import load_workflow_bindings
 from .xlsx_parser import XlsxParseError, extract_claim_ids
@@ -125,7 +125,7 @@ class BatchRunner:
             }
             return
         use_parser = workflow_uses_parser(loaded["all_tool_bindings"])
-        fetch_tool = workflow_fetch_tool(workflow_id)
+        fetch_tool = resolve_fetch_tool(workflow_id, loaded["all_tool_bindings"])
 
         # ── 3. Reserve / fetch the BatchExecutionRun row ──────────────────
         # If the caller pre-created it (async path), update it with the
@@ -149,6 +149,24 @@ class BatchRunner:
                 total_claims=len(claim_ids),
                 status="RUNNING",
             )
+
+        if not fetch_tool:
+            err = fetch_tool_error(loaded["all_tool_bindings"])
+            BatchExecutionRun.objects.filter(id=batch_id).update(
+                status="FAILED",
+                error_message=err,
+                finished_at=timezone.now(),
+            )
+            yield {
+                "kind": "summary",
+                "batch": {
+                    "id": batch_id, "status": "FAILED",
+                    "total_claims": len(claim_ids), "completed": 0, "failed": 0,
+                    "duration_ms": int((time.time() - t0) * 1000),
+                    "error_message": err,
+                },
+            }
+            return
 
         # ── 4. batch_start envelope ────────────────────────────────────────
         yield {
@@ -270,9 +288,8 @@ class BatchRunner:
         from execution_app.models import (RuleExecutionRun,
                                              ToolInvocationRecord)
 
-        # 1. Fetch the claim via the workflow's configured fetch tool
-        #    (defaults to linx_claim_search; this flow overrides it via
-        #    Workflow.metadata['fetch_tool'] so linx is never used).
+        # 1. Fetch the claim via the workflow's configured fetch tool (required;
+        #    resolved from metadata or canvas bindings — no silent default).
         fetch_out = fetch_claim(claim_id, tool_name=fetch_tool)
         if not fetch_out["ok"]:
             run_id = str(uuid.uuid4())

@@ -24,6 +24,7 @@ from rest_framework import serializers as drf_serializers
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.renderers import BaseRenderer
 from rest_framework.response import Response
 
 from .models import (
@@ -170,6 +171,17 @@ class DashboardWidgetViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 # ── Workflows ───────────────────────────────────────────────────────────────
+
+
+class _EventStreamRenderer(BaseRenderer):
+    """Advertise ``text/event-stream`` so DRF content negotiation accepts SSE."""
+
+    media_type = "text/event-stream"
+    format = "txt"
+    charset = "utf-8"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):  # pragma: no cover
+        return data
 
 
 class WorkflowViewSet(viewsets.ModelViewSet):
@@ -637,7 +649,8 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             "llm_errors":  llm_errors,
         })
 
-    @action(detail=True, methods=["get"], url_path="build_stream")
+    @action(detail=True, methods=["get"], url_path="build_stream",
+            renderer_classes=[_EventStreamRenderer])
     def build_stream(self, _request, pk=None):
         """Server-Sent Events stream of live pipeline stage logs for the build.
 
@@ -767,42 +780,153 @@ class WorkflowViewSet(viewsets.ModelViewSet):
     def attachable(self, _request, pk=None):
         """Enumerate everything a node on this workflow's canvas can attach to.
 
-        Returns four lists keyed by stable string keys the SPA can store
-        verbatim on ``Shape.properties``:
+        Supports two modes via the ``?sop_id=<id>`` query parameter:
 
-        * ``sop_rules`` — one entry per individual rule row in any completed
-          SOP linked to this workflow.  Sources both pre-condition rules
-          (``llm_rules``) and decision-tree rows.  Each rule carries:
-            - ``references``   — keys of rules a goto/skip-to depends on,
-            - ``excluded_by``  — keys of *exclusions* that override this rule
-                                 (computed from the agentic graph's
-                                 ``OVERRIDES`` edges),
-            - ``graph_node_key`` — corresponding node in the knowledge graph,
-            - ``html_reference`` — source URL + section anchor + raw text
-                                   the SPA can render as the original
-                                   document context.
-        * ``exclusions`` — dedicated list of exclusion / exception rules
-          (``rule_kind="exclusion"`` or ``is_exception=true`` or
-          ``OVERRIDES`` edges sourced from the rule). Each exclusion exposes
-          the list of ``overrides_rule_keys`` it neutralises, so the SPA
-          can show "these rules are excluded" when an exclusion is picked.
-        * ``sops`` — narrative summary per SOP.
+        **Fast path** (no ``sop_id``): returns the SOP list + tool_calls only.
+        ``sop_rules`` and ``exclusions`` are empty.  Used on first open so the
+        picker renders the SOP list immediately without waiting for every SOP's
+        rules to be computed.
+
+        **Per-SOP path** (``?sop_id=N``): returns ``sop_rules`` and
+        ``exclusions`` for the requested SOP only, plus the full ``tool_calls``
+        list.  Called lazily when the user clicks a SOP in the sidebar.
+
+        The ``sops`` list in both responses includes a ``rule_count`` field
+        (pre-aggregated) so the sidebar can display the count before rules load.
+
+        Full field docs:
+        * ``sop_rules`` — one entry per individual rule row.  Each carries
+          ``references``, ``excluded_by``, ``graph_node_key``, and
+          ``html_reference``.
+        * ``exclusions`` — exclusion / exception rules with ``overrides_rule_keys``.
+        * ``sops`` — lightweight SOP summaries (id, title, narrative, rule_count).
         * ``tool_calls`` — registered runtime API agents.
         """
         from sop_ingestion.models import (  # local to avoid cycles
             AuditSop, AuditGraphNode, AuditGraphEdge, SopExclusion,
         )
+        from .sop_compliance import sop_approval_meta
+
         wf: Workflow = self.get_object()
+
+        # ── Resolve optional sop_id filter ─────────────────────────────────────
+        sop_id_param = _request.query_params.get("sop_id")
+        sop_id_filter: int | None = None
+        if sop_id_param:
+            try:
+                sop_id_filter = int(sop_id_param)
+            except (TypeError, ValueError):
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError({"sop_id": "Must be an integer."})
+
+        approved_only = _request.query_params.get("approved_only", "").lower() in {
+            "1", "true", "yes",
+        }
 
         sop_rules: list[dict] = []
         sop_summaries: list[dict] = []
-        sops_qs = AuditSop.objects.filter(job__workflow=wf).prefetch_related(
-            "preconditions", "steps__decisions",
-        ).order_by("id")
+
+        def _summary_for(sop: AuditSop, *, rule_count=None) -> dict:
+            approval = sop_approval_meta(sop)
+            return {
+                "sop_id":      sop.id,
+                "title":       sop.title or f"SOP #{sop.id}",
+                "narrative":   sop.narrative_context or sop.llm_summary or "",
+                "source_url":  sop.url or "",
+                "doc_format":  sop.doc_format or "HTML",
+                "rule_count":  rule_count,
+                "is_approved": approval["is_approved"],
+                "approval_issue": approval["approval_issue"],
+                "activation_status": approval["activation_status"],
+                "current_sop_id": approval["current_sop_id"],
+                "version_number": approval["version_number"],
+            }
+
+        # ── Base SOP queryset ───────────────────────────────────────────────────
+        # For the fast path we skip the heavy prefetch; for the per-SOP path we
+        # filter to one SOP and prefetch only its related rows.
+        if sop_id_filter is not None:
+            sops_qs = (
+                AuditSop.objects.filter(job__workflow=wf, id=sop_id_filter)
+                .select_related("document", "document__current_version")
+                .prefetch_related("preconditions", "steps__decisions")
+                .order_by("id")
+            )
+        else:
+            sops_qs = (
+                AuditSop.objects.filter(job__workflow=wf)
+                .select_related("document", "document__current_version")
+                .order_by("id")
+            )
         # doc_format per SOP — drives whether the SPA shows an HTML iframe
         # (when the source is reachable) or a plain text panel (DOCX/PDF
         # uploads, where the snippet is the only viewable form).
         sop_meta_by_id: dict[int, dict] = {}
+
+        # ── Fast path: no sop_id → return SOP list + tools only ───────────────
+        # Skip all rule / exclusion computation so the picker renders instantly.
+        if sop_id_filter is None:
+            for sop in sops_qs:
+                summary = _summary_for(sop, rule_count=None)
+                if approved_only and not summary["is_approved"]:
+                    continue
+                sop_summaries.append(summary)
+            tool_calls_fast: list[dict] = []
+            try:
+                from agent_tools.models import Tool as _ToolFast
+                for t in _ToolFast.objects.filter(is_active=True).order_by("display_name"):
+                    tool_calls_fast.append({
+                        "key":           f"tool:{t.name}",
+                        "tool_id":       str(t.id),
+                        "name":          t.name,
+                        "display_name":  t.display_name,
+                        "description":   t.description,
+                        "tool_kind":     t.kind,
+                        "kind":          t.kind,
+                        "invoke_url":    t.invoke_url,
+                        "args_schema":   t.args_schema or {},
+                        "endpoint_id":   t.endpoint_id,
+                        "method":        (t.metadata or {}).get("method", "GET" if t.kind == "api_agent" else "POST"),
+                        "url":           t.invoke_url,
+                        "auth_type":     (t.metadata or {}).get("auth_type", "none"),
+                    })
+            except Exception:
+                agents = (wf.metadata or {}).get("runtime_agents") or []
+                tool_calls_fast = [{
+                    "key":         f"agent:{a.get('endpoint_id', '') or a.get('name', '')}",
+                    "tool_kind":   "api_agent",
+                    "endpoint_id": a.get("endpoint_id", ""),
+                    "name":        a.get("name", ""),
+                    "display_name": a.get("name", ""),
+                    "method":      a.get("method", "GET"),
+                    "url":         a.get("url", ""),
+                    "description": a.get("description", ""),
+                    "auth_type":   a.get("auth_type", "none"),
+                    "args_schema": {},
+                } for a in agents if a.get("endpoint_id") or a.get("name")]
+            return Response({
+                "sops":       sop_summaries,
+                "sop_rules":  [],
+                "exclusions": [],
+                "tool_calls": tool_calls_fast,
+            })
+
+        # ── Per-SOP path: compute rules + exclusions for sop_id_filter ─────────
+        target_sop = sops_qs.first()
+        if target_sop is None:
+            return Response({"detail": "SOP not found on this workflow."},
+                            status=status.HTTP_404_NOT_FOUND)
+        if not sop_approval_meta(target_sop)["is_approved"]:
+            approval = sop_approval_meta(target_sop)
+            return Response({
+                "detail": (
+                    f"SOP {target_sop.id} is not approved for rule attachment "
+                    f"({approval['approval_issue']}). Activate the current version first."
+                ),
+                "sop_id": target_sop.id,
+                "approval_issue": approval["approval_issue"],
+                "current_sop_id": approval["current_sop_id"],
+            }, status=status.HTTP_409_CONFLICT)
 
         # ── 1. Pull every OVERRIDES edge into a map keyed by source graph
         #       node key so we can derive (rule → excluded_by exclusions).
@@ -836,13 +960,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             sop_meta_by_id[sop.id] = {
                 "title": sop_title, "url": sop_url, "doc_format": doc_format,
             }
-            sop_summaries.append({
-                "sop_id":     sop.id,
-                "title":      sop_title,
-                "narrative":  sop.narrative_context or sop.llm_summary or "",
-                "source_url": sop_url,
-                "doc_format": doc_format,
-            })
+            sop_summaries.append(_summary_for(sop))
 
             # Pre-index step → decision-row keys (used by goto_step refs)
             step_to_keys: dict[int, list[str]] = {}

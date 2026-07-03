@@ -14,10 +14,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timezone as dt_timezone
 from pathlib import Path
 from time import monotonic as _monotonic
 from typing import Any, Iterator
@@ -25,9 +26,9 @@ from typing import Any, Iterator
 from django.conf import settings
 from django.db.models import Avg, DurationField, ExpressionWrapper, F, Q
 from django.http import StreamingHttpResponse
+from django.utils import timezone as dj_timezone
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser
-from rest_framework.permissions import AllowAny
 from rest_framework.renderers import BaseRenderer
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -36,8 +37,9 @@ from rest_framework.views import APIView
 from . import trace_builder
 from .models import BatchExecutionRun, RuleExecutionRun
 from .serializers import (BatchExecutionRunSerializer,
-                          RuleExecutionRunSerializer, serialize_run_summary)
-from .trace_builder import (CLEAN, DEFECT, INCONCLUSIVE, _CLEAN_DECISIONS,
+                          RuleExecutionRunSerializer, claim_audit_status,
+                          serialize_run_summary)
+from .trace_builder import (CLEAN, DEFECT, INCONCLUSIVE, IN_PROGRESS, _CLEAN_DECISIONS,
                             _DEFECT_DECISIONS)
 
 logger = logging.getLogger(__name__)
@@ -57,8 +59,8 @@ def _iso_utc(ts: datetime | None) -> str | None:
     if ts is None:
         return None
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        ts = ts.replace(tzinfo=dt_timezone.utc)
+    return ts.astimezone(dt_timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _format_clock(ts: datetime | None) -> str:
@@ -66,8 +68,8 @@ def _format_clock(ts: datetime | None) -> str:
     if ts is None:
         return ""
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc).strftime("%I:%M:%S %p")
+        ts = ts.replace(tzinfo=dt_timezone.utc)
+    return ts.astimezone(dt_timezone.utc).strftime("%I:%M:%S %p")
 
 
 def _format_duration(duration_ms: int | None) -> str:
@@ -242,7 +244,7 @@ def _claim_status(
     agrees with the per-agent / Explainability views.
     """
     if run.status == "RUNNING":
-        return INCONCLUSIVE
+        return IN_PROGRESS
     if run.status in {"FAILED", "FETCH_FAILED"}:
         return INCONCLUSIVE
     if run.status == "TERMINATED_EARLY":
@@ -478,7 +480,7 @@ def _claim_run_context(
 def _claim_status_light(run: RuleExecutionRun, trace=None) -> str:
     """Fast claim status for the summary tab — no trace_json walk or node rollup."""
     if run.status == "RUNNING":
-        return INCONCLUSIVE
+        return IN_PROGRESS
     if run.status in {"FAILED", "FETCH_FAILED"}:
         return INCONCLUSIVE
     if run.status == "TERMINATED_EARLY":
@@ -684,6 +686,10 @@ def _run_header_payload_light(run: RuleExecutionRun, trace=None) -> dict[str, An
         "processingTimeMin": _processing_time_min(run),
         "startedAt": _iso_utc(run.started_at),
         "finishedAt": _iso_utc(run.finished_at),
+        "reviewStatus": run.review_status or None,
+        "auditorStatus": run.auditor_status or None,
+        "feedback": run.review_feedback or None,
+        **_review_date_fields(run),
     }
 
 
@@ -708,6 +714,10 @@ def _run_header_payload(
         "processingTimeMin": _processing_time_min(run),
         "startedAt": _iso_utc(run.started_at),
         "finishedAt": _iso_utc(run.finished_at),
+        "reviewStatus": run.review_status or None,
+        "auditorStatus": run.auditor_status or None,
+        "feedback": run.review_feedback or None,
+        **_review_date_fields(run),
     }
 
 
@@ -783,8 +793,6 @@ class RunBatchView(APIView):
     finishes — but the work no longer runs inside the gunicorn worker.
     """
     parser_classes = [MultiPartParser]
-    permission_classes = [AllowAny]
-
     # Bound on how long the sync HTTP request will wait. Overridable via env
     # for CI/large batches; align with the gunicorn / proxy timeout in prod.
     _DEFAULT_TIMEOUT_SEC = 600
@@ -864,8 +872,6 @@ class RunBatchView(APIView):
 class BatchLatestView(APIView):
     """GET /api/execute/batches/latest/ — most recent batch from shared DB."""
 
-    permission_classes = [AllowAny]
-
     def get(self, _request: Request) -> Response:
         batch = (
             BatchExecutionRun.objects
@@ -880,8 +886,6 @@ class BatchLatestView(APIView):
 
 
 class BatchDetailView(APIView):
-    permission_classes = [AllowAny]
-
     def get(self, _request: Request, batch_id: str) -> Response:
         try:
             batch = BatchExecutionRun.objects.prefetch_related("runs").get(id=batch_id)
@@ -896,7 +900,7 @@ def _parse_yyyy_mm_dd(value: str) -> datetime | None:
     if not raw:
         return None
     try:
-        return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=dt_timezone.utc)
     except ValueError:
         return None
 
@@ -917,10 +921,12 @@ def _filter_run_list_queryset(request: Request, qs):
         )
     elif claim_status == INCONCLUSIVE:
         qs = qs.filter(
-            Q(status__in=["RUNNING", "FAILED", "FETCH_FAILED"])
+            Q(status__in=["FAILED", "FETCH_FAILED"])
             | Q(final_decision_type__iexact="INCONCLUSIVE")
             | Q(final_decision_type="")
         )
+    elif claim_status == IN_PROGRESS:
+        qs = qs.filter(status="RUNNING")
 
     from_date = _parse_yyyy_mm_dd(request.query_params.get("from_date", ""))
     if from_date is not None:
@@ -956,7 +962,6 @@ def _avg_processing_time_min(qs) -> float:
 class RunListView(APIView):
     """GET /api/execute/runs/ — all processed claims across every batch."""
 
-    permission_classes = [AllowAny]
     _DEFAULT_LIMIT = 25
     _MAX_LIMIT = 200
 
@@ -991,8 +996,6 @@ class RunListView(APIView):
 
 
 class RunDetailView(APIView):
-    permission_classes = [AllowAny]
-
     def get(self, _request: Request, run_id: str) -> Response:
         try:
             run = (RuleExecutionRun.objects
@@ -1002,6 +1005,242 @@ class RunDetailView(APIView):
             return Response({"detail": "not found"},
                             status=status.HTTP_404_NOT_FOUND)
         return Response(RuleExecutionRunSerializer(run).data)
+
+
+_VALID_REVIEW_STATUSES = frozenset({
+    "", "pending", "in_progress", "approved", "rejected", "completed",
+})
+
+_REVIEW_TO_AUDITOR_STATUS = {
+    "": "",
+    "pending": "PENDING",
+    "in_progress": "IN_PROGRESS",
+    "approved": "APPROVED",
+    "rejected": "REJECTED",
+    "completed": "COMPLETED",
+}
+
+
+def _auditor_status_for_review(review_status: str) -> str:
+    return _REVIEW_TO_AUDITOR_STATUS.get(review_status, "")
+
+
+def _parse_review_status_body(request: Request) -> tuple[str | None, Response | None]:
+    if "reviewStatus" not in request.data and "review_status" not in request.data:
+        return None, Response(
+            {"detail": "reviewStatus is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    raw = request.data.get("reviewStatus", request.data.get("review_status"))
+    value = str(raw or "").strip().lower().replace("-", "_")
+    if value not in _VALID_REVIEW_STATUSES:
+        return None, Response(
+            {
+                "detail": f"invalid reviewStatus: {raw!r}",
+                "allowed": sorted(_VALID_REVIEW_STATUSES - {""}),
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return value, None
+
+
+def _review_date_fields(run: RuleExecutionRun) -> dict[str, Any]:
+    return {
+        "reviewStartedAt": _iso_utc(run.review_started_at),
+        "reviewedAt": _iso_utc(run.reviewed_at),
+    }
+
+
+def _serialize_review_status_update(run: RuleExecutionRun) -> dict[str, Any]:
+    return {
+        "runId": str(run.id),
+        "claimId": run.claim_id,
+        "batchId": str(run.batch_id) if run.batch_id else None,
+        "runStatus": run.status,
+        "claimStatus": claim_audit_status(run),
+        "reviewStatus": run.review_status or None,
+        "auditorStatus": run.auditor_status or None,
+        "feedback": run.review_feedback or None,
+        **_review_date_fields(run),
+    }
+
+
+def _parse_feedback_body(
+    request: Request, *, required: bool,
+) -> tuple[str | None, Response | None]:
+    raw = request.data.get("feedback", request.data.get("reviewFeedback"))
+    if raw is None:
+        raw = ""
+    value = str(raw).strip()
+    if required and not value:
+        return None, Response(
+            {"detail": "feedback is required when rejecting a review"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return value, None
+
+
+def _apply_review_decision(
+    run: RuleExecutionRun,
+    *,
+    review_status: str,
+    feedback: str,
+) -> RuleExecutionRun:
+    now = dj_timezone.now()
+    run.review_status = review_status
+    run.auditor_status = _auditor_status_for_review(review_status)
+    run.review_feedback = feedback
+    if review_status in {"approved", "rejected"}:
+        run.reviewed_at = now
+    fields = ["review_status", "auditor_status", "review_feedback", "reviewed_at"]
+    run.save(update_fields=fields)
+    return run
+
+
+def _apply_review_status(run: RuleExecutionRun, review_status: str) -> RuleExecutionRun:
+    now = dj_timezone.now()
+    run.review_status = review_status
+    run.auditor_status = _auditor_status_for_review(review_status)
+    fields = ["review_status", "auditor_status"]
+    if review_status == "in_progress":
+        run.review_started_at = now
+        fields.append("review_started_at")
+    run.save(update_fields=fields)
+    return run
+
+
+class RunReviewApproveView(APIView):
+    """POST /api/execute/runs/<run_id>/review/approve/"""
+
+    def post(self, request: Request, run_id: str) -> Response:
+        try:
+            run = RuleExecutionRun.objects.get(id=run_id)
+        except RuleExecutionRun.DoesNotExist:
+            return Response({"detail": "not found"},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        feedback, err = _parse_feedback_body(request, required=False)
+        if err is not None:
+            return err
+        assert feedback is not None
+
+        _apply_review_decision(run, review_status="approved", feedback=feedback)
+        return Response(_serialize_review_status_update(run))
+
+
+class RunReviewRejectView(APIView):
+    """POST /api/execute/runs/<run_id>/review/reject/"""
+
+    def post(self, request: Request, run_id: str) -> Response:
+        try:
+            run = RuleExecutionRun.objects.get(id=run_id)
+        except RuleExecutionRun.DoesNotExist:
+            return Response({"detail": "not found"},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        feedback, err = _parse_feedback_body(request, required=True)
+        if err is not None:
+            return err
+        assert feedback is not None
+
+        _apply_review_decision(run, review_status="rejected", feedback=feedback)
+        return Response(_serialize_review_status_update(run))
+
+
+class ClaimReviewApproveView(APIView):
+    """POST /api/claims/<claim_id>/review/approve/"""
+
+    def post(self, request: Request, claim_id: str) -> Response:
+        run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
+        if err is not None:
+            return err
+        run, err = _load_run_for_claim(
+            claim_id, run_uuid, batch_uuid, lightweight=True,
+        )
+        if err is not None:
+            return err
+        assert run is not None
+
+        feedback, err = _parse_feedback_body(request, required=False)
+        if err is not None:
+            return err
+        assert feedback is not None
+
+        _apply_review_decision(run, review_status="approved", feedback=feedback)
+        return Response(_serialize_review_status_update(run))
+
+
+class ClaimReviewRejectView(APIView):
+    """POST /api/claims/<claim_id>/review/reject/"""
+
+    def post(self, request: Request, claim_id: str) -> Response:
+        run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
+        if err is not None:
+            return err
+        run, err = _load_run_for_claim(
+            claim_id, run_uuid, batch_uuid, lightweight=True,
+        )
+        if err is not None:
+            return err
+        assert run is not None
+
+        feedback, err = _parse_feedback_body(request, required=True)
+        if err is not None:
+            return err
+        assert feedback is not None
+
+        _apply_review_decision(run, review_status="rejected", feedback=feedback)
+        return Response(_serialize_review_status_update(run))
+
+
+class RunReviewStatusView(APIView):
+    """PATCH /api/execute/runs/<run_id>/review-status/
+
+    Mark the human audit / review workflow for one claim run (e.g.
+    ``{"reviewStatus": "in_progress"}``).
+    """
+
+    def patch(self, request: Request, run_id: str) -> Response:
+        try:
+            run = RuleExecutionRun.objects.get(id=run_id)
+        except RuleExecutionRun.DoesNotExist:
+            return Response({"detail": "not found"},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        review_status, err = _parse_review_status_body(request)
+        if err is not None:
+            return err
+        assert review_status is not None
+
+        _apply_review_status(run, review_status)
+        return Response(_serialize_review_status_update(run))
+
+
+class ClaimReviewStatusView(APIView):
+    """PATCH /api/claims/<claim_id>/review-status/
+
+    Same as ``RunReviewStatusView`` but resolves the run via ``claim_id`` and
+    optional ``?run_id=`` / ``?batch_id=`` query params.
+    """
+
+    def patch(self, request: Request, claim_id: str) -> Response:
+        run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
+        if err is not None:
+            return err
+        run, err = _load_run_for_claim(
+            claim_id, run_uuid, batch_uuid, lightweight=True,
+        )
+        if err is not None:
+            return err
+        assert run is not None
+
+        review_status, err = _parse_review_status_body(request)
+        if err is not None:
+            return err
+        assert review_status is not None
+
+        _apply_review_status(run, review_status)
+        return Response(_serialize_review_status_update(run))
 
 
 class RunNodesView(APIView):
@@ -1014,8 +1253,6 @@ class RunNodesView(APIView):
 
     No new tables; this is purely a derived view.
     """
-    permission_classes = [AllowAny]
-
     def get(self, _request: Request, run_id: str) -> Response:
         try:
             run = (RuleExecutionRun.objects
@@ -1045,8 +1282,6 @@ class RunNodesView(APIView):
 
 class ClaimSummaryView(APIView):
     """GET /api/claims/<claim_id>/summary/ — header + outer tools + summaries."""
-
-    permission_classes = [AllowAny]
 
     def get(self, request: Request, claim_id: str) -> Response:
         from .models import ClaimTrace
@@ -1080,16 +1315,15 @@ class ClaimSummaryView(APIView):
                 }
                 for inv in outer_tools
             ],
-            "reviewStatus": None,
-            "feedback": None,
+            "reviewStatus": run.review_status or None,
+            "auditorStatus": run.auditor_status or None,
+            "feedback": run.review_feedback or None,
         }
         return Response(payload, status=status.HTTP_200_OK)
 
 
 class ClaimAgentsView(APIView):
     """GET /api/claims/<claim_id>/agents/ — per-node execution + evaluations."""
-
-    permission_classes = [AllowAny]
 
     def get(self, request: Request, claim_id: str) -> Response:
         from .models import ClaimTrace
@@ -1122,8 +1356,6 @@ class ClaimAgentsView(APIView):
 
 class ClaimProcessingView(APIView):
     """GET /api/claims/<claim_id>/processing/ — legacy full snapshot (all tabs)."""
-
-    permission_classes = [AllowAny]
 
     def get(self, request: Request, claim_id: str) -> Response:
         run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
@@ -1169,8 +1401,9 @@ class ClaimProcessingView(APIView):
                 }
                 for log in llm_calls
             ],
-            "reviewStatus": None,
-            "feedback": None,
+            "reviewStatus": run.review_status or None,
+            "auditorStatus": run.auditor_status or None,
+            "feedback": run.review_feedback or None,
         }
         return Response(payload, status=status.HTTP_200_OK)
 
@@ -1205,7 +1438,6 @@ class ClaimTraceView(APIView):
     claim lookup; ``?batch_id=`` scopes it; ``?download=1`` returns the JSON as
     a file attachment. ``kind`` is set per URL route ("trace" | "explainability").
     """
-    permission_classes = [AllowAny]
     kind = "trace"
 
     def get(self, request: Request, claim_id: str) -> Response:
@@ -1246,11 +1478,11 @@ class ClaimTraceView(APIView):
 def _execution_upload_dir() -> Path:
     """Where the kickoff view stashes the .xlsx for the Celery task to read.
 
-    Sits under MEDIA_ROOT when configured, otherwise under the system temp
+    Sits under MEDIA_ROOT when configured, tempfile.gettempdir() under the system temp
     directory (matches Django's default upload behaviour).
     """
     media = getattr(settings, "MEDIA_ROOT", "") or ""
-    base = Path(media) if media else Path("/tmp")
+    base = Path(media) if media else Path(tempfile.gettempdir())
     target = base / "execution_uploads"
     target.mkdir(parents=True, exist_ok=True)
     return target
@@ -1273,8 +1505,6 @@ class RunBatchAsyncView(APIView):
     receive per-Shape / per-rule / per-claim events as they happen.
     """
     parser_classes = [MultiPartParser]
-    permission_classes = [AllowAny]
-
     def post(self, request: Request, workflow_id: str) -> Response:
         err, batch_id = _dispatch_batch(request=request, workflow_id=workflow_id)
         if err is not None:
@@ -1341,7 +1571,6 @@ class BatchEventsView(APIView):
     Terminates when a ``summary`` or ``error`` event arrives (the task's
     final publish) or when the client disconnects.
     """
-    permission_classes = [AllowAny]
     renderer_classes = [_EventStreamRenderer]
 
     def get(self, _request: Request, batch_id: str) -> StreamingHttpResponse:

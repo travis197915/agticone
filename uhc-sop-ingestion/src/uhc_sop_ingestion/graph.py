@@ -91,6 +91,16 @@ from .agents.a03_parse_html import (
     html_sub_procedures,
     html_links,
 )
+from .agents.a03b_html_graph import (
+    html_perceive,
+    html_entity_extractor,
+    html_relation_reasoner,
+    html_context_graph_writer,
+    html_context_validator,
+    html_step_synthesizer,
+    html_presection_synthesizer,
+    html_quality_gate,
+)
 from .agents.a04_parse_docx import (
     docx_metadata,
     docx_headings,
@@ -232,6 +242,7 @@ from .agents.a16_graph_synthesis import (
 )
 from .agents.a17_narrative import sop_overview_narrator, step_narrative_writer
 from .agents.a18_ir_synthesis import ir_maker, ir_checker
+from .agents.a18_versioning import revision_version_gate, pg_version_registry
 
 
 def _bind(fn, cfg: PipelineConfig):
@@ -305,6 +316,13 @@ def _route_after_fetch(state: PipelineState) -> str:
     }.get(fmt, "html_parse")
 
 
+def _route_after_version_check(state: PipelineState) -> str:
+    if state.get("is_duplicate") and state.get("version_action") == "UNCHANGED":
+        return "link_stage"
+    if state.get("doc_format") in ("PDF", "HTML"):
+        return "context_stage"
+    return "enrich_stage"
+
 def _route_completion(state: PipelineState) -> str:
     return "final_stage" if state.get("processing_complete") else "pick_next_url"
 
@@ -376,6 +394,40 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
             stage_name="html_parse",
         ),
     )
+    # HTML GRAPH DOOR — the SEPARATE HTML analog of the PDF vision door. Mirrors
+    # PDF's perceive → contextualize → synthesize but is driven by the structured
+    # DOM (deterministic perception). Shares NO code with the PDF agents.
+    # 1) contextualize: DOM -> pages -> entities/relations -> durable Neo4j
+    #    context graph (:HtmlDoc/:HtmlNode), with a per-page coverage retry.
+    g.add_node(
+        "html_contextualize",
+        _stage(
+            html_perceive,
+            html_entity_extractor,
+            html_relation_reasoner,
+            html_context_graph_writer,
+            html_context_validator,
+            cfg=cfg,
+            stage_name="html_contextualize",
+        ),
+    )
+    # 2) synthesize: pages/entities -> canonical steps/pre_sections (nested
+    #    decision rows), then the shared format-agnostic enrichers add group
+    #    rules, date conditions and the summary, then the SopIR quality gate.
+    g.add_node(
+        "html_synthesize",
+        _stage(
+            html_step_synthesizer,
+            html_presection_synthesizer,
+            pre_section_rule_extractor,
+            group_rule_extractor,
+            date_condition_extractor,
+            summary_generator,
+            html_quality_gate,
+            cfg=cfg,
+            stage_name="html_synthesize",
+        ),
+    )
     g.add_node(
         "docx_parse",
         _stage(
@@ -445,6 +497,12 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
             stage_name="pdf_synthesize",
         ),
     )
+
+    # ── Revision-date version gate (skip LLM when unchanged) ─────────────────
+    g.add_node("version_check_stage", _stage(
+        revision_version_gate,
+        cfg=cfg, stage_name="version_check_stage",
+    ))
 
     # ── LLM enrichment ────────────────────────────────────────────────────────
     g.add_node(
@@ -596,6 +654,7 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
             pg_annotation_writer,
             pg_reference_writer,
             pg_graph_writer,  # canonical knowledge-graph in Postgres
+            pg_version_registry,  # revision chain + diff
             pg_job_updater,
             cfg=cfg,
             stage_name="write_postgres",
@@ -685,15 +744,27 @@ def build_graph(cfg: PipelineConfig) -> StateGraph:
         },
     )
 
-    # Parse → enrich → context → validate → write (sequential)
-    # HTML/DOCX/XLSX share the HTML enrich_stage; PDF uses its own pdf_enrich
-    # army so the two flows never mix. Both rejoin at context_stage.
-    for parse_node in ("html_parse", "docx_parse", "xlsx_parse"):
-        g.add_edge(parse_node, "enrich_stage")
+    # Parse → version check → enrich/context → validate → write (sequential)
+    # DOCX/XLSX use enrich_stage after the gate. HTML and PDF each run a
+    # dedicated graph-first door (contextualize → synthesize) before version_check.
+    for parse_node in ("docx_parse", "xlsx_parse"):
+        g.add_edge(parse_node, "version_check_stage")
+    g.add_edge("html_parse", "html_contextualize")
+    g.add_edge("html_contextualize", "html_synthesize")
+    g.add_edge("html_synthesize", "version_check_stage")
     g.add_edge("pdf_perceive", "pdf_contextualize")
     g.add_edge("pdf_contextualize", "pdf_synthesize")
+    g.add_edge("pdf_synthesize", "version_check_stage")
+    g.add_conditional_edges(
+        "version_check_stage",
+        _route_after_version_check,
+        {
+            "enrich_stage": "enrich_stage",
+            "context_stage": "context_stage",
+            "link_stage": "link_stage",
+        },
+    )
     g.add_edge("enrich_stage", "context_stage")
-    g.add_edge("pdf_synthesize", "context_stage")
     g.add_edge("context_stage", "validate_stage")
     g.add_edge("validate_stage", "narrative_stage")
     g.add_edge("narrative_stage", "graph_synthesis_stage")

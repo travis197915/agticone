@@ -1,0 +1,16 @@
+{
+  "date_condition_extractor": "gpt-5-mini",
+  "group_rule_extractor": "gpt-5-mini",
+  "pre_section_rule_extractor": "gpt-5-mini",
+  "cross_reference_resolver": "gpt-5-mini",
+  "step_question_refiner": "opus",
+  "decision_row_classifier": "opus",
+  "rule_semantic_enricher": "opus",
+  "ambiguous_term_resolver": "opus",
+  "potf_validator": "opus",
+  "summary_generator": "opus",
+  "code_detector": "gpt-5-mini",
+  "entity_list_ref_detector": "gpt-5-mini",
+  "pdf_page_reader": "opus",
+  "__default__": "gpt-5-mini"
+}

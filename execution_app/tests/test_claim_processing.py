@@ -9,6 +9,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from agent_tools.models import NodeRuleBinding, NodeToolBinding, Tool
+from builder.auth import CorebackendUser
 from builder.models import Shape, ShapeCategory, ShapeDefinition, WorkArea, Workbench, Workflow
 from execution_app.models import BatchExecutionRun, RuleEvaluation, RuleExecutionRun, ToolInvocationRecord
 from sop_ingestion.models import AuditSop, IngestionJob
@@ -17,6 +18,9 @@ from sop_ingestion.models import AuditSop, IngestionJob
 class ClaimProcessingEndpointTests(TestCase):
     def setUp(self) -> None:
         self.client = APIClient()
+        self.client.force_authenticate(
+            user=CorebackendUser(id="test-user", email="t@example.com", role="MEMBER"),
+        )
         self.workflow = Workflow.objects.create(name="WF", slug=f"wf-{uuid.uuid4().hex[:8]}")
         self.batch = BatchExecutionRun.objects.create(
             workflow=self.workflow,
@@ -110,11 +114,11 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(body["runId"], str(run.id))
         self.assertEqual(body["batchId"], str(self.batch.id))
         self.assertEqual(body["workflowId"], str(self.workflow.id))
-        self.assertEqual(body["claimStatus"], "MET")
+        self.assertEqual(body["claimStatus"], "CLEAN")
         self.assertEqual(body["reviewStatus"], None)
         self.assertEqual(body["feedback"], None)
         self.assertEqual(len(body["agents"]), 1)
-        self.assertEqual(body["agents"][0]["status"], "MET")
+        self.assertEqual(body["agents"][0]["status"], "CLEAN")
         self.assertEqual(body["agents"][0]["steps"][0]["duration"], "12s")
         self.assertEqual(len(body["outerToolInvocations"]), 1)
         self.assertEqual(body["outerToolInvocations"][0]["phase"], "FETCH")
@@ -138,6 +142,102 @@ class ClaimProcessingEndpointTests(TestCase):
         body = resp.json()
         self.assertEqual(body["source"], "django")
         self.assertIn("Malformed run_id", body["error"])
+
+    def test_running_claim_reports_in_progress_status(self):
+        run = RuleExecutionRun.objects.create(
+            batch=self.batch,
+            workflow=self.workflow,
+            claim_id="RUNNING-CLAIM",
+            status="RUNNING",
+        )
+        resp = self.client.get("/api/claims/RUNNING-CLAIM/summary/")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["runStatus"], "RUNNING")
+        self.assertEqual(body["claimStatus"], "IN_PROGRESS")
+
+    def test_patch_review_status_in_progress(self):
+        run = self._create_run(claim_id="REVIEW-CLAIM")
+        resp = self.client.patch(
+            f"/api/execute/runs/{run.id}/review-status/",
+            {"reviewStatus": "in_progress"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["reviewStatus"], "in_progress")
+        run.refresh_from_db()
+        self.assertEqual(run.auditor_status, "IN_PROGRESS")
+        self.assertIsNotNone(run.review_started_at)
+        self.assertIn("reviewStartedAt", body)
+
+        summary = self.client.get("/api/claims/REVIEW-CLAIM/summary/")
+        self.assertEqual(summary.json()["reviewStatus"], "in_progress")
+
+    def test_patch_claim_review_status_endpoint(self):
+        run = self._create_run(claim_id="REVIEW-CLAIM-2")
+        resp = self.client.patch(
+            "/api/claims/REVIEW-CLAIM-2/review-status/",
+            {"review_status": "in_progress"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["runId"], str(run.id))
+        self.assertEqual(resp.json()["reviewStatus"], "in_progress")
+
+    def test_approve_review_optional_feedback(self):
+        run = self._create_run(claim_id="APPROVE-CLAIM")
+        resp = self.client.post(
+            f"/api/execute/runs/{run.id}/review/approve/",
+            {"feedback": "Looks good"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["reviewStatus"], "approved")
+        self.assertEqual(body["auditorStatus"], "APPROVED")
+        self.assertEqual(body["feedback"], "Looks good")
+        run.refresh_from_db()
+        self.assertEqual(run.review_status, "approved")
+        self.assertEqual(run.auditor_status, "APPROVED")
+        self.assertIsNotNone(run.reviewed_at)
+        self.assertEqual(run.review_feedback, "Looks good")
+
+    def test_approve_review_without_feedback(self):
+        run = self._create_run(claim_id="APPROVE-NO-FB")
+        resp = self.client.post(
+            f"/api/execute/runs/{run.id}/review/approve/",
+            {},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["reviewStatus"], "approved")
+        self.assertIsNone(resp.json()["feedback"])
+
+    def test_reject_review_requires_feedback(self):
+        run = self._create_run(claim_id="REJECT-CLAIM")
+        resp = self.client.post(
+            f"/api/execute/runs/{run.id}/review/reject/",
+            {},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("feedback is required", resp.json()["detail"])
+
+    def test_reject_review_with_feedback(self):
+        run = self._create_run(claim_id="REJECT-CLAIM")
+        resp = self.client.post(
+            "/api/claims/REJECT-CLAIM/review/reject/",
+            {"feedback": "Missing documentation"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["reviewStatus"], "rejected")
+        self.assertEqual(body["auditorStatus"], "REJECTED")
+        self.assertEqual(body["feedback"], "Missing documentation")
+        run.refresh_from_db()
+        self.assertIsNotNone(run.reviewed_at)
 
 
 class PersistFailureRegressionTests(TestCase):

@@ -57,6 +57,22 @@ class RuleExecutionRun(_UUIDPK):
         ("TERMINATED_EARLY", "Terminated early (DENY/STOP rule on a shape)"),
         ("FETCH_FAILED", "Claim fetch failed"),
     ]
+    REVIEW_STATUS_CHOICES = [
+        ("", "Not started"),
+        ("pending", "Pending review"),
+        ("in_progress", "In progress"),
+        ("approved", "Approved"),
+        ("rejected", "Rejected"),
+        ("completed", "Completed"),
+    ]
+    AUDITOR_STATUS_CHOICES = [
+        ("", "Not started"),
+        ("PENDING", "Pending"),
+        ("IN_PROGRESS", "In progress"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+        ("COMPLETED", "Completed"),
+    ]
 
     batch = models.ForeignKey(
         BatchExecutionRun, on_delete=models.SET_NULL, null=True, blank=True,
@@ -75,6 +91,15 @@ class RuleExecutionRun(_UUIDPK):
     applied_codes = models.JSONField(default=list, blank=True)
     narrative = models.TextField(blank=True, default="")
     error_message = models.TextField(blank=True, default="")
+    review_status = models.CharField(
+        max_length=32, choices=REVIEW_STATUS_CHOICES, blank=True, default="",
+    )
+    review_feedback = models.TextField(blank=True, default="")
+    auditor_status = models.CharField(
+        max_length=32, choices=AUDITOR_STATUS_CHOICES, blank=True, default="",
+    )
+    review_started_at = models.DateTimeField(null=True, blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
     # Identified Line of Business for this claim (SOW deliverable):
     # {"product", "network", "label", "source"}. Empty for legacy/failed runs.
     claim_lob = models.JSONField(default=dict, blank=True)

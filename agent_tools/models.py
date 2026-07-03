@@ -107,13 +107,11 @@ class McpServerConfig(_UUIDPK, _Timestamps):
     """Shared connection config for an external (mock or real) claims MCP/REST
     server that tools are routed to.
 
-    Only the **base endpoint** is stored here (once). Each tool stores **only
-    its path** in ``Tool.metadata['mcp_path']`` (e.g. ``/tools/facets_get_summary``).
-    The execution engine joins ``base_url + path`` at call time.
+    **Runtime resolution (see ``uhc_execution_engine.mcp_client``):**
+    1. ``MCP_SERVER_*`` env vars when ``MCP_SERVER_BASE_URL`` is set (production).
+    2. Else the most recently updated active row here (builder UI / legacy).
 
-    Exactly one row is normally active (``is_active=True``); the engine uses the
-    most recently updated active row. When no active row exists tools fall back
-    to their in-process ``agent_tools`` implementation (backward compatible).
+    Each tool stores **only its path** in ``Tool.metadata['mcp_path']``.
     """
 
     label = models.CharField(max_length=128, default="claims-mock-mcp")

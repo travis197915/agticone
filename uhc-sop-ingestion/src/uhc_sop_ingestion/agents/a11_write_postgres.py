@@ -31,6 +31,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Tiny in-process cache so we don't hit information_schema on every document.
+_COLUMN_EXISTS_CACHE: dict[tuple[str, str], bool] = {}
+
 
 def _ir_persist_enabled() -> bool:
     """When SOP_IR_PERSIST is on, the canonical-IR gate (sop_ir.persist.persist_ir,
@@ -72,6 +75,35 @@ def _exec(cfg: "PipelineConfig", sql: str, params: tuple) -> list:
     except Exception as exc:
         log.warning("pg write error: %s", exc)
         return []
+
+
+def _table_has_column(cfg: "PipelineConfig", table_name: str, column_name: str) -> bool:
+    """Best-effort schema probe used by raw SQL writers.
+
+    We support mixed environments where DB schema may be ahead/behind package
+    code. If the probe fails, assume column does not exist and keep writes safe.
+    """
+    key = (table_name, column_name)
+    cached = _COLUMN_EXISTS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    rows = _exec(
+        cfg,
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+              AND column_name = %s
+        );
+        """,
+        (table_name, column_name),
+    )
+    exists = bool(rows and rows[0] and rows[0][0])
+    _COLUMN_EXISTS_CACHE[key] = exists
+    return exists
 
 
 # ── serialization helpers ─────────────────────────────────────────────────────
@@ -175,83 +207,176 @@ def pg_sop_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     Returns {"sop_db_id": <int>} so all child writers can reference it.
     A human claims auditor opens this record first.
     """
+    from uhc_sop_ingestion.revision import normalize_canonical_url
+
     meta = state.get("metadata") or {}
     steps = state.get("steps") or []
     pre_secs = state.get("pre_sections") or []
     codes = state.get("detected_codes") or []
     dec_cnt = sum(len(s.get("decision_rows") or s.get("rows") or []) for s in steps)
 
-    sql = """
-        INSERT INTO sop_ingestion_auditsop (
-            job_id, url, content_hash, doc_format, neo4j_sop_id,
-            title, purpose, llm_summary, narrative_context,
-            platform, lob, audience, state_div, product,
-            effective_date, revision_date,
-            crawl_depth, parent_url,
-            step_count, decision_count, code_count, precondition_count,
-            raw_text, parse_warnings, crawled_at, updated_at
-        ) VALUES (
-            %s, %s, %s, %s, %s,
-            %s, %s, %s, %s,
-            %s, %s::jsonb, %s::jsonb, %s, %s,
-            %s, %s,
-            %s, %s,
-            %s, %s, %s, %s,
-            %s, %s::jsonb, NOW(), NOW()
-        )
-        ON CONFLICT ON CONSTRAINT unique_auditsop_job_hash
-        DO UPDATE SET
-            title              = EXCLUDED.title,
-            purpose            = EXCLUDED.purpose,
-            llm_summary        = EXCLUDED.llm_summary,
-            narrative_context  = CASE
+    current_url = _s(state.get("current_url", ""), 2048)
+    canonical_url = _s(
+        state.get("canonical_url")
+        or meta.get("canonical_url")
+        or normalize_canonical_url(current_url),
+        2048,
+    )
+    include_canonical_url = _table_has_column(
+        cfg, "sop_ingestion_auditsop", "canonical_url"
+    )
+    include_version_number = _table_has_column(
+        cfg, "sop_ingestion_auditsop", "version_number"
+    )
+    include_is_current = _table_has_column(
+        cfg, "sop_ingestion_auditsop", "is_current"
+    )
+    include_version_action = _table_has_column(
+        cfg, "sop_ingestion_auditsop", "version_action"
+    )
+    include_activation_status = _table_has_column(
+        cfg, "sop_ingestion_auditsop", "activation_status"
+    )
+    include_supersedes_id = _table_has_column(
+        cfg, "sop_ingestion_auditsop", "supersedes_id"
+    )
+    requires_review = bool(state.get("requires_human_review"))
+    if state.get("version_action"):
+        version_action = _s(state.get("version_action", "NEW"), 64)
+        is_current = not requires_review
+        activation_status = "pending_review" if requires_review else "active"
+    else:
+        is_current = bool(meta.get("is_current", True))
+        version_action = _s(meta.get("version_action", "NEW"), 64)
+        activation_status = _s(meta.get("activation_status", "active"), 64)
+    version_number = _i(meta.get("version_number")) or 1
+    prior_sop_id = _i(state.get("prior_sop_db_id"))
+
+    columns = [
+        "job_id", "url", "content_hash", "doc_format", "neo4j_sop_id",
+        "title", "purpose", "llm_summary", "narrative_context",
+        "platform", "lob", "audience", "state_div", "product",
+        "effective_date", "revision_date",
+        "crawl_depth", "parent_url",
+        "step_count", "decision_count", "code_count", "precondition_count",
+        "raw_text", "parse_warnings", "crawled_at", "updated_at",
+    ]
+    placeholders = [
+        "%s", "%s", "%s", "%s", "%s",
+        "%s", "%s", "%s", "%s",
+        "%s", "%s::jsonb", "%s::jsonb", "%s", "%s",
+        "%s", "%s",
+        "%s", "%s",
+        "%s", "%s", "%s", "%s",
+        "%s", "%s::jsonb", "NOW()", "NOW()",
+    ]
+    params: list[Any] = [
+        state.get("job_id", ""),
+        current_url,
+        _s(state.get("content_hash", "x"), 64),
+        _s(state.get("doc_format") or meta.get("doc_format", "HTML"), 8),
+        _s(state.get("neo4j_sop_id") or meta.get("sop_id", ""), 256),
+        _s(meta.get("title", ""), 4096),
+        _s(meta.get("purpose", ""), 4096),
+        _s(state.get("llm_summary", meta.get("llm_summary", "")), 8192),
+        _s(state.get("sop_narrative", "")),
+        _s(meta.get("platform", ""), 256),
+        _j(meta.get("lob", [])),
+        _j(meta.get("audience", [])),
+        _s(meta.get("state_div", ""), 256),
+        _s(meta.get("product", ""), 256),
+        _s(meta.get("effective_date", ""), 32),
+        _s(meta.get("revision_date", ""), 32),
+        _i(state.get("current_depth", 0)) or 0,
+        _s(state.get("current_parent_url", ""), 2048),
+        len(steps),
+        dec_cnt,
+        len(codes),
+        len(pre_secs),
+        _s(state.get("raw_text", ""))[:500_000],
+        _j(state.get("parse_warnings", [])),
+    ]
+
+    if include_canonical_url:
+        columns.insert(2, "canonical_url")
+        placeholders.insert(2, "%s")
+        params.insert(2, canonical_url)
+    if include_version_number:
+        columns.append("version_number")
+        placeholders.append("%s")
+        params.append(version_number)
+    if include_is_current:
+        columns.append("is_current")
+        placeholders.append("%s")
+        params.append(is_current)
+    if include_version_action:
+        columns.append("version_action")
+        placeholders.append("%s")
+        params.append(version_action)
+    if include_activation_status:
+        columns.append("activation_status")
+        placeholders.append("%s")
+        params.append(activation_status)
+    if include_supersedes_id and prior_sop_id:
+        columns.append("supersedes_id")
+        placeholders.append("%s")
+        params.append(prior_sop_id)
+
+    update_set = [
+        "title              = EXCLUDED.title",
+        "purpose            = EXCLUDED.purpose",
+        "llm_summary        = EXCLUDED.llm_summary",
+        """narrative_context  = CASE
                 WHEN EXCLUDED.narrative_context <> ''
                 THEN EXCLUDED.narrative_context
                 ELSE sop_ingestion_auditsop.narrative_context
-            END,
-            step_count         = EXCLUDED.step_count,
-            decision_count     = EXCLUDED.decision_count,
-            code_count         = EXCLUDED.code_count,
-            precondition_count = EXCLUDED.precondition_count,
-            raw_text           = EXCLUDED.raw_text,
-            updated_at         = NOW()
+            END""",
+        "effective_date     = EXCLUDED.effective_date",
+        "revision_date      = EXCLUDED.revision_date",
+        "platform           = EXCLUDED.platform",
+        "lob                = EXCLUDED.lob",
+        "audience           = EXCLUDED.audience",
+        "step_count         = EXCLUDED.step_count",
+        "decision_count     = EXCLUDED.decision_count",
+        "code_count         = EXCLUDED.code_count",
+        "precondition_count = EXCLUDED.precondition_count",
+        "raw_text           = EXCLUDED.raw_text",
+        "updated_at         = NOW()",
+    ]
+    if include_canonical_url:
+        update_set.insert(0, "canonical_url      = EXCLUDED.canonical_url")
+    if include_version_number:
+        update_set.insert(0, "version_number     = EXCLUDED.version_number")
+    if include_is_current:
+        update_set.insert(0, "is_current         = EXCLUDED.is_current")
+    if include_version_action:
+        update_set.insert(0, "version_action     = EXCLUDED.version_action")
+    if include_activation_status:
+        update_set.insert(0, "activation_status  = EXCLUDED.activation_status")
+
+    sql = f"""
+        INSERT INTO sop_ingestion_auditsop (
+            {", ".join(columns)}
+        ) VALUES (
+            {", ".join(placeholders)}
+        )
+        ON CONFLICT ON CONSTRAINT unique_auditsop_job_hash
+        DO UPDATE SET
+            {",\n            ".join(update_set)}
         RETURNING id;
     """
-    rows = _exec(
-        cfg,
-        sql,
-        (
-            state.get("job_id", ""),
-            _s(state.get("current_url", ""), 2048),
-            _s(state.get("content_hash", "x"), 64),
-            _s(meta.get("doc_format", "HTML"), 8),
-            _s(meta.get("sop_id", ""), 256),
-            _s(meta.get("title", ""), 4096),
-            _s(meta.get("purpose", ""), 4096),
-            _s(state.get("llm_summary", meta.get("llm_summary", "")), 8192),
-            _s(state.get("sop_narrative", "")),
-            _s(meta.get("platform", ""), 256),
-            _j(meta.get("lob", [])),
-            _j(meta.get("audience", [])),
-            _s(meta.get("state_div", ""), 256),
-            _s(meta.get("product", ""), 256),
-            _s(meta.get("effective_date", ""), 32),
-            _s(meta.get("revision_date", ""), 32),
-            _i(state.get("current_depth", 0)) or 0,
-            _s(state.get("current_parent_url", ""), 2048),
-            len(steps),
-            dec_cnt,
-            len(codes),
-            len(pre_secs),
-            _s(state.get("raw_text", ""))[:500_000],
-            _j(state.get("parse_warnings", [])),
-        ),
-    )
+    rows = _exec(cfg, sql, tuple(params))
+
 
     if rows:
         sop_id = rows[0][0]
         log.info("pg_sop_writer: sop_db_id=%s", sop_id)
         return {"sop_db_id": sop_id}
+    log.warning(
+        "pg_sop_writer: insert failed for job=%s url=%s — downstream PG writers will skip",
+        state.get("job_id", ""),
+        state.get("current_url", ""),
+    )
     return {}
 
 

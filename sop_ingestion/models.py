@@ -13,6 +13,12 @@ class JobStatus(models.TextChoices):
     PARTIAL   = "PARTIAL",   "Partial"
 
 
+class TriggerSource(models.TextChoices):
+    API      = "api",      "REST API"
+    WORKFLOW = "workflow", "Workflow builder"
+    CLI      = "cli",      "CLI / script"
+
+
 class IngestionJob(models.Model):
     job_id         = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     # Optional FK to the builder Workflow that triggered this ingestion.
@@ -34,8 +40,20 @@ class IngestionJob(models.Model):
     max_docs       = models.PositiveIntegerField(default=200)
     llm_provider   = models.CharField(max_length=32, default="anthropic")
     llm_model      = models.CharField(max_length=64,  default="claude-sonnet-4-5-20250929")
+    trigger_source = models.CharField(
+        max_length=32,
+        choices=TriggerSource.choices,
+        default=TriggerSource.API,
+        db_index=True,
+    )
     updated_at     = models.DateTimeField(auto_now=True)
     celery_task_id = models.CharField(max_length=255, blank=True)
+    trigger_source = models.CharField(
+        max_length=32,
+        default="manual",
+        blank=True,
+        help_text="manual | workflow | revision_check",
+    )
     created_at     = models.DateTimeField(auto_now_add=True)
     started_at     = models.DateTimeField(null=True, blank=True)
     completed_at   = models.DateTimeField(null=True, blank=True)
@@ -192,6 +210,41 @@ class LLMCallLog(models.Model):
 # Neo4j holds the graph edges (Step-[:IF_YES]->Step) for traversal.
 # Postgres holds the full relational record for querying and reporting.
 
+class SopDocument(models.Model):
+    """Stable identity for one SOP URL across ingestion jobs and revisions."""
+
+    canonical_url         = models.TextField(unique=True)
+    title                 = models.TextField(blank=True)
+    latest_revision_date  = models.CharField(max_length=32, blank=True)
+    current_version       = models.ForeignKey(
+        "AuditSop",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="+",
+    )
+    last_revision_check_at      = models.DateTimeField(null=True, blank=True)
+    last_remote_revision_date   = models.CharField(max_length=32, blank=True)
+    last_remote_content_hash    = models.CharField(max_length=64, blank=True)
+    last_revision_check_status  = models.CharField(max_length=32, blank=True)
+    last_revision_check_detail  = models.TextField(blank=True)
+    created_at            = models.DateTimeField(auto_now_add=True)
+    updated_at            = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "SOP Document"
+        ordering     = ["-updated_at"]
+
+    def __str__(self) -> str:
+        return self.title or self.canonical_url[:80]
+
+
+class ActivationStatus(models.TextChoices):
+    ACTIVE         = "active",         "Active"
+    PENDING_REVIEW = "pending_review", "Pending review"
+    REJECTED       = "rejected",       "Rejected"
+    SUPERSEDED     = "superseded",     "Superseded"
+
+
 class AuditSop(models.Model):
     """
     One ingested SOP document.  The root of every audit trail.
@@ -200,6 +253,28 @@ class AuditSop(models.Model):
     """
     job            = models.ForeignKey(IngestionJob, on_delete=models.CASCADE,
                                        related_name="audit_sops")
+    document       = models.ForeignKey(
+        SopDocument,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="versions",
+    )
+    canonical_url  = models.TextField(blank=True, db_index=True)
+    version_number = models.PositiveIntegerField(default=1)
+    is_current     = models.BooleanField(default=True, db_index=True)
+    activation_status = models.CharField(
+        max_length=16,
+        choices=ActivationStatus.choices,
+        default=ActivationStatus.ACTIVE,
+        db_index=True,
+    )
+    supersedes     = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="superseded_by_set",
+    )
+    version_action = models.CharField(max_length=24, blank=True, default="")
     # Identity
     url            = models.TextField()
     content_hash   = models.CharField(max_length=64, db_index=True)
@@ -245,15 +320,58 @@ class AuditSop(models.Model):
         # Named constraint (NOT unique_together) — the ingestion writer upserts
         # via ``ON CONFLICT ON CONSTRAINT unique_auditsop_job_hash`` (see
         # a11_write_postgres.py), so this exact name is load-bearing.
-        constraints     = [
-            models.UniqueConstraint(fields=["job", "content_hash"],
-                                    name="unique_auditsop_job_hash"),
+        constraints = [
+            models.UniqueConstraint(
+                fields=["job", "content_hash"],
+                name="unique_auditsop_job_hash",
+            ),
         ]
         ordering        = ["crawl_depth", "crawled_at"]
         verbose_name    = "Audit SOP"
 
     def __str__(self):
         return f"{self.title or self.url[:60]}"
+
+
+class SopVersionDiff(models.Model):
+    """Structured diff between two ingested versions of the same SOP document."""
+
+    document           = models.ForeignKey(
+        SopDocument,
+        on_delete=models.CASCADE,
+        related_name="diffs",
+    )
+    from_sop           = models.ForeignKey(
+        AuditSop,
+        on_delete=models.CASCADE,
+        null=True, blank=True,
+        related_name="diffs_from",
+    )
+    to_sop             = models.ForeignKey(
+        AuditSop,
+        on_delete=models.CASCADE,
+        related_name="diffs_to",
+    )
+    from_revision_date = models.CharField(max_length=32, blank=True)
+    to_revision_date   = models.CharField(max_length=32, blank=True)
+    from_content_hash  = models.CharField(max_length=64, blank=True)
+    to_content_hash    = models.CharField(max_length=64, blank=True)
+    summary            = models.JSONField(default=dict)
+    changes            = models.JSONField(default=list)
+    computed_at        = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "SOP Version Diff"
+        ordering     = ["-computed_at"]
+        constraints  = [
+            models.UniqueConstraint(
+                fields=["from_sop", "to_sop"],
+                name="uniq_sop_version_diff_pair",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"diff v{self.from_sop_id}→v{self.to_sop_id}"
 
 
 class AuditPrecondition(models.Model):
@@ -325,9 +443,11 @@ class AuditStep(models.Model):
     class Meta:
         # Named constraint — writer upserts via
         # ``ON CONFLICT ON CONSTRAINT unique_auditstep_sop_number``.
-        constraints     = [
-            models.UniqueConstraint(fields=["sop", "step_number"],
-                                    name="unique_auditstep_sop_number"),
+        constraints = [
+            models.UniqueConstraint(
+                fields=["sop", "step_number"],
+                name="unique_auditstep_sop_number",
+            ),
         ]
         ordering        = ["step_number"]
         verbose_name    = "Audit Step"
@@ -502,9 +622,11 @@ class AuditCode(models.Model):
     class Meta:
         # Named constraint — writer upserts via
         # ``ON CONFLICT ON CONSTRAINT unique_auditcode``.
-        constraints     = [
-            models.UniqueConstraint(fields=["sop", "code_value", "code_type"],
-                                    name="unique_auditcode"),
+        constraints = [
+            models.UniqueConstraint(
+                fields=["sop", "code_value", "code_type"],
+                name="unique_auditcode",
+            ),
         ]
         ordering        = ["code_type", "code_value"]
         verbose_name    = "Audit Code"
