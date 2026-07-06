@@ -168,6 +168,259 @@ def _request_url(cfg: dict[str, Any], path: str) -> str:
     return f"{cfg['base_url']}{path if path.startswith('/') else '/' + path}"
 
 
+def mcp_health_check_enabled() -> bool:
+    """Whether to probe MCP reachability once per claim before tool calls."""
+    raw = os.environ.get("MCP_HEALTH_CHECK_ENABLED", "true").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _first_tool_mcp_path() -> tuple[str, str] | None:
+    """Return ``(tool_name, mcp_path)`` for the first active tool with a path."""
+    try:
+        from agent_tools.models import Tool
+    except Exception:  # pragma: no cover
+        return None
+    for tool in Tool.objects.filter(is_active=True).only("name", "metadata"):
+        meta = tool.metadata if isinstance(tool.metadata, dict) else {}
+        path = (meta or {}).get("mcp_path") or ""
+        if path:
+            return tool.name, path
+    return None
+
+
+def tool_uses_mcp(tool_name: str) -> bool:
+    """True when MCP is configured and this tool has an ``mcp_path``."""
+    return bool(_active_config() and _tool_path(tool_name))
+
+
+def should_run_mcp_health_check(*, fetch_tool: str | None = None) -> bool:
+    """True when a once-per-claim MCP probe should run before any tool call."""
+    if not mcp_health_check_enabled():
+        return False
+    if not _active_config():
+        return False
+    if fetch_tool and _tool_path(fetch_tool):
+        return True
+    return _first_tool_mcp_path() is not None
+
+
+def format_mcp_health_error(health: dict[str, Any]) -> str:
+    """Stable user-facing message when the MCP health probe fails."""
+    status = health.get("status_code")
+    status_part = f", status={status}" if status is not None else ", status=None"
+    err = (health.get("error") or "").strip() or "route not available"
+    url = health.get("url") or "?"
+    return f"Claims tool service unavailable: {err} (probed {url}{status_part})"
+
+
+def check_mcp_health(
+    *,
+    tool_name: str | None = None,
+    claim_id: str = "",
+    explicit_path: str = "",
+) -> dict[str, Any]:
+    """Probe MCP reachability using a real tool route (or bare base URL).
+
+    Returns ``{ok, reachable, error, url, probed_tool, status_code, latency_ms}``.
+    """
+    cfg = _active_config()
+    if not cfg:
+        return {
+            "ok": True,
+            "reachable": True,
+            "error": "",
+            "url": "",
+            "probed_tool": None,
+            "status_code": None,
+            "latency_ms": 0,
+            "skipped": True,
+        }
+    return check_mcp_health_with_config(
+        cfg,
+        tool_name=tool_name,
+        claim_id=claim_id,
+        explicit_path=explicit_path,
+    )
+
+
+def check_mcp_health_with_config(
+    cfg: dict[str, Any],
+    *,
+    tool_name: str | None = None,
+    claim_id: str = "",
+    explicit_path: str = "",
+) -> dict[str, Any]:
+    """Probe using an explicit MCP config dict (runtime env/db or builder test row)."""
+    probe_path = (explicit_path or "").strip()
+    probed_tool: str | None = tool_name
+    if not probe_path and tool_name:
+        probe_path = _tool_path(tool_name)
+    if not probe_path:
+        picked = _first_tool_mcp_path()
+        if picked:
+            probed_tool, probe_path = picked
+
+    headers: dict[str, str] = {}
+    if cfg.get("api_key"):
+        headers[cfg["auth_header"]] = cfg["api_key"]
+    timeout_s = int(cfg.get("timeout") or 30)
+    t0 = time.time()
+
+    if not probe_path:
+        url = cfg["base_url"]
+        logger.info(
+            "mcp_health start claim=%s method=HEAD path=/ (base_url ping) timeout_s=%s",
+            claim_id or "-",
+            timeout_s,
+        )
+        try:
+            resp = requests.head(
+                url, headers=headers, timeout=timeout_s, allow_redirects=True,
+            )
+            if resp.status_code >= 400:
+                resp = requests.get(url, headers=headers, timeout=timeout_s)
+            latency_ms = int((time.time() - t0) * 1000)
+            ok = resp.status_code < 400
+            result = {
+                "ok": ok,
+                "reachable": True,
+                "error": "" if ok else f"HTTP {resp.status_code}",
+                "url": url,
+                "probed_tool": None,
+                "status_code": resp.status_code,
+                "latency_ms": latency_ms,
+            }
+            _log_mcp_health_result(claim_id=claim_id, probed_tool=None, result=result)
+            return result
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "reachable": False,
+                "error": str(exc),
+                "url": url,
+                "probed_tool": None,
+                "status_code": None,
+                "latency_ms": int((time.time() - t0) * 1000),
+            }
+            _log_mcp_health_result(claim_id=claim_id, probed_tool=None, result=result)
+            return result
+
+    url = _request_url(cfg, probe_path)
+    payload = {cfg["claim_arg"]: claim_id}
+    logger.info(
+        "mcp_health start claim=%s tool=%s method=%s path=%s timeout_s=%s",
+        claim_id or "-",
+        probed_tool or "-",
+        cfg["http_method"],
+        probe_path,
+        timeout_s,
+    )
+    try:
+        resp = requests.request(
+            cfg["http_method"], url, json=payload,
+            headers={**headers, "Content-Type": "application/json"},
+            timeout=timeout_s,
+        )
+        route_ok = resp.status_code != 404
+        latency_ms = int((time.time() - t0) * 1000)
+        error = ""
+        if not route_ok:
+            error = f"HTTP {resp.status_code}"
+        elif resp.status_code >= 500:
+            error = f"HTTP {resp.status_code}"
+        ok = route_ok and resp.status_code < 500
+        result = {
+            "ok": ok,
+            "reachable": True,
+            "route_ok": route_ok,
+            "error": error,
+            "url": url,
+            "probed_tool": probed_tool,
+            "status_code": resp.status_code,
+            "latency_ms": latency_ms,
+        }
+        _log_mcp_health_result(
+            claim_id=claim_id,
+            probed_tool=probed_tool,
+            result=result,
+            args=payload,
+            timeout_s=timeout_s,
+        )
+        return result
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "reachable": False,
+            "route_ok": None,
+            "error": str(exc),
+            "url": url,
+            "probed_tool": probed_tool,
+            "status_code": None,
+            "latency_ms": int((time.time() - t0) * 1000),
+        }
+        _log_mcp_health_result(
+            claim_id=claim_id,
+            probed_tool=probed_tool,
+            result=result,
+            args=payload,
+            timeout_s=timeout_s,
+            error_kind=classify_tool_error(exc),
+        )
+        return result
+
+
+def _log_mcp_health_result(
+    *,
+    claim_id: str,
+    probed_tool: str | None,
+    result: dict[str, Any],
+    args: dict[str, Any] | None = None,
+    timeout_s: int | None = None,
+    error_kind: str = "",
+) -> None:
+    """Emit mcp_health + tool_call [HEALTH] lines for grep-friendly tracing."""
+    from .tool_telemetry import log_tool_call
+
+    ok = bool(result.get("ok"))
+    duration_ms = int(result.get("latency_ms") or 0)
+    tool_name = probed_tool or "mcp_server"
+    error = str(result.get("error") or "")
+    status = result.get("status_code")
+
+    if ok:
+        logger.info(
+            "mcp_health ok claim=%s tool=%s url=%s status=%s ms=%s",
+            claim_id or "-",
+            tool_name,
+            result.get("url") or "-",
+            status if status is not None else "-",
+            duration_ms,
+        )
+    else:
+        logger.warning(
+            "mcp_health FAILED claim=%s tool=%s url=%s status=%s ms=%s error=%s",
+            claim_id or "-",
+            tool_name,
+            result.get("url") or "-",
+            status if status is not None else "-",
+            duration_ms,
+            error or "-",
+        )
+
+    log_tool_call(
+        tool_name=tool_name,
+        phase="HEALTH",
+        ok=ok,
+        duration_ms=duration_ms,
+        route="mcp",
+        claim_id=claim_id,
+        error=error,
+        args=args if args is not None else ({"claim_number": claim_id} if claim_id else {}),
+        timeout_s=timeout_s,
+        error_kind=error_kind or (classify_tool_error(None, error_text=error) if error else ""),
+    )
+
+
 def mcp_invoke(tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
     """Call the external server for ``tool_name``. Returns a tool_runner-shaped
     dict, or ``None`` when routing is not configured for this tool."""

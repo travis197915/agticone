@@ -22,6 +22,8 @@ from django.utils import timezone
 
 from .claim_fetcher import (fetch_claim, fetch_tool_error, parse_claim,
                             resolve_fetch_tool, workflow_uses_parser)
+from .mcp_client import (check_mcp_health, format_mcp_health_error,
+                         should_run_mcp_health_check)
 from .pipeline import RuleEnginePipeline
 from .rule_loader import load_workflow_bindings
 from .xlsx_parser import XlsxParseError, extract_claim_ids
@@ -285,8 +287,43 @@ class BatchRunner:
     def _run_one(self, *, workflow_id: str, claim_id: str,
                  batch_id: str, use_parser: bool,
                  fetch_tool: str | None = None) -> dict[str, Any]:
-        from execution_app.models import (RuleExecutionRun,
-                                             ToolInvocationRecord)
+        from execution_app.models import RuleExecutionRun, ToolInvocationRecord
+
+        if should_run_mcp_health_check(fetch_tool=fetch_tool):
+            logger.info(
+                "batch: MCP health check starting claim=%s fetch_tool=%s",
+                claim_id,
+                fetch_tool or "-",
+            )
+            health = check_mcp_health(tool_name=fetch_tool, claim_id=claim_id)
+            if not health.get("ok"):
+                run_id = str(uuid.uuid4())
+                error_message = format_mcp_health_error(health)
+                logger.warning(
+                    "batch: MCP health check failed claim=%s tool=%s url=%s error=%s",
+                    claim_id,
+                    health.get("probed_tool") or fetch_tool or "-",
+                    health.get("url") or "-",
+                    health.get("error") or "-",
+                )
+                RuleExecutionRun.objects.create(
+                    id=run_id,
+                    batch_id=batch_id,
+                    workflow_id=workflow_id,
+                    claim_id=claim_id,
+                    claim_payload={},
+                    raw_fetch={},
+                    finished_at=timezone.now(),
+                    status="FAILED",
+                    error_message=error_message,
+                )
+                return {
+                    "run_id": run_id,
+                    "claim_id": claim_id,
+                    "status": "FAILED",
+                    "error_message": error_message,
+                    "tool_invocations": [],
+                }
 
         # 1. Fetch the claim via the workflow's configured fetch tool (required;
         #    resolved from metadata or canvas bindings — no silent default).
@@ -351,6 +388,7 @@ class BatchRunner:
             claim_id=claim_id,
             batch_id=batch_id,
             run_id=run_id,
+            skip_mcp_health_check=True,
         )
 
         # Splice outer invocations onto the response + persist them too.
