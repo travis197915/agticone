@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
+from uhc_execution_engine.xlsx_parser import EXCEL_BILLING_FIELDS
+
 from . import trace_builder
 from .models import (BatchExecutionRun, RuleEvaluation, RuleExecutionRun,
                       ToolInvocationRecord)
@@ -19,6 +21,16 @@ def _format_time(ts) -> str:
     if ts is None:
         return ""
     return ts.strftime("%I:%M:%S %p")
+
+
+def _excel_claim_fields(payload: dict | None) -> dict:
+    if not payload:
+        return {}
+    return {
+        k: payload[k]
+        for k in EXCEL_BILLING_FIELDS
+        if payload.get(k) not in (None, "")
+    }
 
 
 def serialize_run_summary(run: RuleExecutionRun) -> dict:
@@ -50,6 +62,7 @@ def serialize_run_summary(run: RuleExecutionRun) -> dict:
         "feedback": run.review_feedback or None,
         "review_started_at": _format_time(run.review_started_at),
         "reviewed_at": _format_time(run.reviewed_at),
+        **_excel_claim_fields(run.claim_payload),
     }
 
 

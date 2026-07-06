@@ -11,6 +11,7 @@ from django.utils import timezone
 from ..config import get_config
 from ..memory import apply_claim_level_policy, update_claim_memory
 from ..state import ExecutionState
+from ..xlsx_parser import EXCEL_BILLING_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,13 @@ def _build_response(state: ExecutionState) -> dict[str, Any]:
     if status == "RUNNING":
         status = "COMPLETED"
 
+    claim = state.get("claim") or {}
+    excel_fields = {
+        k: claim[k]
+        for k in EXCEL_BILLING_FIELDS
+        if claim.get(k) not in (None, "")
+    }
+
     return {
         "run_id": state["run_id"],
         "claim_id": state.get("claim_id") or "",
@@ -274,6 +282,7 @@ def _build_response(state: ExecutionState) -> dict[str, Any]:
         # Per-claim LLM cost snapshot. ``cost`` is set in _persist after the run
         # children are written; ``{}`` for fail-open runs that never reached it.
         "cost": state.get("cost") or {},
+        **excel_fields,
     }
 
 
