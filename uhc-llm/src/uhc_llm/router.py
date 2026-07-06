@@ -7,6 +7,7 @@ from typing import Any, Protocol
 from .messages import extract_pdf_text_from_b64, pdf_document_blocks
 from .prompts import enrich_for_json
 from .routes import describe_api_key_target, describe_registry_target
+from .backend import DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL
 
 
 class _ApiKeyCfg(Protocol):
@@ -246,7 +247,7 @@ def _invoke_api_key_chat(
         model = getattr(cfg, "anthropic_model", None) if cfg else None
         api_key = getattr(cfg, "anthropic_api_key", None) if cfg else None
         llm = ChatAnthropic(
-            model=model or _env_model("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
+            model=model or _env_model("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL),
             api_key=api_key or _env("ANTHROPIC_API_KEY"),
             max_tokens=max_tokens,
             temperature=0,
@@ -262,7 +263,7 @@ def _invoke_api_key_chat(
         if json_mode:
             kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
         llm = ChatOpenAI(
-            model=model or _env_model("OPENAI_MODEL", "gpt-4o"),
+            model=model or _env_model("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
             api_key=api_key or _env("OPENAI_API_KEY"),
             max_tokens=max_tokens,
             temperature=0,
@@ -298,7 +299,7 @@ def _invoke_api_key_pdf(
     model = getattr(cfg, "anthropic_model", None) if cfg else None
     api_key = getattr(cfg, "anthropic_api_key", None) if cfg else None
     llm = ChatAnthropic(
-        model=model or _env_model("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
+        model=model or _env_model("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL),
         api_key=api_key or _env("ANTHROPIC_API_KEY"),
         max_tokens=max_tokens,
         temperature=0,

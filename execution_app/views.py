@@ -37,7 +37,8 @@ from rest_framework.views import APIView
 from . import trace_builder
 from .models import BatchExecutionRun, RuleExecutionRun
 from .serializers import (BatchExecutionRunSerializer,
-                          RuleExecutionRunSerializer, claim_audit_status,
+                          RuleExecutionRunSerializer, _excel_claim_fields,
+                          claim_audit_status,
                           serialize_run_summary)
 from .trace_builder import (CLEAN, DEFECT, INCONCLUSIVE, IN_PROGRESS, _CLEAN_DECISIONS,
                             _DEFECT_DECISIONS)
@@ -690,6 +691,7 @@ def _run_header_payload_light(run: RuleExecutionRun, trace=None) -> dict[str, An
         "auditorStatus": run.auditor_status or None,
         "feedback": run.review_feedback or None,
         **_review_date_fields(run),
+        **_excel_claim_fields(run.claim_payload),
     }
 
 
@@ -718,6 +720,7 @@ def _run_header_payload(
         "auditorStatus": run.auditor_status or None,
         "feedback": run.review_feedback or None,
         **_review_date_fields(run),
+        **_excel_claim_fields(run.claim_payload),
     }
 
 
@@ -1529,6 +1532,8 @@ def _sse_format(event_kind: str, data: dict) -> bytes:
 
 def _claim_payload_from_run(run: RuleExecutionRun) -> dict:
     """Project a RuleExecutionRun row into a `claim` SSE payload."""
+    from .serializers import _excel_claim_fields
+
     return {
         "claim_id":               run.claim_id,
         "run_id":                 str(run.id),
@@ -1537,6 +1542,7 @@ def _claim_payload_from_run(run: RuleExecutionRun) -> dict:
         "applied_codes":          list(run.applied_codes or []),
         "narrative":              run.narrative,
         "error_message":          run.error_message,
+        **_excel_claim_fields(run.claim_payload),
     }
 
 

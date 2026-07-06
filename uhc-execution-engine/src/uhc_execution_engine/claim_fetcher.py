@@ -106,7 +106,11 @@ def fetch_claim(claim_id: str, *,
             "duration_ms": 0,
         }
     args = _fetch_args(tool_name, claim_id, extra_args)
-    return invoke_tool(tool_name, args)
+    return invoke_tool(
+        tool_name, args,
+        phase="FETCH",
+        claim_id=claim_id,
+    )
 
 
 def workflow_fetch_tool(workflow_id: str) -> str | None:
@@ -118,7 +122,19 @@ def parse_claim(raw_fetch: dict[str, Any], template_name: str = "default"
                 ) -> dict[str, Any]:
     """Normalize the fetch payload via ``llm_parse_claim_with_ontology``."""
     args = {"claim_data": raw_fetch, "template_name": template_name}
-    return invoke_tool(PARSE_TOOL, args)
+    claim_id = ""
+    if isinstance(raw_fetch, dict):
+        claim_id = str(
+            raw_fetch.get("claim_number")
+            or raw_fetch.get("claim_id")
+            or raw_fetch.get("subscriber_id")
+            or ""
+        )
+    return invoke_tool(
+        PARSE_TOOL, args,
+        phase="PARSE",
+        claim_id=claim_id,
+    )
 
 
 def workflow_uses_parser(all_tool_bindings: list[dict[str, Any]]) -> bool:

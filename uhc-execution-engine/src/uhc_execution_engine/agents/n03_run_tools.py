@@ -15,9 +15,11 @@ from typing import Any
 
 from ..claim_fetcher import FETCH_TOOL, PARSE_TOOL
 from ..config import get_config
+from ..mcp_client import parallel_tool_invoke_timeout_seconds
 from ..memory import lookup_reusable_tool
 from ..state import ExecutionState
 from ..tool_runner import invoke_tool
+from ..tool_telemetry import log_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +114,6 @@ def run_tools(state: ExecutionState) -> dict:
     prior_context = state.get("prior_context") or {}
     outcomes: dict[str, dict[str, Any]] = {}
     live_groups: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
-    reused_keys: set[str] = set()
     for key, members in groups.items():
         rep_tb, rep_args = members[0]
         remembered = lookup_reusable_tool(cfg, prior_context,
@@ -127,12 +128,16 @@ def run_tools(state: ExecutionState) -> dict:
                 "duration_ms": 0,
                 "reused_from_run": remembered.get("run_id") or "",
             }
-            reused_keys.add(key)
         else:
             live_groups[key] = members
 
-    def _run_group(rep_tool: str, rep_args: dict[str, Any]) -> dict[str, Any]:
-        return invoke_tool(rep_tool, rep_args)
+    def _run_group(rep_tool: str, rep_args: dict[str, Any], rep_binding: str) -> dict[str, Any]:
+        return invoke_tool(
+            rep_tool, rep_args,
+            phase="EVALUATE",
+            binding_id=rep_binding,
+            claim_id=str(state.get("claim_id") or ""),
+        )
 
     # Invoke the distinct LIVE calls in parallel. Propagate the contextvars
     # (run_id / batch_id) so LLMCallLog stamping + SSE publishing keep working
@@ -140,6 +145,7 @@ def run_tools(state: ExecutionState) -> dict:
     # object cannot be entered by more than one thread at a time (RuntimeError),
     # which would otherwise serialize everything.
     workers = max(1, min(int(getattr(cfg, "tool_prefetch_workers", 8) or 8), len(live_groups) or 1))
+    parallel_timeout = parallel_tool_invoke_timeout_seconds()
     if live_groups:
         if workers > 1 and len(live_groups) > 1:
             with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -147,20 +153,64 @@ def run_tools(state: ExecutionState) -> dict:
                 for key, members in live_groups.items():
                     rep_tb, rep_args = members[0]
                     task_ctx = contextvars.copy_context()
-                    futs[ex.submit(task_ctx.run, _run_group, rep_tb["tool_name"], rep_args)] = key
+                    futs[ex.submit(
+                        task_ctx.run, _run_group,
+                        rep_tb["tool_name"], rep_args, rep_tb["binding_id"],
+                    )] = key
                 for fut in _cf.as_completed(futs):
                     key = futs[fut]
+                    rep_tb, rep_args = live_groups[key][0]
                     try:
-                        outcomes[key] = fut.result()
+                        if parallel_timeout:
+                            outcomes[key] = fut.result(timeout=parallel_timeout)
+                        else:
+                            outcomes[key] = fut.result()
+                    except _cf.TimeoutError:
+                        logger.warning(
+                            "run_tools TIMEOUT claim=%s tool=%s binding=%s "
+                            "parallel_timeout_s=%s",
+                            state.get("claim_id") or "-",
+                            rep_tb["tool_name"],
+                            rep_tb["binding_id"],
+                            parallel_timeout,
+                        )
+                        outcomes[key] = {
+                            "ok": False,
+                            "tool": rep_tb["tool_name"],
+                            "args": rep_args,
+                            "result": None,
+                            "error": (
+                                f"parallel tool invoke exceeded "
+                                f"{parallel_timeout}s timeout"
+                            ),
+                            "duration_ms": int(parallel_timeout * 1000),
+                            "error_kind": "timeout",
+                            "timeout_s": parallel_timeout,
+                        }
+                        log_tool_call(
+                            tool_name=rep_tb["tool_name"],
+                            phase="EVALUATE",
+                            ok=False,
+                            duration_ms=int(parallel_timeout * 1000),
+                            route="mcp",
+                            binding_id=rep_tb["binding_id"],
+                            claim_id=str(state.get("claim_id") or ""),
+                            error=outcomes[key]["error"],
+                            args=rep_args,
+                            timeout_s=parallel_timeout,
+                            error_kind="timeout",
+                        )
                     except Exception as exc:  # pragma: no cover — defensive
-                        rep_tb, rep_args = live_groups[key][0]
                         outcomes[key] = {"ok": False, "tool": rep_tb["tool_name"],
                                          "args": rep_args, "result": None,
-                                         "error": str(exc), "duration_ms": 0}
+                                         "error": str(exc), "duration_ms": 0,
+                                         "error_kind": "other"}
         else:
             for key, members in live_groups.items():
                 rep_tb, rep_args = members[0]
-                outcomes[key] = _run_group(rep_tb["tool_name"], rep_args)
+                outcomes[key] = _run_group(
+                    rep_tb["tool_name"], rep_args, rep_tb["binding_id"],
+                )
 
     # Fan each distinct outcome out to every binding that shared the call.
     for key, members in groups.items():

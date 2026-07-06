@@ -46,10 +46,15 @@ def dispatch_sop_ingestions(workflow: Workflow, urls: Iterable[str]) -> list[dic
         if not url:
             continue
         try:
+            from uhc_llm.backend import resolve_ingestion_job_llm
+
+            llm_provider, llm_model = resolve_ingestion_job_llm()
             job = IngestionJob.objects.create(
                 workflow=workflow,
                 seed_url=url,
                 trigger_source=TriggerSource.WORKFLOW,
+                llm_provider=llm_provider,
+                llm_model=llm_model,
             )
             try:
                 task = run_ingestion_pipeline.delay(str(job.job_id))

@@ -354,88 +354,49 @@ class McpServerTestView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, pk, *args, **kwargs):
-        import time
-
-        import requests
-
-        cfg = McpServerConfig.objects.filter(pk=pk).first()
-        if not cfg:
+        cfg_row = McpServerConfig.objects.filter(pk=pk).first()
+        if not cfg_row:
             return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
 
         body = request.data if isinstance(request.data, dict) else {}
         explicit_path = (body.get("path") or "").strip()
         sample_claim = str(body.get("claim_number") or body.get("claim") or "").strip()
 
-        # Resolve a tool route to probe.
-        probe_path = explicit_path
-        probed_tool = None
-        if not probe_path:
-            for t in Tool.objects.filter(is_active=True).only("name", "metadata"):
-                p = (t.metadata or {}).get("mcp_path") if isinstance(t.metadata, dict) else None
-                if p:
-                    probe_path, probed_tool = p, t.name
-                    break
+        from uhc_execution_engine.mcp_client import check_mcp_health_with_config
 
-        base = (cfg.base_url or "").rstrip("/")
-        headers = {}
-        if cfg.api_key:
-            headers[cfg.auth_header] = cfg.api_key
-
-        t0 = time.time()
-
-        # ── No tool path to probe → bare base-URL host-up ping ──────────────
-        if not probe_path:
-            url = base
-            try:
-                resp = requests.head(url, headers=headers,
-                                     timeout=cfg.timeout_seconds or 30, allow_redirects=True)
-                if resp.status_code >= 400:
-                    resp = requests.get(url, headers=headers, timeout=cfg.timeout_seconds or 30)
-                return Response({
-                    "ok": resp.status_code < 400,
-                    "reachable": True,
-                    "status_code": resp.status_code,
-                    "latency_ms": int((time.time() - t0) * 1000),
-                    "url": url,
-                    "probed_tool": None,
-                    "note": "no tool has an mcp_path yet — set one on the Tool Calls "
-                            "page to verify a real route.",
-                })
-            except Exception as exc:
-                return Response({
-                    "ok": False, "reachable": False, "status_code": None,
-                    "latency_ms": int((time.time() - t0) * 1000), "url": url,
-                    "probed_tool": None, "error": str(exc),
-                })
-
-        # ── Probe the actual tool route ─────────────────────────────────────
-        url = f"{base}{probe_path if probe_path.startswith('/') else '/' + probe_path}"
-        payload = {cfg.claim_arg or "claim_number": sample_claim}
-        try:
-            resp = requests.request(
-                (cfg.http_method or "POST").upper(), url, json=payload,
-                headers={**headers, "Content-Type": "application/json"},
-                timeout=cfg.timeout_seconds or 30,
+        cfg = {
+            "base_url": (cfg_row.base_url or "").rstrip("/"),
+            "auth_header": cfg_row.auth_header or "x-api-key",
+            "api_key": cfg_row.api_key or "",
+            "http_method": (cfg_row.http_method or "POST").upper(),
+            "claim_arg": cfg_row.claim_arg or "claim_number",
+            "timeout": cfg_row.timeout_seconds or 30,
+        }
+        health = check_mcp_health_with_config(
+            cfg,
+            claim_id=sample_claim,
+            explicit_path=explicit_path,
+        )
+        payload = {
+            "ok": health.get("ok"),
+            "reachable": health.get("reachable"),
+            "status_code": health.get("status_code"),
+            "latency_ms": health.get("latency_ms"),
+            "url": health.get("url"),
+            "probed_tool": health.get("probed_tool"),
+        }
+        if health.get("route_ok") is not None:
+            payload["route_ok"] = health.get("route_ok")
+        if sample_claim:
+            payload["sample_claim"] = sample_claim
+        if health.get("error"):
+            payload["error"] = health.get("error")
+        if not explicit_path and not health.get("probed_tool") and health.get("reachable"):
+            payload["note"] = (
+                "no tool has an mcp_path yet — set one on the Tool Calls "
+                "page to verify a real route."
             )
-            route_ok = resp.status_code != 404
-            return Response({
-                # Route exists (any non-404) → the server + auth + route are wired up.
-                "ok": route_ok,
-                "reachable": True,
-                "route_ok": route_ok,
-                "status_code": resp.status_code,
-                "latency_ms": int((time.time() - t0) * 1000),
-                "url": url,
-                "probed_tool": probed_tool,
-                "sample_claim": sample_claim,
-            })
-        except Exception as exc:
-            return Response({
-                "ok": False, "reachable": False, "route_ok": None,
-                "status_code": None,
-                "latency_ms": int((time.time() - t0) * 1000),
-                "url": url, "probed_tool": probed_tool, "error": str(exc),
-            })
+        return Response(payload)
 
 
 class ToolInvokeView(APIView):

@@ -543,8 +543,10 @@ def _make_openai_vision_llm(cfg, max_tokens: int = 8192):
     """A higher-token ChatOpenAI (gpt-4o family) for multimodal page-image
     perception. Keeps json_object mode so the contract matches the text path."""
     from langchain_openai import ChatOpenAI
+    from uhc_llm.backend import DEFAULT_OPENAI_MODEL
+
     return ChatOpenAI(
-        model=cfg.openai_model or "gpt-4o",
+        model=cfg.openai_model or DEFAULT_OPENAI_MODEL,
         api_key=cfg.openai_api_key,
         max_tokens=max_tokens,
         temperature=0,

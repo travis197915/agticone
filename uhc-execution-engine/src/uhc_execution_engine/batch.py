@@ -22,15 +22,40 @@ from django.utils import timezone
 
 from .claim_fetcher import (fetch_claim, fetch_tool_error, parse_claim,
                             resolve_fetch_tool, workflow_uses_parser)
+from .mcp_client import (check_mcp_health, format_mcp_health_error,
+                         should_run_mcp_health_check)
 from .pipeline import RuleEnginePipeline
 from .rule_loader import load_workflow_bindings
-from .xlsx_parser import XlsxParseError, extract_claim_ids
+from .xlsx_parser import XlsxParseError, extract_claim_rows, EXCEL_BILLING_FIELDS
 
 logger = logging.getLogger(__name__)
 
+_EXCEL_RESPONSE_KEYS = EXCEL_BILLING_FIELDS
+
+
+def _excel_fields(excel_row: dict[str, Any] | None) -> dict[str, Any]:
+    if not excel_row:
+        return {}
+    return {
+        k: excel_row[k]
+        for k in _EXCEL_RESPONSE_KEYS
+        if excel_row.get(k) not in (None, "")
+    }
+
+
+def _apply_excel_metadata(claim: dict[str, Any],
+                          excel_row: dict[str, Any] | None) -> dict[str, Any]:
+    fields = _excel_fields(excel_row)
+    if not fields:
+        return claim
+    merged = dict(claim)
+    merged.update(fields)
+    return merged
+
 
 def _claim_from_fetch(claim_id: str, raw_fetch_result: dict[str, Any],
-                      parsed: dict[str, Any] | None) -> dict[str, Any]:
+                      parsed: dict[str, Any] | None,
+                      excel_row: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build the claim dict handed to the inner pipeline.
 
     If `llm_parse_claim_with_ontology` ran successfully, prefer its
@@ -46,7 +71,7 @@ def _claim_from_fetch(claim_id: str, raw_fetch_result: dict[str, Any],
         if isinstance(data, dict):
             base.update({k: v for k, v in data.items()
                          if k not in base or base[k] in ("", None)})
-    return base
+    return _apply_excel_metadata(base, excel_row)
 
 
 class BatchRunner:
@@ -94,7 +119,7 @@ class BatchRunner:
 
         # ── 1. Parse the workbook ──────────────────────────────────────────
         try:
-            claim_ids, resolved_col = extract_claim_ids(
+            claim_rows, resolved_col = extract_claim_rows(
                 xlsx_bytes, claim_id_column=claim_id_column,
                 sheet_name=sheet_name)
         except XlsxParseError as exc:
@@ -118,7 +143,7 @@ class BatchRunner:
                 "kind": "summary",
                 "batch": {
                     "id": batch_id, "status": "FAILED",
-                    "total_claims": len(claim_ids), "completed": 0, "failed": 0,
+                    "total_claims": len(claim_rows), "completed": 0, "failed": 0,
                     "duration_ms": int((time.time() - t0) * 1000),
                     "error_message": f"load_workflow_bindings: {exc}",
                 },
@@ -136,7 +161,7 @@ class BatchRunner:
                 workflow_id=str(workflow_id),
                 source_filename=filename,
                 claim_id_column=resolved_col,
-                total_claims=len(claim_ids),
+                total_claims=len(claim_rows),
                 status="RUNNING",
             ),
         )
@@ -146,7 +171,7 @@ class BatchRunner:
             BatchExecutionRun.objects.filter(id=batch_id).update(
                 source_filename=filename,
                 claim_id_column=resolved_col,
-                total_claims=len(claim_ids),
+                total_claims=len(claim_rows),
                 status="RUNNING",
             )
 
@@ -161,7 +186,7 @@ class BatchRunner:
                 "kind": "summary",
                 "batch": {
                     "id": batch_id, "status": "FAILED",
-                    "total_claims": len(claim_ids), "completed": 0, "failed": 0,
+                    "total_claims": len(claim_rows), "completed": 0, "failed": 0,
                     "duration_ms": int((time.time() - t0) * 1000),
                     "error_message": err,
                 },
@@ -173,7 +198,7 @@ class BatchRunner:
             "kind": "batch_start",
             "batch_id": batch_id,
             "workflow_id": str(workflow_id),
-            "total_claims": len(claim_ids),
+            "total_claims": len(claim_rows),
             "claim_id_column": resolved_col,
             "source_filename": filename,
         }
@@ -182,11 +207,12 @@ class BatchRunner:
         completed = 0
         failed = 0
         logger.info("batch=%s starting per-claim loop over %d claim(s)",
-                    batch_id, len(claim_ids))
-        for cid in claim_ids:
+                    batch_id, len(claim_rows))
+        for row in claim_rows:
+            cid = str(row["claim_id"])
             res = self._run_one(workflow_id=str(workflow_id), claim_id=cid,
                                 batch_id=batch_id, use_parser=use_parser,
-                                fetch_tool=fetch_tool)
+                                fetch_tool=fetch_tool, excel_row=row)
             counted_as = ("completed" if res["status"]
                           in {"COMPLETED", "TERMINATED_EARLY"} else "failed")
             if counted_as == "completed":
@@ -222,7 +248,7 @@ class BatchRunner:
             "batch": {
                 "id": batch_id,
                 "status": batch_status,
-                "total_claims": len(claim_ids),
+                "total_claims": len(claim_rows),
                 "completed": completed,
                 "failed": failed,
                 "duration_ms": int((time.time() - t0) * 1000),
@@ -284,9 +310,48 @@ class BatchRunner:
 
     def _run_one(self, *, workflow_id: str, claim_id: str,
                  batch_id: str, use_parser: bool,
-                 fetch_tool: str | None = None) -> dict[str, Any]:
-        from execution_app.models import (RuleExecutionRun,
-                                             ToolInvocationRecord)
+                 fetch_tool: str | None = None,
+                 excel_row: dict[str, Any] | None = None) -> dict[str, Any]:
+        from execution_app.models import RuleExecutionRun, ToolInvocationRecord
+
+        excel_payload = _excel_fields(excel_row)
+
+        if should_run_mcp_health_check(fetch_tool=fetch_tool):
+            logger.info(
+                "batch: MCP health check starting claim=%s fetch_tool=%s",
+                claim_id,
+                fetch_tool or "-",
+            )
+            health = check_mcp_health(tool_name=fetch_tool, claim_id=claim_id)
+            if not health.get("ok"):
+                run_id = str(uuid.uuid4())
+                error_message = format_mcp_health_error(health)
+                logger.warning(
+                    "batch: MCP health check failed claim=%s tool=%s url=%s error=%s",
+                    claim_id,
+                    health.get("probed_tool") or fetch_tool or "-",
+                    health.get("url") or "-",
+                    health.get("error") or "-",
+                )
+                RuleExecutionRun.objects.create(
+                    id=run_id,
+                    batch_id=batch_id,
+                    workflow_id=workflow_id,
+                    claim_id=claim_id,
+                    claim_payload=excel_payload,
+                    raw_fetch={},
+                    finished_at=timezone.now(),
+                    status="FAILED",
+                    error_message=error_message,
+                )
+                return {
+                    "run_id": run_id,
+                    "claim_id": claim_id,
+                    "status": "FAILED",
+                    "error_message": error_message,
+                    "tool_invocations": [],
+                    **excel_payload,
+                }
 
         # 1. Fetch the claim via the workflow's configured fetch tool (required;
         #    resolved from metadata or canvas bindings — no silent default).
@@ -295,7 +360,7 @@ class BatchRunner:
             run_id = str(uuid.uuid4())
             run = RuleExecutionRun.objects.create(
                 id=run_id, batch_id=batch_id, workflow_id=workflow_id,
-                claim_id=claim_id, claim_payload={},
+                claim_id=claim_id, claim_payload=excel_payload,
                 raw_fetch=fetch_out.get("result") if isinstance(fetch_out.get("result"), dict) else {},
                 finished_at=timezone.now(),
                 status="FETCH_FAILED",
@@ -315,6 +380,7 @@ class BatchRunner:
                     "ok": False, "ms": fetch_out["duration_ms"],
                     "error": fetch_out["error"],
                 }],
+                **excel_payload,
             }
 
         # 2. Optional parse step
@@ -340,7 +406,9 @@ class BatchRunner:
                 parsed_payload = parse_out["result"]
 
         # 3. Build the claim dict + invoke the inner pipeline
-        claim = _claim_from_fetch(claim_id, fetch_out["result"] or {}, parsed_payload)
+        claim = _claim_from_fetch(
+            claim_id, fetch_out["result"] or {}, parsed_payload, excel_row,
+        )
         run_id = str(uuid.uuid4())
         # Seed the inner pipeline's tool_invocations with the outer-layer calls
         # so they show up in the response + persistence in one place.
@@ -351,6 +419,7 @@ class BatchRunner:
             claim_id=claim_id,
             batch_id=batch_id,
             run_id=run_id,
+            skip_mcp_health_check=True,
         )
 
         # Splice outer invocations onto the response + persist them too.
@@ -375,4 +444,5 @@ class BatchRunner:
              "ok": inv["ok"], "ms": inv["duration_ms"],
              "error": inv["error"]} for inv in outer_invocations
         ] + response["tool_invocations"]
+        response.update(excel_payload)
         return response

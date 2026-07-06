@@ -31,11 +31,22 @@ class IngestionJobSerializer(serializers.ModelSerializer):
         return None
 
 
+def _default_llm_provider() -> str:
+    from sop_ingestion.models import _default_job_llm_provider
+
+    return _default_job_llm_provider()
+
+
+def _default_llm_model() -> str:
+    from sop_ingestion.models import _default_job_llm_model
+
+    return _default_job_llm_model()
+
+
 class StartJobSerializer(serializers.Serializer):
     seed_url     = serializers.URLField()
     max_depth    = serializers.IntegerField(min_value=1, max_value=8,   default=4)
     max_docs     = serializers.IntegerField(min_value=1, max_value=500, default=200)
     llm_provider = serializers.ChoiceField(choices=["openai", "anthropic"],
-                                           default="anthropic")
-    llm_model    = serializers.CharField(max_length=64,
-                                         default="claude-sonnet-4-5-20250929")
+                                           default=_default_llm_provider)
+    llm_model    = serializers.CharField(max_length=64, default=_default_llm_model)
