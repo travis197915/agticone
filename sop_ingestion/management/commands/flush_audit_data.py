@@ -125,19 +125,11 @@ class Command(BaseCommand):
         self.stdout.write(self.style.MIGRATE_HEADING("MongoDB…"))
         try:
             from pymongo import MongoClient
-            from urllib.parse import quote_plus
 
-            host = os.environ.get("MONGO_HOST", "localhost")
-            port = int(os.environ.get("MONGO_PORT", "27017"))
-            user = os.environ.get("MONGO_USER", "")
-            pw = os.environ.get("MONGO_PASSWORD", "")
+            from sop_backend.db_config import mongo_uri_from_env
+
             db_name = os.environ.get("MONGO_DATABASE", "sop_ingestion")
-            if user and pw:
-                creds = f"{quote_plus(user)}:{quote_plus(pw)}@"
-            else:
-                creds = ""
-            uri = f"mongodb://{creds}{host}:{port}/"
-            client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+            client = MongoClient(mongo_uri_from_env(), serverSelectionTimeoutMS=10000)
             db = client[db_name]
             cols = db.list_collection_names()
             for c in cols:
@@ -153,12 +145,12 @@ class Command(BaseCommand):
         try:
             from neo4j import GraphDatabase
 
-            host = os.environ.get("NEO4J_HOST", "localhost")
-            port = int(os.environ.get("NEO4J_PORT", "7687"))
+            from sop_backend.db_config import neo4j_uri_from_env
+
             user = os.environ.get("NEO4J_USER", "neo4j")
             pw = os.environ.get("NEO4J_PASSWORD", "")
             db_name = os.environ.get("NEO4J_DATABASE", "neo4j")
-            driver = GraphDatabase.driver(f"neo4j://{host}:{port}", auth=(user, pw))
+            driver = GraphDatabase.driver(neo4j_uri_from_env(), auth=(user, pw))
             with driver.session(database=db_name) as session:
                 session.run("MATCH (n) DETACH DELETE n")
             driver.close()
@@ -172,6 +164,8 @@ class Command(BaseCommand):
         try:
             import redis
 
+            from sop_backend.db_config import redis_ssl_kwargs
+
             host = os.environ.get("REDIS_HOST", "localhost")
             port = int(os.environ.get("REDIS_PORT", "6379"))
             user = os.environ.get("REDIS_USER", "default")
@@ -180,6 +174,7 @@ class Command(BaseCommand):
             client = redis.Redis(
                 host=host, port=port, username=user, password=pw,
                 db=db_idx, socket_connect_timeout=10,
+                **redis_ssl_kwargs(),
             )
             client.flushdb()
             self.stdout.write(f"  flushed Redis DB {db_idx}")
