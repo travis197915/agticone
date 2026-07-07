@@ -131,21 +131,15 @@ def _mongo_db():
     Returns the database handle or None when Mongo is not configured/reachable
     — the relational write is authoritative, so a missing Mongo never blocks a
     persist (it just skips the lossless archive)."""
-    host = os.environ.get("MONGO_HOST")
-    if not host:
-        return None
     try:
-        from urllib.parse import quote_plus
-
         from pymongo import MongoClient
 
-        user = os.environ.get("MONGO_USER", "admin")
-        password = os.environ.get("MONGO_PASSWORD", "")
-        port = int(os.environ.get("MONGO_PORT", "27017"))
+        from sop_backend.db_config import is_prod, mongo_uri_from_env
+
+        if not (os.environ.get("MONGO_HOST") or (is_prod() and os.environ.get("MONGO_URI"))):
+            return None
         database = os.environ.get("MONGO_DATABASE", "sop_ingestion")
-        creds = f"{quote_plus(user)}:{quote_plus(password)}@" if (user and password) else ""
-        uri = f"mongodb://{creds}{host}:{port}/"
-        client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+        client = MongoClient(mongo_uri_from_env(), serverSelectionTimeoutMS=10000)
         return client[database]
     except Exception as exc:
         log.warning("persist_ir: Mongo unavailable (%s) — skipping IR archive", exc)

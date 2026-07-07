@@ -79,18 +79,19 @@ def _neo4j_driver():
     if _DRIVER is not None:
         return _DRIVER
     host = os.environ.get("NEO4J_HOST")
-    port = os.environ.get("NEO4J_PORT", "7687")
     user = os.environ.get("NEO4J_USER", "neo4j")
     password = os.environ.get("NEO4J_PASSWORD", "")
     if not host or not password:
         return None
     try:
         from neo4j import GraphDatabase
+
+        from sop_backend.db_config import neo4j_uri_from_env
     except ImportError:  # pragma: no cover — driver is in requirements
         return None
     try:
         _DRIVER = GraphDatabase.driver(
-            f"bolt://{host}:{port}",
+            neo4j_uri_from_env(),
             auth=(user, password),
             connection_timeout=5,
         )

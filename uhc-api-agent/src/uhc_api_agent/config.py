@@ -51,6 +51,13 @@ def _env_int(key: str, default: int) -> int:
     return int(os.environ.get(key, str(default)).strip())
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ── Config dataclass ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -80,6 +87,14 @@ class AgentConfig:
     cache_ttl: int              # Redis cache TTL in seconds
     max_response_bytes: int     # safety limit on body size
 
+    # APP_ENV — "prod"/"production" enables the prod overrides below
+    app_env: str = ""
+    # MONGO_URI — full connection string (e.g. Atlas mongodb+srv://…); prod only
+    mongo_uri_override: str = ""
+    # Redis TLS is PROD ONLY (managed Azure Redis needs it; local dev doesn't).
+    redis_ssl: bool = True                  # REDIS_SSL — applied only when prod
+    redis_ssl_check_hostname: bool = False  # REDIS_SSL_CHECK_HOSTNAME
+
     # ── Computed connection strings ───────────────────────────────────────────
 
     @property
@@ -92,17 +107,41 @@ class AgentConfig:
 
     @property
     def mongo_uri(self) -> str:
-        return (
-            f"mongodb://{self.mongo_user}:{self.mongo_password}"
-            f"@{self.mongo_host}:{self.mongo_port}/"
+        # PROD ONLY: MONGO_URI (full connection string, e.g. Atlas SRV) wins.
+        # Non-prod always uses the plain local mongodb://host:port build.
+        is_prod = (self.app_env or "").strip().lower() in ("prod", "production")
+        if is_prod and self.mongo_uri_override:
+            return self.mongo_uri_override
+        creds = (
+            f"{self.mongo_user}:{self.mongo_password}@"
+            if (self.mongo_user and self.mongo_password)
+            else ""
         )
+        return f"mongodb://{creds}{self.mongo_host}:{self.mongo_port}/"
+
+    @property
+    def _is_prod(self) -> bool:
+        return (self.app_env or "").strip().lower() in ("prod", "production")
 
     @property
     def redis_url(self) -> str:
+        # rediss:// (TLS) in prod for managed Azure Redis; plain redis:// else.
+        scheme = "rediss" if (self._is_prod and self.redis_ssl) else "redis"
         return (
-            f"redis://{self.redis_user}:{self.redis_password}"
+            f"{scheme}://{self.redis_user}:{self.redis_password}"
             f"@{self.redis_host}:{self.redis_port}/0"
         )
+
+    @property
+    def redis_ssl_kwargs(self) -> dict:
+        # SSL kwargs for a direct redis.Redis(...) client — PROD ONLY.
+        if not (self._is_prod and self.redis_ssl):
+            return {}
+        return {
+            "ssl": True,
+            "ssl_check_hostname": self.redis_ssl_check_hostname,
+            "ssl_cert_reqs": None,
+        }
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
@@ -121,11 +160,15 @@ class AgentConfig:
             mongo_user=_env("MONGO_USER", "admin"),
             mongo_password=_env("MONGO_PASSWORD"),
             mongo_database=_env("MONGO_DATABASE", "sop_ingestion"),
+            app_env=_env("APP_ENV", ""),
+            mongo_uri_override=_env("MONGO_URI", ""),
 
             redis_host=_env("REDIS_HOST"),
             redis_port=_env_int("REDIS_PORT", 6379),
             redis_user=_env("REDIS_USER", "default"),
             redis_password=_env("REDIS_PASSWORD"),
+            redis_ssl=_env_bool("REDIS_SSL", True),
+            redis_ssl_check_hostname=_env_bool("REDIS_SSL_CHECK_HOSTNAME", False),
 
             http_timeout=_env_int("API_AGENT_TIMEOUT", 30),
             cache_ttl=_env_int("API_AGENT_CACHE_TTL", 300),
@@ -166,5 +209,6 @@ def get_redis(cfg: AgentConfig):
             host=cfg.redis_host, port=cfg.redis_port,
             username=cfg.redis_user, password=cfg.redis_password,
             decode_responses=True, socket_connect_timeout=10,
+            **cfg.redis_ssl_kwargs,
         )
     return _redis_client

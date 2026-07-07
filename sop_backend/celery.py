@@ -53,19 +53,30 @@ def _check_postgres() -> tuple[bool, str]:
 def _check_redis(cfg) -> tuple[bool, str]:
     from uhc_sop_ingestion.config import get_redis
     get_redis(cfg).ping()
-    return True, f"{cfg.redis_host}:{cfg.redis_port}"
+    tls = " tls" if getattr(cfg, "redis_ssl_kwargs", {}) else ""
+    return True, f"{cfg.redis_host}:{cfg.redis_port}{tls}"
+
+
+def _redact_uri(uri: str) -> str:
+    """Hide the password in a connection URI before logging it."""
+    import re
+    return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", uri)
 
 
 def _check_mongo(cfg) -> tuple[bool, str]:
     from uhc_sop_ingestion.config import get_mongo
+
+    from sop_backend.db_config import mongo_uri_from_env
     get_mongo(cfg).admin.command("ping")
-    return True, f"{cfg.mongo_host}:{cfg.mongo_port}/{cfg.mongo_database}"
+    return True, f"{_redact_uri(mongo_uri_from_env())} ({cfg.mongo_database})"
 
 
 def _check_neo4j(cfg) -> tuple[bool, str]:
     from uhc_sop_ingestion.config import get_neo4j
+
+    from sop_backend.db_config import neo4j_uri_from_env
     get_neo4j(cfg).verify_connectivity()
-    return True, f"{cfg.neo4j_host}:{cfg.neo4j_port}"
+    return True, neo4j_uri_from_env()
 
 
 def _log_datastore_connectivity() -> None:

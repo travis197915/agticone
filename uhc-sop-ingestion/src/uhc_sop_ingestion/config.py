@@ -58,6 +58,12 @@ def _env(key: str, default: str = "") -> str:
 def _env_int(key: str, default: int) -> int:
     return int(os.environ.get(key, str(default)).strip())
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 
 # ── Config dataclass ──────────────────────────────────────────────────────────
 
@@ -126,6 +132,26 @@ class PipelineConfig:
     pdf_slice_pages: int = 2     # pages per Claude document slice
     pdf_slice_overlap: int = 1   # page overlap so boundary tables are seen whole
 
+    # Environment gate. The prod overrides below (secure Neo4j scheme, Atlas
+    # Mongo URI, Redis TLS) are honoured ONLY when APP_ENV marks this as
+    # production; local dev / CI always use the plain builds regardless.
+    app_env: str = ""              # APP_ENV — "prod"/"production" enables overrides
+
+    # Redis TLS is PROD ONLY (managed Azure Redis needs it; local dev doesn't).
+    redis_ssl: bool = True                  # REDIS_SSL — applied only when is_prod
+    redis_ssl_check_hostname: bool = False  # REDIS_SSL_CHECK_HOSTNAME
+
+    # Neo4j connection URI override (prod only). Prod terminates TLS with a
+    # self-signed cert and must use a secure bolt scheme (e.g. bolt+ssc). Set
+    # NEO4J_URI to a full URI (highest priority), or NEO4J_SCHEME to just change
+    # the scheme while still building host:port from NEO4J_HOST/NEO4J_PORT.
+    neo4j_uri_override: str = ""   # NEO4J_URI — full URI, wins if set
+    neo4j_scheme: str = "neo4j"    # NEO4J_SCHEME — e.g. bolt+ssc / neo4j+s
+
+    # MongoDB connection URI override (prod only). Prod points at Atlas via a
+    # full SRV connection string (mongodb+srv://user:pass@cluster.mongodb.net/?...).
+    mongo_uri_override: str = ""   # MONGO_URI — full connection string, wins if set
+
     # ── Computed connection strings ───────────────────────────────────────────
 
     @property
@@ -138,17 +164,49 @@ class PipelineConfig:
 
     @property
     def redis_url(self) -> str:
+        # rediss:// (TLS) in prod for managed Azure Redis; plain redis:// else.
+        scheme = "rediss" if (self.is_prod and self.redis_ssl) else "redis"
         return (
-            f"redis://{self.redis_user}:{self.redis_password}"
+            f"{scheme}://{self.redis_user}:{self.redis_password}"
             f"@{self.redis_host}:{self.redis_port}/0"
         )
 
     @property
+    def redis_ssl_kwargs(self) -> dict:
+        # SSL kwargs for a direct redis.Redis(...) client — PROD ONLY. Azure's
+        # managed endpoint terminates TLS with a cert that won't pass hostname/
+        # CA checks over the private link, so verification is relaxed.
+        if not (self.is_prod and self.redis_ssl):
+            return {}
+        return {
+            "ssl": True,
+            "ssl_check_hostname": self.redis_ssl_check_hostname,
+            "ssl_cert_reqs": None,
+        }
+
+    @property
+    def is_prod(self) -> bool:
+        return (self.app_env or "").strip().lower() in ("prod", "production")
+
+    @property
     def neo4j_uri(self) -> str:
+        # PROD ONLY: NEO4J_URI (full URI) wins, else NEO4J_SCHEME + host:port so
+        # prod can select a secure scheme (bolt+ssc / neo4j+s). Non-prod always
+        # uses the plain local neo4j:// scheme regardless of the overrides.
+        if self.is_prod:
+            if self.neo4j_uri_override:
+                return self.neo4j_uri_override
+            scheme = (self.neo4j_scheme or "neo4j").strip()
+            return f"{scheme}://{self.neo4j_host}:{self.neo4j_port}"
         return f"neo4j://{self.neo4j_host}:{self.neo4j_port}"
 
     @property
     def mongo_uri(self) -> str:
+        # PROD ONLY: MONGO_URI (full connection string, e.g. Atlas SRV) wins.
+        # Non-prod always uses the plain local mongodb://host:port build so
+        # local/CI can never dial the prod cluster.
+        if self.is_prod and self.mongo_uri_override:
+            return self.mongo_uri_override
         # Omit the "user:pass@" credentials block when either is empty —
         # an auth-less Mongo (local Docker) rejects "mongodb://:@host".
         if self.mongo_user and self.mongo_password:
@@ -195,6 +253,12 @@ class PipelineConfig:
             neo4j_user=_env("NEO4J_USER", "neo4j"),
             neo4j_password=_env("NEO4J_PASSWORD"),
             neo4j_database=_env("NEO4J_DATABASE", "neo4j"),
+            app_env=_env("APP_ENV", ""),
+            redis_ssl=_env_bool("REDIS_SSL", True),
+            redis_ssl_check_hostname=_env_bool("REDIS_SSL_CHECK_HOSTNAME", False),
+            neo4j_uri_override=_env("NEO4J_URI", ""),
+            neo4j_scheme=_env("NEO4J_SCHEME", "neo4j"),
+            mongo_uri_override=_env("MONGO_URI", ""),
             # MongoDB
             mongo_host=_env("MONGO_HOST"),
             mongo_port=_env_int("MONGO_PORT", 27017),
@@ -242,6 +306,7 @@ def get_redis(cfg: PipelineConfig):
             host=cfg.redis_host, port=cfg.redis_port,
             username=cfg.redis_user, password=cfg.redis_password,
             decode_responses=True, socket_connect_timeout=10,
+            **cfg.redis_ssl_kwargs,
         )
     return _redis_client
 

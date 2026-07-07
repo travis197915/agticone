@@ -191,12 +191,10 @@ REST_FRAMEWORK = {
 }
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
-_redis_user = os.environ.get("REDIS_USER",     "default")
-_redis_pass = os.environ.get("REDIS_PASSWORD", "")
-_redis_host = os.environ.get("REDIS_HOST",     "localhost")
-_redis_port = os.environ.get("REDIS_PORT",     "6379")
-_redis_auth = f"{_redis_user}:{_redis_pass}@" if _redis_pass else ""
-REDIS_URL   = f"redis://{_redis_auth}{_redis_host}:{_redis_port}/0"
+# Prod (APP_ENV=prod) yields a rediss:// URL for the managed TLS endpoint
+# (Azure); non-prod stays on plain redis://. See sop_backend/db_config.py.
+from sop_backend.db_config import redis_url_from_env  # noqa: E402
+REDIS_URL = redis_url_from_env()
 
 # Export the composed URL back to the process environment so standalone
 # packages that follow the standard `REDIS_URL` convention (notably
