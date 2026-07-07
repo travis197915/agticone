@@ -169,7 +169,21 @@ def _maybe_persist_ir(job, final_state: dict) -> None:
             "sop_db_id": final_state.get("sop_db_id"),
         }]
     if not entries:
-        log.info("persist_ir skipped: no sop_ir in final state")
+        va = final_state.get("version_action")
+        prior = final_state.get("prior_sop_db_id")
+        if va == "UNCHANGED":
+            log.warning(
+                "persist_ir skipped: no sop_ir in final state — doc UNCHANGED "
+                "(version_action=%s prior_sop_db_id=%s). The pipeline reused the "
+                "existing AuditSop and did NOT re-synthesize/persist; a new "
+                "workflow's auto-build must reuse AuditSop #%s.",
+                va, prior, prior,
+            )
+        else:
+            log.info(
+                "persist_ir skipped: no sop_ir in final state "
+                "(version_action=%s prior_sop_db_id=%s)", va, prior,
+            )
         return
 
     for entry in entries:

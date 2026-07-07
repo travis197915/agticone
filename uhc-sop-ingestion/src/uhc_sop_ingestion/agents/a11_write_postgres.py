@@ -371,6 +371,36 @@ def pg_sop_writer(state: "PipelineState", cfg: "PipelineConfig") -> dict:
     if rows:
         sop_id = rows[0][0]
         log.info("pg_sop_writer: sop_db_id=%s", sop_id)
+        # ── Single-current invariant ─────────────────────────────────────────
+        # The unique constraint is on (job, content_hash), so every re-ingest
+        # is a NEW job → a NEW row inserted with is_current=TRUE. Without this
+        # step the table accumulates many is_current rows for one URL (seen in
+        # prod: 14 current rows for one SOP), which breaks the version lookup
+        # and leaves auto-build unable to pick a single SOP. The version
+        # registry only supersedes by canonical_url/document and is skipped
+        # entirely on UNCHANGED, so enforce the invariant HERE where it always
+        # runs: demote every OTHER current row for the same URL.
+        if include_is_current and is_current:
+            set_clause = "is_current = FALSE"
+            if include_activation_status:
+                set_clause += ", activation_status = 'superseded'"
+            demoted = _exec(cfg, f"""
+                UPDATE sop_ingestion_auditsop
+                   SET {set_clause}
+                 WHERE id <> %s
+                   AND is_current = TRUE
+                   AND (
+                       lower(rtrim(url, '/')) = lower(rtrim(%s, '/'))
+                       OR (canonical_url <> '' AND canonical_url = %s)
+                   )
+             RETURNING id;
+            """, (sop_id, current_url, canonical_url))
+            if demoted:
+                log.info(
+                    "pg_sop_writer: superseded %d prior current AuditSop row(s) "
+                    "for url=%s (ids=%s)",
+                    len(demoted), current_url, [r[0] for r in demoted],
+                )
         return {"sop_db_id": sop_id}
     log.warning(
         "pg_sop_writer: insert failed for job=%s url=%s — downstream PG writers will skip",

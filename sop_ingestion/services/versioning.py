@@ -228,16 +228,25 @@ def _register_sop_version_impl(
     superseded_status = ActivationStatus.SUPERSEDED
 
     if auto_activate:
-        if prior and prior.document_id:
-            AuditSop.objects.filter(document=doc, is_current=True).exclude(pk=sop.pk).update(
-                is_current=False,
-                activation_status=superseded_status,
-            )
-        elif prior:
-            AuditSop.objects.filter(canonical_url=canonical, is_current=True).exclude(pk=sop.pk).update(
-                is_current=False,
-                activation_status=superseded_status,
-            )
+        # Supersede EVERY other row currently marked is_current for the same SOP
+        # identity — matched by document, canonical_url, OR raw url. Matching by
+        # url is essential because older/bypassed ingests can have an empty
+        # canonical_url, and runs even when there is no `prior` so orphan current
+        # rows never survive. This is the single-current invariant.
+        from django.db.models import Q
+
+        url_norm = (sop.url or "").strip().rstrip("/")
+        dupe_q = Q(pk__in=[])  # never-matches base
+        if doc and doc.pk:
+            dupe_q |= Q(document=doc)
+        if canonical:
+            dupe_q |= Q(canonical_url=canonical)
+        if url_norm:
+            dupe_q |= Q(url__iexact=url_norm) | Q(url__iexact=url_norm + "/")
+        AuditSop.objects.filter(dupe_q, is_current=True).exclude(pk=sop.pk).update(
+            is_current=False,
+            activation_status=superseded_status,
+        )
         sop.is_current = True
         sop.activation_status = active_status
         doc.latest_revision_date = rev_norm or doc.latest_revision_date

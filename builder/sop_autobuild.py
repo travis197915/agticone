@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import re
 
-from django.db import transaction
+from django.db import models, transaction
 from django.utils.text import slugify
 
 from builder.bindings_sync import extract_bindings_from_properties
@@ -361,6 +361,52 @@ def build_workflow_from_sop(workflow, sop: AuditSop, *, area: WorkArea,
     return stats
 
 
+def _reuse_existing_sops_for_job(job) -> list:
+    """Resolve the existing current AuditSop(s) for a job whose ingestion was
+    short-circuited (UNCHANGED re-ingest wrote nothing).
+
+    Matches on the job's seed_url (canonical/url/filename). When the URL has
+    several ``is_current`` rows (a known versioning data issue), pick the single
+    best one — most AuditSteps, then most recent id — so the canvas is built
+    from a fully-populated SOP rather than an empty duplicate.
+    """
+    seed = (getattr(job, "seed_url", "") or "").strip()
+    if not seed:
+        return []
+    seed_no_slash = seed.rstrip("/")
+    tail = seed_no_slash.rsplit("/", 1)[-1]
+    try:
+        candidates = list(
+            AuditSop.objects.filter(is_current=True).filter(
+                models.Q(canonical_url__iexact=seed_no_slash)
+                | models.Q(url__iexact=seed_no_slash)
+                | models.Q(url__icontains=tail)
+            )
+        )
+    except Exception as exc:  # pragma: no cover
+        log.warning("auto-build reuse lookup failed for job %s: %s",
+                    getattr(job, "job_id", "?"), exc)
+        return []
+    if not candidates:
+        return []
+
+    # One SOP per URL — best row wins (most steps, then newest id).
+    def _score(s):
+        try:
+            n_steps = AuditStep.objects.filter(sop=s).count()
+        except Exception:
+            n_steps = 0
+        return (n_steps, s.id)
+
+    best_by_url: dict[str, "AuditSop"] = {}
+    for s in candidates:
+        key = (s.canonical_url or s.url or f"sop:{s.id}").rstrip("/")
+        cur = best_by_url.get(key)
+        if cur is None or _score(s) > _score(cur):
+            best_by_url[key] = s
+    return list(best_by_url.values())
+
+
 def build_workflow_for_job(workflow, job) -> dict:
     """Build the full canvas from EVERY SOP ingested for this workflow.
 
@@ -389,8 +435,27 @@ def build_workflow_for_job(workflow, job) -> dict:
     sops = list(by_key.values())
 
     if not sops:
-        log.warning("auto-build: job %s produced no AuditSop rows", job.job_id)
-        return {"shapes": 0, "rules": 0, "sops": 0}
+        # The job wrote NO AuditSop rows — almost always because the
+        # revision/version gate marked the doc UNCHANGED (already ingested), so
+        # the pipeline skipped synthesis/persist and the real AuditSop is FK'd
+        # to an EARLIER job/workflow. Reuse that existing current AuditSop so a
+        # freshly-created workflow still gets a canvas instead of hanging on
+        # "Building canvas…".
+        sops = _reuse_existing_sops_for_job(job)
+        if not sops:
+            log.warning(
+                "auto-build: job %s produced no AuditSop rows for workflow %s "
+                "(seed_url=%s) and no existing current AuditSop matched — canvas "
+                "will be EMPTY.",
+                job.job_id, getattr(workflow, "id", "?"),
+                getattr(job, "seed_url", ""),
+            )
+            return {"shapes": 0, "rules": 0, "sops": 0}
+        log.warning(
+            "auto-build: job %s wrote no AuditSop (UNCHANGED re-ingest); REUSING "
+            "existing AuditSop(s) %s for workflow %s.",
+            job.job_id, [s.id for s in sops], getattr(workflow, "id", "?"),
+        )
 
     with transaction.atomic():
         workflow.work_areas.all().delete()  # clean rebuild

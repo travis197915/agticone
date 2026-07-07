@@ -318,10 +318,20 @@ def _route_after_fetch(state: PipelineState) -> str:
 
 def _route_after_version_check(state: PipelineState) -> str:
     if state.get("is_duplicate") and state.get("version_action") == "UNCHANGED":
+        _log.warning(
+            "route_after_version_check: UNCHANGED -> link_stage (SKIPPING "
+            "enrich/context/validate/narrative/graph_synthesis/ir_synthesis/"
+            "writes). url=%s prior_sop_db_id=%s. Auto-build will find no NEW "
+            "AuditSop for this job.",
+            state.get("current_url", "") or state.get("seed_url", ""),
+            state.get("prior_sop_db_id"),
+        )
         return "link_stage"
-    if state.get("doc_format") in ("PDF", "HTML"):
-        return "context_stage"
-    return "enrich_stage"
+    nxt = "context_stage" if state.get("doc_format") in ("PDF", "HTML") else "enrich_stage"
+    _log.info("route_after_version_check: %s -> %s (url=%s)",
+              state.get("version_action"), nxt,
+              state.get("current_url", "") or state.get("seed_url", ""))
+    return nxt
 
 def _route_completion(state: PipelineState) -> str:
     return "final_stage" if state.get("processing_complete") else "pick_next_url"

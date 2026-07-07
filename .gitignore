@@ -83,3 +83,24 @@ scripts/*
 
 # local DB backups
 backups/
+
+# ── Claim exports / scratch scripts (local only) ─────────────────────────
+_check_claims.py
+_export_ui_trace.py
+claims_63_merged_explainability.xlsx
+claims_63.xlsx
+claims_batch24_explainability-optum.xlsx
+claims_batch24_explainability.xlsx
+claims_complete_17_explainability.xlsx
+claims_complete_17.txt
+claims_completed_explainability.xlsx
+claims_missing_19.txt
+claims_prod_db_export.xlsx
+claims.txt
+prod_extra_context.sql
+reprocess-v1.xlsx
+
+
+poc/*
+
+claim_run_logs/*

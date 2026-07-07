@@ -68,14 +68,26 @@ def revision_version_gate(state: "PipelineState", cfg: "PipelineConfig") -> dict
         "version_action": VERSION_NEW,
     }
     if not canonical:
+        log.info("revision_version_gate: NEW (no canonical url) url=%s", url)
         return base
 
     prior = _lookup_prior(cfg, canonical)
     if not prior:
+        log.info(
+            "revision_version_gate: NEW (no prior current AuditSop) "
+            "canonical=%s rev=%s hash=%s",
+            canonical, rev_norm or revision_date, content_hash,
+        )
         return base
 
     prior_id, prior_rev, prior_hash, _prior_ver = prior
     base["prior_sop_db_id"] = prior_id
+    log.info(
+        "revision_version_gate: prior AuditSop #%s found  canonical=%s  "
+        "rev(new=%s prior=%s)  hash(new=%s prior=%s)",
+        prior_id, canonical, rev_norm or revision_date, prior_rev,
+        content_hash, prior_hash,
+    )
 
     if rev_norm or prior_rev:
         same_rev = (
@@ -84,9 +96,11 @@ def revision_version_gate(state: "PipelineState", cfg: "PipelineConfig") -> dict
             else (prior_rev or "").strip().lower() == (revision_date or "").strip().lower()
         )
         if same_rev and content_hash == prior_hash:
-            log.info(
-                "revision_version_gate: unchanged  url=%s  rev=%s  hash=%s",
-                canonical, rev_norm or revision_date, content_hash,
+            log.warning(
+                "revision_version_gate: UNCHANGED  canonical=%s  rev=%s  hash=%s  "
+                "prior_sop_db_id=%s  -> pipeline will SKIP synthesis/persist "
+                "(reusing existing AuditSop; no new rows written for this job)",
+                canonical, rev_norm or revision_date, content_hash, prior_id,
             )
             return {
                 **base,
@@ -94,12 +108,24 @@ def revision_version_gate(state: "PipelineState", cfg: "PipelineConfig") -> dict
                 "is_duplicate": True,
             }
         if same_rev and content_hash != prior_hash:
+            log.info("revision_version_gate: CONTENT_CHANGE (same rev, new hash) "
+                     "canonical=%s prior_sop_db_id=%s", canonical, prior_id)
             return _apply_review_policy(state, {**base, "version_action": VERSION_CONTENT_CHANGE})
         if not same_rev:
+            log.info("revision_version_gate: REVISED (rev %s -> %s) "
+                     "canonical=%s prior_sop_db_id=%s",
+                     prior_rev, rev_norm or revision_date, canonical, prior_id)
             return _apply_review_policy(state, {**base, "version_action": VERSION_REVISED})
 
     if content_hash == prior_hash:
+        log.warning(
+            "revision_version_gate: UNCHANGED (hash match, no rev date)  "
+            "canonical=%s  hash=%s  prior_sop_db_id=%s  -> pipeline will SKIP "
+            "synthesis/persist", canonical, content_hash, prior_id,
+        )
         return {**base, "version_action": VERSION_UNCHANGED, "is_duplicate": True}
+    log.info("revision_version_gate: CONTENT_CHANGE (no rev date, hash differs) "
+             "canonical=%s prior_sop_db_id=%s", canonical, prior_id)
     return _apply_review_policy(state, {**base, "version_action": VERSION_CONTENT_CHANGE})
 
 
