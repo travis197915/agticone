@@ -1532,7 +1532,7 @@ def _sse_format(event_kind: str, data: dict) -> bytes:
 
 def _claim_payload_from_run(run: RuleExecutionRun) -> dict:
     """Project a RuleExecutionRun row into a `claim` SSE payload."""
-    from .serializers import _excel_claim_fields
+    from uhc_execution_engine.duplicate_claim import skip_metadata
 
     return {
         "claim_id":               run.claim_id,
@@ -1543,6 +1543,7 @@ def _claim_payload_from_run(run: RuleExecutionRun) -> dict:
         "narrative":              run.narrative,
         "error_message":          run.error_message,
         **_excel_claim_fields(run.claim_payload),
+        **skip_metadata(run.claim_payload),
     }
 
 

@@ -56,6 +56,7 @@ class RuleExecutionRun(_UUIDPK):
         ("FAILED", "Failed"),
         ("TERMINATED_EARLY", "Terminated early (DENY/STOP rule on a shape)"),
         ("FETCH_FAILED", "Claim fetch failed"),
+        ("SKIPPED", "Skipped (duplicate or prior clean run)"),
     ]
     REVIEW_STATUS_CHOICES = [
         ("", "Not started"),

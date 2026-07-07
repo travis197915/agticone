@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
+from uhc_execution_engine.duplicate_claim import skip_metadata
 from uhc_execution_engine.xlsx_parser import EXCEL_BILLING_FIELDS
 
 from . import trace_builder
@@ -63,6 +64,7 @@ def serialize_run_summary(run: RuleExecutionRun) -> dict:
         "review_started_at": _format_time(run.review_started_at),
         "reviewed_at": _format_time(run.reviewed_at),
         **_excel_claim_fields(run.claim_payload),
+        **skip_metadata(run.claim_payload),
     }
 
 
@@ -73,6 +75,11 @@ def claim_audit_status(run: RuleExecutionRun) -> str:
     its stored trace (no node rollup), so the list view stays consistent with
     the detail page. A system/fetch failure is *inconclusive*, not a defect.
     """
+    if run.status == "SKIPPED":
+        decided = trace_builder.normalize_decision(run.final_decision_type)
+        if decided:
+            return decided
+        return trace_builder.INCONCLUSIVE
     if run.status == "RUNNING":
         return trace_builder.IN_PROGRESS
     if run.status in {"FAILED", "FETCH_FAILED"}:

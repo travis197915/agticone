@@ -22,6 +22,9 @@ from django.utils import timezone
 
 from .claim_fetcher import (fetch_claim, fetch_tool_error, parse_claim,
                             resolve_fetch_tool, workflow_uses_parser)
+from .duplicate_claim import (SKIP_REASON_BATCH_DUPLICATE,
+                              SKIP_REASON_PRIOR_CLEAN, find_prior_clean_run,
+                              record_skipped_claim)
 from .mcp_client import (check_mcp_health, format_mcp_health_error,
                          should_run_mcp_health_check)
 from .pipeline import RuleEnginePipeline
@@ -206,15 +209,49 @@ class BatchRunner:
         # ── 5. Per-claim loop ──────────────────────────────────────────────
         completed = 0
         failed = 0
+        seen_in_batch: dict[str, dict[str, Any]] = {}
         logger.info("batch=%s starting per-claim loop over %d claim(s)",
                     batch_id, len(claim_rows))
         for row in claim_rows:
             cid = str(row["claim_id"])
-            res = self._run_one(workflow_id=str(workflow_id), claim_id=cid,
-                                batch_id=batch_id, use_parser=use_parser,
-                                fetch_tool=fetch_tool, excel_row=row)
+            excel_payload = _excel_fields(row)
+            if cid in seen_in_batch:
+                res = record_skipped_claim(
+                    batch_id=batch_id,
+                    workflow_id=str(workflow_id),
+                    claim_id=cid,
+                    excel_payload=excel_payload,
+                    prior=seen_in_batch[cid],
+                    skip_reason=SKIP_REASON_BATCH_DUPLICATE,
+                )
+            else:
+                prior_clean = find_prior_clean_run(
+                    claim_id=cid,
+                    workflow_id=str(workflow_id),
+                    exclude_batch_id=batch_id,
+                )
+                if prior_clean is not None:
+                    res = record_skipped_claim(
+                        batch_id=batch_id,
+                        workflow_id=str(workflow_id),
+                        claim_id=cid,
+                        excel_payload=excel_payload,
+                        prior=prior_clean,
+                        skip_reason=SKIP_REASON_PRIOR_CLEAN,
+                    )
+                else:
+                    res = self._run_one(
+                        workflow_id=str(workflow_id),
+                        claim_id=cid,
+                        batch_id=batch_id,
+                        use_parser=use_parser,
+                        fetch_tool=fetch_tool,
+                        excel_row=row,
+                    )
+                seen_in_batch[cid] = res
             counted_as = ("completed" if res["status"]
-                          in {"COMPLETED", "TERMINATED_EARLY"} else "failed")
+                          in {"COMPLETED", "TERMINATED_EARLY", "SKIPPED"}
+                          else "failed")
             if counted_as == "completed":
                 completed += 1
             else:
