@@ -39,6 +39,11 @@ app.autodiscover_tasks()
 # Purely diagnostic and fully defensive — a probe failure is logged, never
 # raised, so a degraded store can't stop the worker from starting.
 
+def _redact_uri(uri: str) -> str:
+    """Hide the password in a connection URI before logging it."""
+    import re
+    return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", uri)
+
 def _check_postgres() -> tuple[bool, str]:
     from django.db import connections
     conn = connections["default"]

@@ -38,7 +38,7 @@ def load_env(env_path: str | Path | None = None) -> None:
     if env_path:
         path = Path(env_path)
         if path.exists():
-            load_dotenv(dotenv_path=path, override=False)
+            load_dotenv(dotenv_path=path, override=False, encoding="utf-8-sig")
             return
 
     # Walk up from cwd until we find a .env
@@ -46,7 +46,7 @@ def load_env(env_path: str | Path | None = None) -> None:
     for candidate in [search, *search.parents]:
         dotenv_file = candidate / ".env"
         if dotenv_file.exists():
-            load_dotenv(dotenv_path=dotenv_file, override=False)
+            load_dotenv(dotenv_path=dotenv_file, override=False, encoding="utf-8-sig")
             return
 
     # Nothing found — env vars may already be set (Docker / CI)
@@ -190,13 +190,16 @@ class PipelineConfig:
 
     @property
     def neo4j_uri(self) -> str:
-        # PROD ONLY: NEO4J_URI (full URI) wins, else NEO4J_SCHEME + host:port so
-        # prod can select a secure scheme (bolt+ssc / neo4j+s). Non-prod always
-        # uses the plain local neo4j:// scheme regardless of the overrides.
+        # PROD ONLY: NEO4J_URI (full URI) wins, else NEO4J_SCHEME + host:port.
+        # Prod default is bolt+ssc — a DIRECT connection with self-signed-cert
+        # TLS. NOT a routing scheme (neo4j / neo4j+ssc): against a single
+        # instance that raises "Unable to retrieve routing information". Set
+        # NEO4J_SCHEME=neo4j+ssc explicitly only for a cluster / Aura endpoint.
+        # Non-prod always uses the plain local neo4j:// scheme.
         if self.is_prod:
             if self.neo4j_uri_override:
                 return self.neo4j_uri_override
-            scheme = (self.neo4j_scheme or "neo4j").strip()
+            scheme = (self.neo4j_scheme or "bolt+ssc").strip()
             return f"{scheme}://{self.neo4j_host}:{self.neo4j_port}"
         return f"neo4j://{self.neo4j_host}:{self.neo4j_port}"
 
@@ -257,7 +260,7 @@ class PipelineConfig:
             redis_ssl=_env_bool("REDIS_SSL", True),
             redis_ssl_check_hostname=_env_bool("REDIS_SSL_CHECK_HOSTNAME", False),
             neo4j_uri_override=_env("NEO4J_URI", ""),
-            neo4j_scheme=_env("NEO4J_SCHEME", "neo4j"),
+            neo4j_scheme=_env("NEO4J_SCHEME", ""),
             mongo_uri_override=_env("MONGO_URI", ""),
             # MongoDB
             mongo_host=_env("MONGO_HOST"),
