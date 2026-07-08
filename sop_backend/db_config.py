@@ -108,10 +108,14 @@ def mongo_uri_from_env() -> str:
 
 def neo4j_uri_from_env() -> str:
     """Resolve the Neo4j connection URI from the environment.
-
-    - **prod** (``APP_ENV=prod``): use ``NEO4J_URI`` (full URI, e.g.
-      ``bolt+ssc://host:7687``) if set, else ``NEO4J_SCHEME`` (e.g. ``bolt+ssc`` /
-      ``neo4j+s`` for the self-signed TLS endpoint) + ``NEO4J_HOST``/``NEO4J_PORT``.
+ 
+    - **prod** (``APP_ENV=prod``): use ``NEO4J_URI`` (full URI) if set, else
+      ``NEO4J_SCHEME`` + ``NEO4J_HOST``/``NEO4J_PORT``. The prod default scheme
+      is ``bolt+ssc`` — a DIRECT connection with self-signed-cert TLS. Do NOT
+      default to a routing scheme (``neo4j`` / ``neo4j+ssc``): against a
+      single-instance server that raises "Unable to retrieve routing
+      information". Set ``NEO4J_SCHEME=neo4j+ssc`` explicitly only for a real
+      cluster / Aura endpoint.
     - **non-prod**: always the plain ``neo4j://host:port`` scheme; the prod
       URI/scheme overrides are ignored.
     """
@@ -121,6 +125,6 @@ def neo4j_uri_from_env() -> str:
         uri = os.environ.get("NEO4J_URI", "").strip()
         if uri:
             return uri
-        scheme = (os.environ.get("NEO4J_SCHEME", "neo4j") or "neo4j").strip()
+        scheme = (os.environ.get("NEO4J_SCHEME", "").strip() or "bolt+ssc")
         return f"{scheme}://{host}:{port}"
     return f"neo4j://{host}:{port}"
