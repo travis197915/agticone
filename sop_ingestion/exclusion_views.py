@@ -349,6 +349,17 @@ class SopStoredHtmlView(APIView):
         sop = get_object_or_404(AuditSop, pk=sop_id)
         kind = classify_sop_source(sop.url)
 
+        # A manually loaded HTML template (e.g. for a file:// upload) always
+        # wins: if it is already stored in Mongo, serve it regardless of the
+        # source URL scheme so the UI can show the original SOP template.
+        stored = get_stored(sop.id)
+        if stored and stored.get("html"):
+            return Response({
+                "sop_id": sop.id, "available": True, "kind": "html",
+                "html": stored["html"], "source_url": sop.url or "",
+                "crawled_at": stored.get("crawled_at"), "reason": "",
+            })
+
         if not is_crawlable_url(sop.url):
             reason = (
                 "This SOP is a PDF upload with no HTML source."

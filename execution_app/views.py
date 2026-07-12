@@ -213,24 +213,22 @@ def _trace_status_by_shape(trace) -> dict[str, str]:
 
 
 def _agent_status(node: dict[str, Any], trace_by_shape: dict[str, str] | None = None) -> str:
-    """3-state audit status for one node (CLEAN / DEFECT / INCONCLUSIVE).
+    """SOP/agent status for one node: CLEAN / DEFECT / OUT_OF_SCOPE / NOT_APPLICABLE.
 
-    Prefers the trace-derived status so the agent chip matches the
-    Explainability tab; falls back to matched + decision type for runs that
-    predate the trace.
+    Classified from the persisted rule rows (see ``node_audit_status``). The
+    trace is consulted only to escalate to DEFECT (so the agent chip never
+    misses a Not-Met the trace caught, e.g. a failed coverage tool), never to
+    re-introduce the old catch-all INCONCLUSIVE for a SOP that simply did not
+    apply / was out of scope.
     """
-    if trace_by_shape:
-        st = trace_by_shape.get(node["shape_id"])
-        if st:
-            return st
-    matched = [e for e in node["evaluations"] if e.get("matched")]
-    if node.get("terminated_here") or any(
-        (e.get("decision_type") or "").upper() in _DEFECT_DECISIONS for e in matched
-    ):
+    if node.get("terminated_here"):
         return DEFECT
-    if matched:
-        return CLEAN
-    return INCONCLUSIVE
+    base = trace_builder.node_audit_status(node["evaluations"])
+    if base == DEFECT:
+        return DEFECT
+    if trace_by_shape and trace_by_shape.get(node["shape_id"]) == DEFECT:
+        return DEFECT
+    return base
 
 
 def _claim_status(
@@ -509,6 +507,8 @@ def _build_summary_rollup(
             "matched",
             "decision_type",
             "skipped",
+            "skip_reason",
+            "codes",
             "rule_key",
             "rule_binding_id",
             "rule_binding__shape_id",
@@ -531,12 +531,20 @@ def _build_summary_rollup(
                 "shape_label": shape_label,
                 "reasonings": [],
                 "matched_decisions": [],
+                "evals": [],
                 "terminated_here": False,
             }
             nodes[shape_id] = slot
         reasoning = (ev.reasoning or "").strip()
         if reasoning:
             slot["reasonings"].append(reasoning)
+        slot["evals"].append({
+            "matched": ev.matched,
+            "skipped": getattr(ev, "skipped", False),
+            "skip_reason": getattr(ev, "skip_reason", ""),
+            "decision_type": ev.decision_type,
+            "codes": list(ev.codes or []),
+        })
         if ev.matched and not getattr(ev, "skipped", False):
             dt = (ev.decision_type or "").upper()
             if dt and dt not in slot["matched_decisions"]:
@@ -566,13 +574,19 @@ def _build_summary_rollup(
 
 
 def _agent_status_light(node: dict[str, Any]) -> str:
+    """SOP/agent status for the summary tab: CLEAN / DEFECT / OUT_OF_SCOPE /
+    NOT_APPLICABLE (Inconclusive is no longer emitted here — a non-executed SOP
+    is a scope state, not an unknown)."""
     if node.get("terminated_here") or any(
         d in _DEFECT_DECISIONS for d in node.get("matched_decisions", [])
     ):
         return DEFECT
-    if node.get("matched_decisions"):
-        return CLEAN
-    return INCONCLUSIVE
+    # Summary-rollup nodes carry rows under "evals"; agents-rollup nodes under
+    # "evaluations". Accept either so both tabs classify identically.
+    evals = node.get("evals")
+    if evals is None:
+        evals = node.get("evaluations", [])
+    return trace_builder.node_audit_status(evals)
 
 
 def _build_agents_rollup(
@@ -1495,11 +1509,15 @@ def _enrich_trace_sop_links(data: Any) -> Any:
     so they are flagged ``sop_available=False`` with a ``sop_kind`` and get no
     view URL. Nothing rewrites stored ``trace_json``.
     """
-    from sop_ingestion.sop_html_crawler import classify_sop_source
+    from sop_ingestion.sop_html_crawler import classify_sop_source, stored_sop_ids
 
     if not isinstance(data, list) or not data:
         return data
     idx = _sop_link_index()
+    # SOPs whose HTML template is already cached in Mongo — viewable even when
+    # the source URL itself is not crawlable (e.g. a file:// upload whose HTML
+    # was loaded via scripts/load_sop_html_to_mongo.py). Fetched once per call.
+    stored = stored_sop_ids()
     for step in data:
         if not isinstance(step, dict):
             continue
@@ -1511,13 +1529,15 @@ def _enrich_trace_sop_links(data: Any) -> Any:
             sop_id, url = hit
             step["sop_id"] = sop_id
             kind = classify_sop_source(url)
-            step["sop_kind"] = kind
-            if kind == "html":
+            if kind == "html" or sop_id in stored:
+                # HTML source (crawled) or a manually stored template — the raw
+                # original SOP template (with rules) can be opened.
+                step["sop_kind"] = "html"
                 step["sop_available"] = True
-                # Raw crawled source SOP HTML (original template with rules).
                 step["sop_view_url"] = f"/api/ingest/sops/{sop_id}/stored-html/"
             else:
-                # Node/workflow (YAML) SOP — no source document to open.
+                # PDF upload or node/workflow (YAML) SOP — no HTML to open.
+                step["sop_kind"] = kind
                 step["sop_available"] = False
     return data
 

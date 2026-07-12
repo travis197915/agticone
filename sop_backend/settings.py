@@ -111,14 +111,40 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-# ── CORS (dev) ───────────────────────────────────────────────────────────────
+# ── CORS ─────────────────────────────────────────────────────────────────────
+# Browser origins allowed to call this backend. Dev defaults + whatever the
+# CORS_ORIGINS env var provides, always unioned with the known prod frontends
+# below (so a misconfigured/empty env var can never lock the deployed portals
+# out).
 CORS_ALLOWED_ORIGINS = [
     s.strip() for s in os.environ.get(
         "CORS_ORIGINS",
         "http://localhost:5173,http://127.0.0.1:5173,"
+        "http://localhost:5174,http://127.0.0.1:5174,"
+        "http://localhost:5175,http://127.0.0.1:5175,"
         "http://localhost:3000,http://127.0.0.1:3000",
     ).split(",") if s.strip()
 ]
+
+# Deployed portals (dev). Always allowed regardless of the env var.
+_PROD_CORS_ORIGINS = [
+    "https://agenticai-backend-dev.optum.com",
+    "https://claims-backend-dev.optum.com",
+    "https://auditworkflow-claims-dev.optum.com",
+    "https://audit-hitl-dev.optum.com",
+    "https://audit-dashboard-dev.optum.com",
+]
+for _origin in _PROD_CORS_ORIGINS:
+    if _origin not in CORS_ALLOWED_ORIGINS:
+        CORS_ALLOWED_ORIGINS.append(_origin)
+# In dev, Vite may pick any free port (5173, 5174, 5175, …). Allow any
+# localhost/127.0.0.1 origin so the browser preflight passes regardless of the
+# port the dev server landed on. Never enabled when DEBUG is off.
+if DEBUG:
+    CORS_ALLOWED_ORIGIN_REGEXES = [
+        r"^http://localhost:\d+$",
+        r"^http://127\.0\.0\.1:\d+$",
+    ]
 CORS_ALLOW_CREDENTIALS = True
 
 ROOT_URLCONF      = "sop_backend.urls"

@@ -200,3 +200,21 @@ def get_stored(sop_id: int) -> dict | None:
     if col is None:
         return None
     return col.find_one({"sop_id": int(sop_id)}, {"_id": 0})
+
+
+def stored_sop_ids() -> set[int]:
+    """Set of ``sop_id``s that have a stored HTML doc in Mongo.
+
+    Lets the read-side flag a SOP as viewable even when its source URL is not
+    itself crawlable (e.g. a ``file://`` upload whose HTML template was loaded
+    manually via ``scripts/load_sop_html_to_mongo.py``). Best-effort: returns an
+    empty set when Mongo is unavailable.
+    """
+    col = _mongo_collection()
+    if col is None:
+        return set()
+    try:
+        return {int(d["sop_id"]) for d in col.find({}, {"sop_id": 1, "_id": 0})}
+    except Exception as exc:  # pragma: no cover - infra dependent
+        logger.warning("sop_html_crawler: stored_sop_ids failed (%s)", exc)
+        return set()

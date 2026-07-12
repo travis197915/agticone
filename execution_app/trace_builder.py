@@ -33,6 +33,15 @@ SKIPPED_RULE = "Skipped"
 CLEAN = "CLEAN"
 DEFECT = "DEFECT"
 INCONCLUSIVE = "INCONCLUSIVE"
+# Scope outcomes for an agent/SOP whose steps never executed against this claim.
+# These replace the old catch-all INCONCLUSIVE chip at the SOP/agent level:
+#   NOT_APPLICABLE — the SOP/step did not apply (condition gate not satisfied,
+#                    routed past, or nothing to evaluate).
+#   OUT_OF_SCOPE   — the SOP/step was explicitly out of scope for this claim.
+# Both are non-findings and are excluded from the claim-level rollup, exactly
+# like a skipped step.
+NOT_APPLICABLE = "NOT_APPLICABLE"
+OUT_OF_SCOPE = "OUT_OF_SCOPE"
 # Engine still evaluating rules for this claim (``RuleExecutionRun.status == RUNNING``).
 IN_PROGRESS = "IN_PROGRESS"
 
@@ -190,9 +199,63 @@ def _aggregate_rule_status(statuses: list[str]) -> str:
     return INCONCLUSIVE_RULE
 
 
+def scope_category(skip_reason: str) -> str:
+    """Classify a skipped row's ``skip_reason`` as OUT_OF_SCOPE or NOT_APPLICABLE.
+
+    The engine writes structured ``skip_reason`` prefixes: ``out of scope: …``,
+    ``not-applicable: …`` and ``skipped: …`` (routed past / terminal). Only the
+    explicit out-of-scope reason maps to OUT_OF_SCOPE; everything else a step was
+    skipped for is treated as NOT_APPLICABLE.
+    """
+    s = (skip_reason or "").strip().lower()
+    if "out of scope" in s or "out-of-scope" in s:
+        return OUT_OF_SCOPE
+    return NOT_APPLICABLE
+
+
+def node_audit_status(evals: list[dict[str, Any]]) -> str:
+    """SOP/agent-level status: DEFECT | CLEAN | OUT_OF_SCOPE | NOT_APPLICABLE.
+
+    Precedence, from the persisted rule rows (no re-run needed):
+      1. DEFECT         — an evaluated (non-skipped) rule applied an adverse
+                          disposition (DENY/STOP/REFER/PEND) or referenced an EOB
+                          code → the SOP was not handled cleanly.
+      2. CLEAN          — at least one rule actually executed against this claim
+                          (non-skipped, not a code-less out-of-scope exclusion)
+                          with no adverse finding → steps ran per SOP.
+      3. OUT_OF_SCOPE   — every row was skipped and at least one was skipped as
+                          explicitly out of scope.
+      4. NOT_APPLICABLE — every row was skipped/routed-past for any other reason,
+                          or there were no rules at all.
+    """
+    evals = list(evals or [])
+    if not evals:
+        return NOT_APPLICABLE
+    if any(_eval_applies_defect(e) for e in evals):
+        return DEFECT
+    executed = [
+        e for e in evals
+        if not e.get("skipped")
+        and not (e.get("is_out_of_scope") and not e.get("codes"))
+    ]
+    if executed:
+        return CLEAN
+    if any(scope_category(e.get("skip_reason", "")) == OUT_OF_SCOPE for e in evals):
+        return OUT_OF_SCOPE
+    return NOT_APPLICABLE
+
+
 # ── Agent / claim level ──────────────────────────────────────────────────────
 def rule_to_audit(status: str) -> str:
-    """Map a rule verdict to the 3-state audit model (Met→CLEAN, Not-Met→DEFECT)."""
+    """Map a rule/agent verdict to the claim-level audit model.
+
+    Met→CLEAN, Not-Met→DEFECT. Skipped and the SOP/agent scope states
+    (NOT_APPLICABLE / OUT_OF_SCOPE) are non-findings and return ``""`` so they
+    drop out of the claim-level rollup entirely.
+    """
+    key = (status or "").strip().upper().replace("-", "_").replace(" ", "_")
+    if key in ("SKIPPED", "SKIP", "NOT_APPLICABLE", "NA", "OUT_OF_SCOPE"):
+        return ""   # ignored at the claim level
     s = _normalize_rule_status(status)
     if s == MET:
         return CLEAN
