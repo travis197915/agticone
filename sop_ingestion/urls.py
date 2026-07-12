@@ -6,7 +6,8 @@ from .exclusion_views import (SopExclusionListCreateView,
                               SopExclusionDetailView,
                               SopExclusionToggleView,
                               SopHtmlBlocksView,
-                              SopSourceHtmlView)
+                              SopSourceHtmlView,
+                              SopStoredHtmlView)
 from .version_views import (
     RevisionCheckView,
     SopDocumentAffectedWorkflowsView,
@@ -87,6 +88,9 @@ urlpatterns = [
     path("sops/<int:sop_id>/source-html/",
          SopSourceHtmlView.as_view(),
          name="sop-source-html"),
+    path("sops/<int:sop_id>/stored-html/",
+         SopStoredHtmlView.as_view(),
+         name="sop-stored-html"),
 
     # HTML DOM-mirror tree (mirrors the source HTML structure 1:1, served
     # straight from Neo4j HtmlBlock nodes with :DERIVED_FROM semantic rules

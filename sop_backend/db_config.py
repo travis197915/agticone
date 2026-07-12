@@ -68,10 +68,10 @@ def redis_url_from_env() -> str:
     - **prod + TLS**: ``rediss://…?ssl_cert_reqs=none`` (Azure managed Redis).
     - **otherwise**: plain ``redis://…``.
     """
-    user = os.environ.get("REDIS_USER", "default")
-    password = os.environ.get("REDIS_PASSWORD", "")
-    host = os.environ.get("REDIS_HOST", "localhost")
-    port = os.environ.get("REDIS_PORT", "6379")
+    user = os.environ.get("REDIS_USER")
+    password = os.environ.get("REDIS_PASSWORD")
+    host = os.environ.get("REDIS_HOST")
+    port = os.environ.get("REDIS_PORT")
     auth = f"{quote_plus(user)}:{quote_plus(password)}@" if password else ""
     if redis_ssl_enabled():
         check = "true" if _truthy(os.environ.get("REDIS_SSL_CHECK_HOSTNAME", "false")) else "false"
@@ -80,10 +80,10 @@ def redis_url_from_env() -> str:
 
 
 def _local_mongo_uri() -> str:
-    host = os.environ.get("MONGO_HOST", "localhost")
-    port = os.environ.get("MONGO_PORT", "27017")
-    user = os.environ.get("MONGO_USER", "")
-    password = os.environ.get("MONGO_PASSWORD", "")
+    host = os.environ.get("MONGO_HOST")
+    port = os.environ.get("MONGO_PORT")
+    user = os.environ.get("MONGO_USER")
+    password = os.environ.get("MONGO_PASSWORD")
     # Omit "user:pass@" when either is empty — an auth-less local Mongo
     # (docker) rejects "mongodb://:@host".
     creds = f"{quote_plus(user)}:{quote_plus(password)}@" if (user and password) else ""
@@ -108,7 +108,7 @@ def mongo_uri_from_env() -> str:
 
 def neo4j_uri_from_env() -> str:
     """Resolve the Neo4j connection URI from the environment.
-
+ 
     - **prod** (``APP_ENV=prod``): use ``NEO4J_URI`` (full URI) if set, else
       ``NEO4J_SCHEME`` + ``NEO4J_HOST``/``NEO4J_PORT``. The prod default scheme
       is ``bolt+ssc`` — a DIRECT connection with self-signed-cert TLS. Do NOT
@@ -119,8 +119,8 @@ def neo4j_uri_from_env() -> str:
     - **non-prod**: always the plain ``neo4j://host:port`` scheme; the prod
       URI/scheme overrides are ignored.
     """
-    host = os.environ.get("NEO4J_HOST", "localhost")
-    port = os.environ.get("NEO4J_PORT", "7687")
+    host = os.environ.get("NEO4J_HOST")
+    port = os.environ.get("NEO4J_PORT")
     if is_prod():
         uri = os.environ.get("NEO4J_URI", "").strip()
         if uri:

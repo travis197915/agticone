@@ -140,11 +140,11 @@ TEMPLATES = [{
 DATABASES = {
     "default": {
         "ENGINE":   "django.db.backends.postgresql",
-        "NAME":     os.environ.get("PG_DATABASE", "postgres"),
-        "USER":     os.environ.get("PG_USER",     "postgres"),
-        "PASSWORD": os.environ.get("PG_PASSWORD", ""),
-        "HOST":     os.environ.get("PG_HOST",     "localhost"),
-        "PORT":     os.environ.get("PG_PORT",     "5432"),
+        "NAME":     os.environ.get("PG_DATABASE"),
+        "USER":     os.environ.get("PG_USER"),
+        "PASSWORD": os.environ.get("PG_PASSWORD"),
+        "HOST":     os.environ.get("PG_HOST"),
+        "PORT":     os.environ.get("PG_PORT"),
         # Include the dedicated agent_tools schema on the connection's
         # search_path. Django's introspection (used by `migrate`, test
         # database flush, and `inspectdb`) only walks the search_path,
@@ -205,7 +205,7 @@ os.environ.setdefault("REDIS_URL", REDIS_URL)
 
 # ── Celery (RabbitMQ) ─────────────────────────────────────────────────────────
 _rmq_user = os.environ.get("RABBITMQ_USER",     "guest")
-_rmq_pass = os.environ.get("RABBITMQ_PASSWORD", "guest")
+_rmq_pass = os.environ.get("RABBITMQ_PASSWORD", "s1Hd6lsd34lksdjldfskljsdnflssd99ef8dfsdfc2Gl1Uu")
 _rmq_host = os.environ.get("RABBITMQ_HOST",     "localhost")
 _rmq_port = os.environ.get("RABBITMQ_PORT",     "5672")
 

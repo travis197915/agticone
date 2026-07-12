@@ -325,6 +325,64 @@ class SopSourceHtmlView(APIView):
         })
 
 
+class SopStoredHtmlView(APIView):
+    """GET the crawled source SOP HTML cached in MongoDB.
+
+    Serves the raw original SOP template (with the rules), crawled once with
+    BeautifulSoup and stored in the ``sop_source_html`` collection. HTML SOPs
+    are crawled lazily on first request when not yet cached (``?crawl=0`` to
+    disable). PDF uploads and node/YAML SOPs are not viewable and return
+    ``available=false``.
+
+    Response::
+
+        {"sop_id": 12, "available": true, "kind": "html",
+         "html": "<html>…</html>", "source_url": "https://…",
+         "crawled_at": "…", "reason": ""}
+    """
+
+    def get(self, request: Request, sop_id: int) -> Response:
+        from .sop_html_crawler import (
+            classify_sop_source, crawl_and_store, get_stored, is_crawlable_url,
+        )
+
+        sop = get_object_or_404(AuditSop, pk=sop_id)
+        kind = classify_sop_source(sop.url)
+
+        if not is_crawlable_url(sop.url):
+            reason = (
+                "This SOP is a PDF upload with no HTML source."
+                if kind == "pdf"
+                else "This SOP is node/workflow-based (no source document)."
+            )
+            return Response({
+                "sop_id": sop.id, "available": False, "kind": kind,
+                "html": "", "source_url": sop.url or "", "reason": reason,
+            })
+
+        doc = get_stored(sop.id)
+        if not doc and (request.query_params.get("crawl") or "1") != "0":
+            try:
+                doc = crawl_and_store(sop)
+            except Exception as exc:  # noqa: BLE001
+                return Response({
+                    "sop_id": sop.id, "available": False, "kind": kind, "html": "",
+                    "source_url": sop.url or "", "reason": f"Crawl failed: {exc}",
+                })
+
+        if not doc or not doc.get("html"):
+            return Response({
+                "sop_id": sop.id, "available": False, "kind": kind, "html": "",
+                "source_url": sop.url or "", "reason": "SOP HTML not available yet.",
+            })
+
+        return Response({
+            "sop_id": sop.id, "available": True, "kind": "html",
+            "html": doc["html"], "source_url": sop.url or "",
+            "crawled_at": doc.get("crawled_at"), "reason": "",
+        })
+
+
 class SopExclusionListCreateView(APIView):
     """GET / POST exclusions for a single SOP."""
 

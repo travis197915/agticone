@@ -128,7 +128,7 @@ class Command(BaseCommand):
 
             from sop_backend.db_config import mongo_uri_from_env
 
-            db_name = os.environ.get("MONGO_DATABASE", "sop_ingestion")
+            db_name = os.environ.get("MONGO_DATABASE")
             client = MongoClient(mongo_uri_from_env(), serverSelectionTimeoutMS=10000)
             db = client[db_name]
             cols = db.list_collection_names()
@@ -147,9 +147,9 @@ class Command(BaseCommand):
 
             from sop_backend.db_config import neo4j_uri_from_env
 
-            user = os.environ.get("NEO4J_USER", "neo4j")
-            pw = os.environ.get("NEO4J_PASSWORD", "")
-            db_name = os.environ.get("NEO4J_DATABASE", "neo4j")
+            user = os.environ.get("NEO4J_USER")
+            pw = os.environ.get("NEO4J_PASSWORD")
+            db_name = os.environ.get("NEO4J_DATABASE")
             driver = GraphDatabase.driver(neo4j_uri_from_env(), auth=(user, pw))
             with driver.session(database=db_name) as session:
                 session.run("MATCH (n) DETACH DELETE n")
@@ -166,11 +166,11 @@ class Command(BaseCommand):
 
             from sop_backend.db_config import redis_ssl_kwargs
 
-            host = os.environ.get("REDIS_HOST", "localhost")
-            port = int(os.environ.get("REDIS_PORT", "6379"))
-            user = os.environ.get("REDIS_USER", "default")
-            pw = os.environ.get("REDIS_PASSWORD", "")
-            db_idx = int(os.environ.get("REDIS_DB", "0"))
+            host = os.environ.get("REDIS_HOST")
+            port = int(os.environ.get("REDIS_PORT"))
+            user = os.environ.get("REDIS_USER")
+            pw = os.environ.get("REDIS_PASSWORD")
+            db_idx = int(os.environ.get("REDIS_DB"))
             client = redis.Redis(
                 host=host, port=port, username=user, password=pw,
                 db=db_idx, socket_connect_timeout=10,

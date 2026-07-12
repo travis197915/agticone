@@ -79,8 +79,8 @@ def _neo4j_driver():
     if _DRIVER is not None:
         return _DRIVER
     host = os.environ.get("NEO4J_HOST")
-    user = os.environ.get("NEO4J_USER", "neo4j")
-    password = os.environ.get("NEO4J_PASSWORD", "")
+    user = os.environ.get("NEO4J_USER")
+    password = os.environ.get("NEO4J_PASSWORD")
     if not host or not password:
         return None
     try:
@@ -102,7 +102,7 @@ def _neo4j_driver():
 
 
 def _neo4j_database() -> str:
-    return os.environ.get("NEO4J_DATABASE", "neo4j")
+    return os.environ.get("NEO4J_DATABASE")
 
 
 # ── Read from Neo4j ─────────────────────────────────────────────────────────

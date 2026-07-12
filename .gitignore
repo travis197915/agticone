@@ -99,6 +99,28 @@ claims_prod_db_export.xlsx
 claims.txt
 prod_extra_context.sql
 reprocess-v1.xlsx
+claim_audit_summary.csv
+claim_ids.csv
+claim_reasoning_all.csv
+claim_reasoning_all.md
+claim_rules_report.csv
+sb_queue_ping_test.py
+sop7_scope_audit.csv
+uhc_backend_20260708_213208.dump
+uhc_backend_perfect_20260708_222751.dump
+backfill_claim_lob.py
+_celery_ssl_live.py
+_celery_ssl_probe.py
+_check_idx.py
+_check_idx2.py
+_graph_check.py
+_introspect_exec.py
+_introspect_sop.py
+_mig_introspect.py
+_mig_reconcile.py
+_mig_repair.py
+_redis_ping_test.py
+_rowcounts.py
 
 
 poc/*

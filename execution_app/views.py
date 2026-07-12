@@ -1283,11 +1283,36 @@ class RunNodesView(APIView):
         })
 
 
+def _serialize_executive_summary(row) -> dict[str, Any] | None:
+    """Shape the ClaimExecutiveSummary row for the summary payload."""
+    if row is None:
+        return None
+    return {
+        "headline": row.headline or "",
+        "overallSummary": row.overall_summary or "",
+        "verdict": row.verdict or "",
+        "auditStatus": row.audit_status or "",
+        "keyFindings": list(row.key_findings or []),
+        "steps": [
+            {
+                "shapeId": s.get("shape_id", ""),
+                "agentName": s.get("agent_name", ""),
+                "status": s.get("status", ""),
+                "summary": s.get("summary", ""),
+            }
+            for s in (row.step_summaries or [])
+            if isinstance(s, dict)
+        ],
+        "generatedBy": row.generated_by or "",
+        "updatedAt": _iso_utc(row.updated_at),
+    }
+
+
 class ClaimSummaryView(APIView):
     """GET /api/claims/<claim_id>/summary/ — header + outer tools + summaries."""
 
     def get(self, request: Request, claim_id: str) -> Response:
-        from .models import ClaimTrace
+        from .models import ClaimExecutiveSummary, ClaimTrace
 
         run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
         if err is not None:
@@ -1306,8 +1331,12 @@ class ClaimSummaryView(APIView):
             .first()
         )
         nodes, outer_tools = _build_summary_rollup(run)
+        exec_summary = (
+            ClaimExecutiveSummary.objects.filter(run_id=run.id).first()
+        )
         payload = {
             **_run_header_payload_light(run, trace),
+            "executiveSummary": _serialize_executive_summary(exec_summary),
             "agents": [_serialize_agent_summary_light(node) for node in nodes],
             "outerToolInvocations": [
                 {
@@ -1411,6 +1440,88 @@ class ClaimProcessingView(APIView):
         return Response(payload, status=status.HTTP_200_OK)
 
 
+import re as _re
+
+_SOP_HASH_PREFIX_RE = _re.compile(r"^[0-9a-fA-F]{16,}_")
+
+
+def _clean_sop_name(name: str) -> str:
+    """Human-readable SOP name from a raw trace ``sop_name``.
+
+    Ingested PDF/DOCX uploads carry a storage key title like
+    ``37cb2d10..._OBH_Facets_Timely_Filing``; strip the hash prefix and turn
+    underscores into spaces. Already-clean titles pass through unchanged.
+    """
+    raw = (name or "").strip()
+    cleaned = _SOP_HASH_PREFIX_RE.sub("", raw).replace("_", " ").strip()
+    return cleaned or raw
+
+
+def _sop_link_index() -> dict[str, tuple[int, str]]:
+    """Map ``AuditSop.title`` -> ``(sop_id, source_url)`` for current SOPs.
+
+    The execution trace stores ``sop_name`` = the SOP's title, so this lets a
+    step resolve its SOP. Cleaned names are also indexed as a fallback for
+    minor title drift.
+    """
+    from sop_ingestion.models import AuditSop
+
+    idx: dict[str, tuple[int, str]] = {}
+    clean_idx: dict[str, tuple[int, str]] = {}
+    rows = (
+        AuditSop.objects
+        .filter(is_current=True)
+        .order_by("id")
+        .values_list("id", "title", "url")
+    )
+    for sop_id, title, url in rows:
+        if not title:
+            continue
+        val = (sop_id, url or "")
+        idx.setdefault(title, val)
+        clean_idx.setdefault(_clean_sop_name(title), val)
+    # Merge cleaned fallbacks without clobbering exact-title hits.
+    for key, val in clean_idx.items():
+        idx.setdefault(key, val)
+    return idx
+
+
+def _enrich_trace_sop_links(data: Any) -> Any:
+    """Attach SOP identity + source availability to each trace step.
+
+    Purely additive read-side enrichment so the claim-detail UI can show the
+    real SOP name and, for HTML SOPs, a click-through to the raw crawled SOP
+    HTML (cached in Mongo). PDF uploads and node/YAML SOPs have no HTML source,
+    so they are flagged ``sop_available=False`` with a ``sop_kind`` and get no
+    view URL. Nothing rewrites stored ``trace_json``.
+    """
+    from sop_ingestion.sop_html_crawler import classify_sop_source
+
+    if not isinstance(data, list) or not data:
+        return data
+    idx = _sop_link_index()
+    for step in data:
+        if not isinstance(step, dict):
+            continue
+        raw = step.get("sop_name") or ""
+        display = _clean_sop_name(raw)
+        step["sop_display_name"] = display
+        hit = idx.get(raw) or idx.get(display)
+        if hit:
+            sop_id, url = hit
+            step["sop_id"] = sop_id
+            kind = classify_sop_source(url)
+            step["sop_kind"] = kind
+            if kind == "html":
+                step["sop_available"] = True
+                # Raw crawled source SOP HTML (original template with rules).
+                step["sop_view_url"] = f"/api/ingest/sops/{sop_id}/stored-html/"
+            else:
+                # Node/workflow (YAML) SOP — no source document to open.
+                step["sop_available"] = False
+    return data
+
+
 def _load_claim_trace_record(
     claim_id: str,
     run_uuid: uuid.UUID | None,
@@ -1466,6 +1577,9 @@ class ClaimTraceView(APIView):
             )
 
         data = getattr(trace, json_field) or []
+
+        if self.kind == "trace":
+            data = _enrich_trace_sop_links(data)
 
         if download:
             resp = JsonResponse(data, safe=False, json_dumps_params={"indent": 2})

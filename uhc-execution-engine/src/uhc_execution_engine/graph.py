@@ -5,8 +5,9 @@ from functools import lru_cache
 
 from langgraph.graph import END, START, StateGraph
 
-from .agents import (aggregate_decision, execute_shapes, load_bindings,
-                      persist_and_respond, run_tools, validate_input)
+from .agents import (aggregate_decision, execute_shapes, executive_summary,
+                      load_bindings, persist_and_respond, run_tools,
+                      validate_input)
 from .state import ExecutionState
 
 
@@ -19,6 +20,8 @@ def build_graph():
     g.add_node("execute_shapes", execute_shapes)
     g.add_node("aggregate_decision", aggregate_decision)
     g.add_node("persist_and_respond", persist_and_respond)
+    # Add-on: condense the persisted run into a human-auditor executive summary.
+    g.add_node("executive_summary", executive_summary)
 
     g.add_edge(START, "validate_input")
     g.add_edge("validate_input", "load_bindings")
@@ -26,6 +29,7 @@ def build_graph():
     g.add_edge("run_tools", "execute_shapes")
     g.add_edge("execute_shapes", "aggregate_decision")
     g.add_edge("aggregate_decision", "persist_and_respond")
-    g.add_edge("persist_and_respond", END)
+    g.add_edge("persist_and_respond", "executive_summary")
+    g.add_edge("executive_summary", END)
 
     return g.compile()

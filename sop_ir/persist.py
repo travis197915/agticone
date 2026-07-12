@@ -138,7 +138,7 @@ def _mongo_db():
 
         if not (os.environ.get("MONGO_HOST") or (is_prod() and os.environ.get("MONGO_URI"))):
             return None
-        database = os.environ.get("MONGO_DATABASE", "sop_ingestion")
+        database = os.environ.get("MONGO_DATABASE")
         client = MongoClient(mongo_uri_from_env(), serverSelectionTimeoutMS=10000)
         return client[database]
     except Exception as exc:
