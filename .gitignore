@@ -84,6 +84,7 @@ scripts/*
 # local DB backups
 backups/
 
+output.csv
 # ── Claim exports / scratch scripts (local only) ─────────────────────────
 _check_claims.py
 _export_ui_trace.py

@@ -43,6 +43,7 @@ Stable target keys (must match keys emitted by
 * ``sop``        → ``"sop:<sop_id>"``
 * ``graph_node`` → raw ``AuditGraphNode.node_key`` (e.g. ``"step_4_d0"``)
 """
+
 from __future__ import annotations
 
 import re
@@ -55,10 +56,19 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import (
-    AuditDecision, AuditGraphNode, AuditPrecondition, AuditSop, AuditStep,
+    AuditDecision,
+    AuditGraphNode,
+    AuditPrecondition,
+    AuditSop,
+    AuditStep,
     SopExclusion,
 )
-from .html_blocks import extract_blocks, fetch_sanitized_html, fetch_html_or_fallback, get_block_by_id
+from .html_blocks import (
+    extract_blocks,
+    fetch_sanitized_html,
+    fetch_html_or_fallback,
+    get_block_by_id,
+)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -88,7 +98,10 @@ def _validate_target(sop: AuditSop, kind: str, key: str) -> tuple[bool, str]:
     if kind == "rule":
         m = re.match(r"^(pre|step):(\d+):(\d+)(?::(\d+))?$", key)
         if not m:
-            return False, "rule target_key must be 'pre:<sop>:<pc>:<idx>' or 'step:<sop>:<step>:<row>'"
+            return (
+                False,
+                "rule target_key must be 'pre:<sop>:<pc>:<idx>' or 'step:<sop>:<step>:<row>'",
+            )
         if int(m.group(2)) != sop.id:
             return False, f"rule target_key sop_id mismatch (expected {sop.id})"
         return True, ""
@@ -134,22 +147,24 @@ def _validate_target(sop: AuditSop, kind: str, key: str) -> tuple[bool, str]:
 
 def _serialize(ex: SopExclusion) -> dict:
     return {
-        "id":               ex.id,
-        "sop_id":           ex.sop_id,
-        "target_kind":      ex.target_kind,
-        "target_key":       ex.target_key,
-        "label":            ex.label,
-        "reason":           ex.reason,
-        "snippet_text":     ex.snippet_text,
-        "metadata":         ex.metadata or {},
-        "created_by_id":    ex.created_by_id,
+        "id": ex.id,
+        "sop_id": ex.sop_id,
+        "target_kind": ex.target_kind,
+        "target_key": ex.target_key,
+        "label": ex.label,
+        "reason": ex.reason,
+        "snippet_text": ex.snippet_text,
+        "metadata": ex.metadata or {},
+        "created_by_id": ex.created_by_id,
         "created_by_email": ex.created_by_email,
-        "created_at":       ex.created_at.isoformat() if ex.created_at else None,
-        "updated_at":       ex.updated_at.isoformat() if ex.updated_at else None,
+        "created_at": ex.created_at.isoformat() if ex.created_at else None,
+        "updated_at": ex.updated_at.isoformat() if ex.updated_at else None,
     }
 
 
-def _autoderive_label_and_snippet(sop: AuditSop, kind: str, key: str) -> tuple[str, str]:
+def _autoderive_label_and_snippet(
+    sop: AuditSop, kind: str, key: str
+) -> tuple[str, str]:
     """Best-effort fill of label + snippet_text from the audit tables when
     the caller doesn't pass them — so the UI never has to repeat data it
     already has from /attachable/. Deterministic; no LLM.
@@ -159,7 +174,12 @@ def _autoderive_label_and_snippet(sop: AuditSop, kind: str, key: str) -> tuple[s
             m = re.match(r"^(pre|step):(\d+):(\d+):(\d+)$", key)
             if not m:
                 return "", ""
-            src, _sop_id, a, b = m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+            src, _sop_id, a, b = (
+                m.group(1),
+                m.group(2),
+                int(m.group(3)),
+                int(m.group(4)),
+            )
             if src == "pre":
                 pc = AuditPrecondition.objects.filter(sop=sop, id=a).first()
                 if not pc or not (pc.llm_rules or []):
@@ -172,22 +192,35 @@ def _autoderive_label_and_snippet(sop: AuditSop, kind: str, key: str) -> tuple[s
                 return label, snippet
             else:  # decision
                 step = AuditStep.objects.filter(sop=sop, step_number=a).first()
-                d = AuditDecision.objects.filter(step=step, row_index=b).first() if step else None
+                d = (
+                    AuditDecision.objects.filter(step=step, row_index=b).first()
+                    if step
+                    else None
+                )
                 if not d:
                     return "", ""
-                label = (d.condition_if or d.action_text or d.action_summary or "")[:255]
-                snippet = ((step.intro_text or "") + "\n\n"
-                           + (d.action_text or d.action_summary or "")).strip()
+                label = (d.condition_if or d.action_text or d.action_summary or "")[
+                    :255
+                ]
+                snippet = (
+                    (step.intro_text or "")
+                    + "\n\n"
+                    + (d.action_text or d.action_summary or "")
+                ).strip()
                 return label, snippet
         if kind == "step":
             m = re.match(r"^step:(\d+):(\d+)$", key)
             if not m:
                 return "", ""
-            step = AuditStep.objects.filter(sop=sop, step_number=int(m.group(2))).first()
+            step = AuditStep.objects.filter(
+                sop=sop, step_number=int(m.group(2))
+            ).first()
             if not step:
                 return "", ""
-            label = (f"Step {step.step_number}"
-                     + (f": {step.question}" if step.question else ""))[:255]
+            label = (
+                f"Step {step.step_number}"
+                + (f": {step.question}" if step.question else "")
+            )[:255]
             return label, step.intro_text or step.narrative_context or ""
         if kind == "section":
             m = re.match(r"^pre:(\d+):(\d+)$", key)
@@ -198,7 +231,9 @@ def _autoderive_label_and_snippet(sop: AuditSop, kind: str, key: str) -> tuple[s
                 return "", ""
             return (pc.label or pc.category)[:255], pc.content_text or ""
         if kind == "sop":
-            return (sop.title or "Whole SOP")[:255], (sop.purpose or sop.llm_summary or "")
+            return (sop.title or "Whole SOP")[:255], (
+                sop.purpose or sop.llm_summary or ""
+            )
         if kind == "graph_node":
             n = AuditGraphNode.objects.filter(sop=sop, node_key=key).first()
             if not n:
@@ -263,20 +298,24 @@ class SopHtmlBlocksView(APIView):
         enriched = []
         for b in blocks:
             tgt = f"html:{sop.id}:{b['block_id']}"
-            enriched.append({
-                **b,
-                "target_kind":  "html_block",
-                "target_key":   tgt,
-                "is_excluded":  tgt in existing,
-                "exclusion_id": existing.get(tgt),
-            })
-        return Response({
-            "sop_id":     sop.id,
-            "source_url": sop.url or "",
-            "doc_format": sop.doc_format or "HTML",
-            "count":      len(enriched),
-            "blocks":     enriched,
-        })
+            enriched.append(
+                {
+                    **b,
+                    "target_kind": "html_block",
+                    "target_key": tgt,
+                    "is_excluded": tgt in existing,
+                    "exclusion_id": existing.get(tgt),
+                }
+            )
+        return Response(
+            {
+                "sop_id": sop.id,
+                "source_url": sop.url or "",
+                "doc_format": sop.doc_format or "HTML",
+                "count": len(enriched),
+                "blocks": enriched,
+            }
+        )
 
 
 class SopSourceHtmlView(APIView):
@@ -309,20 +348,22 @@ class SopSourceHtmlView(APIView):
         # Existing user-marked html_block exclusions (target_keys) so the
         # SPA can outline them on load without re-querying /attachable/.
         excluded_keys = list(
-            sop.user_exclusions
-               .filter(target_kind="html_block")
-               .values_list("target_key", flat=True)
+            sop.user_exclusions.filter(target_kind="html_block").values_list(
+                "target_key", flat=True
+            )
         )
-        return Response({
-            "sop_id":     sop.id,
-            "doc_format": sop.doc_format or "HTML",
-            "source_url": sop.url or "",
-            "available":  bool(html),
-            "html":       html,
-            "reason":     reason,
-            "is_fallback": is_fallback,
-            "excluded_target_keys": excluded_keys,
-        })
+        return Response(
+            {
+                "sop_id": sop.id,
+                "doc_format": sop.doc_format or "HTML",
+                "source_url": sop.url or "",
+                "available": bool(html),
+                "html": html,
+                "reason": reason,
+                "is_fallback": is_fallback,
+                "excluded_target_keys": excluded_keys,
+            }
+        )
 
 
 class SopStoredHtmlView(APIView):
@@ -343,7 +384,10 @@ class SopStoredHtmlView(APIView):
 
     def get(self, request: Request, sop_id: int) -> Response:
         from .sop_html_crawler import (
-            classify_sop_source, crawl_and_store, get_stored, is_crawlable_url,
+            classify_sop_source,
+            crawl_and_store,
+            get_stored,
+            is_crawlable_url,
         )
 
         sop = get_object_or_404(AuditSop, pk=sop_id)
@@ -354,11 +398,17 @@ class SopStoredHtmlView(APIView):
         # source URL scheme so the UI can show the original SOP template.
         stored = get_stored(sop.id)
         if stored and stored.get("html"):
-            return Response({
-                "sop_id": sop.id, "available": True, "kind": "html",
-                "html": stored["html"], "source_url": sop.url or "",
-                "crawled_at": stored.get("crawled_at"), "reason": "",
-            })
+            return Response(
+                {
+                    "sop_id": sop.id,
+                    "available": True,
+                    "kind": "html",
+                    "html": stored["html"],
+                    "source_url": sop.url or "",
+                    "crawled_at": stored.get("crawled_at"),
+                    "reason": "",
+                }
+            )
 
         if not is_crawlable_url(sop.url):
             reason = (
@@ -366,32 +416,56 @@ class SopStoredHtmlView(APIView):
                 if kind == "pdf"
                 else "This SOP is node/workflow-based (no source document)."
             )
-            return Response({
-                "sop_id": sop.id, "available": False, "kind": kind,
-                "html": "", "source_url": sop.url or "", "reason": reason,
-            })
+            return Response(
+                {
+                    "sop_id": sop.id,
+                    "available": False,
+                    "kind": kind,
+                    "html": "",
+                    "source_url": sop.url or "",
+                    "reason": reason,
+                }
+            )
 
         doc = get_stored(sop.id)
         if not doc and (request.query_params.get("crawl") or "1") != "0":
             try:
                 doc = crawl_and_store(sop)
             except Exception as exc:  # noqa: BLE001
-                return Response({
-                    "sop_id": sop.id, "available": False, "kind": kind, "html": "",
-                    "source_url": sop.url or "", "reason": f"Crawl failed: {exc}",
-                })
+                return Response(
+                    {
+                        "sop_id": sop.id,
+                        "available": False,
+                        "kind": kind,
+                        "html": "",
+                        "source_url": sop.url or "",
+                        "reason": f"Crawl failed: {exc}",
+                    }
+                )
 
         if not doc or not doc.get("html"):
-            return Response({
-                "sop_id": sop.id, "available": False, "kind": kind, "html": "",
-                "source_url": sop.url or "", "reason": "SOP HTML not available yet.",
-            })
+            return Response(
+                {
+                    "sop_id": sop.id,
+                    "available": False,
+                    "kind": kind,
+                    "html": "",
+                    "source_url": sop.url or "",
+                    "reason": "SOP HTML not available yet.",
+                }
+            )
 
-        return Response({
-            "sop_id": sop.id, "available": True, "kind": "html",
-            "html": doc["html"], "source_url": sop.url or "",
-            "crawled_at": doc.get("crawled_at"), "reason": "",
-        })
+        return Response(
+            {
+                "sop_id": sop.id,
+                "available": True,
+                "kind": "html",
+                "html": doc["html"],
+                "source_url": sop.url or "",
+                "crawled_at": doc.get("crawled_at"),
+                "reason": "",
+            }
+        )
 
 
 class SopExclusionListCreateView(APIView):
@@ -400,8 +474,7 @@ class SopExclusionListCreateView(APIView):
     def get(self, _request: Request, sop_id: int) -> Response:
         sop = get_object_or_404(AuditSop, pk=sop_id)
         items = [
-            _serialize(ex)
-            for ex in sop.user_exclusions.all().order_by("-updated_at")
+            _serialize(ex) for ex in sop.user_exclusions.all().order_by("-updated_at")
         ]
         return Response({"sop_id": sop.id, "count": len(items), "results": items})
 
@@ -409,14 +482,14 @@ class SopExclusionListCreateView(APIView):
         sop = get_object_or_404(AuditSop, pk=sop_id)
         data = request.data if isinstance(request.data, dict) else {}
         kind = (data.get("target_kind") or "rule").strip()
-        key  = (data.get("target_key") or "").strip()
+        key = (data.get("target_key") or "").strip()
 
         ok, err = _validate_target(sop, kind, key)
         if not ok:
             return Response({"error": err}, status=status.HTTP_400_BAD_REQUEST)
 
         # Auto-fill label/snippet when the caller didn't provide them.
-        label_in   = (data.get("label") or "").strip()
+        label_in = (data.get("label") or "").strip()
         snippet_in = (data.get("snippet_text") or "").strip()
         if not label_in or not snippet_in:
             d_label, d_snippet = _autoderive_label_and_snippet(sop, kind, key)
@@ -435,7 +508,10 @@ class SopExclusionListCreateView(APIView):
         )
         try:
             ex, created = SopExclusion.objects.update_or_create(
-                sop=sop, target_kind=kind, target_key=key, defaults=defaults,
+                sop=sop,
+                target_kind=kind,
+                target_key=key,
+                defaults=defaults,
             )
         except IntegrityError as e:
             return Response({"error": str(e)}, status=status.HTTP_409_CONFLICT)
@@ -451,7 +527,7 @@ class SopExclusionDetailView(APIView):
 
     def delete(self, _request: Request, sop_id: int, exclusion_id: int) -> Response:
         sop = get_object_or_404(AuditSop, pk=sop_id)
-        ex  = get_object_or_404(SopExclusion, pk=exclusion_id, sop=sop)
+        ex = get_object_or_404(SopExclusion, pk=exclusion_id, sop=sop)
         ex.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -470,15 +546,17 @@ class SopExclusionToggleView(APIView):
         sop = get_object_or_404(AuditSop, pk=sop_id)
         data = request.data if isinstance(request.data, dict) else {}
         kind = (data.get("target_kind") or "rule").strip()
-        key  = (data.get("target_key") or "").strip()
-        on   = data.get("on")  # None → toggle
+        key = (data.get("target_key") or "").strip()
+        on = data.get("on")  # None → toggle
 
         ok, err = _validate_target(sop, kind, key)
         if not ok:
             return Response({"error": err}, status=status.HTTP_400_BAD_REQUEST)
 
         existing = SopExclusion.objects.filter(
-            sop=sop, target_kind=kind, target_key=key,
+            sop=sop,
+            target_kind=kind,
+            target_key=key,
         ).first()
         if on is None:
             on = existing is None
@@ -486,8 +564,14 @@ class SopExclusionToggleView(APIView):
         if not on:
             if existing:
                 existing.delete()
-            return Response({"sop_id": sop.id, "target_kind": kind,
-                             "target_key": key, "excluded": False})
+            return Response(
+                {
+                    "sop_id": sop.id,
+                    "target_kind": kind,
+                    "target_key": key,
+                    "excluded": False,
+                }
+            )
 
         # on == True → upsert with auto-derived label/snippet
         d_label, d_snippet = _autoderive_label_and_snippet(sop, kind, key)
@@ -500,12 +584,17 @@ class SopExclusionToggleView(APIView):
             created_by_email=getattr(request.user, "email", "") or "",
         )
         ex, _created = SopExclusion.objects.update_or_create(
-            sop=sop, target_kind=kind, target_key=key, defaults=defaults,
+            sop=sop,
+            target_kind=kind,
+            target_key=key,
+            defaults=defaults,
         )
-        return Response({
-            "sop_id":      sop.id,
-            "target_kind": kind,
-            "target_key":  key,
-            "excluded":    True,
-            "exclusion":   _serialize(ex),
-        })
+        return Response(
+            {
+                "sop_id": sop.id,
+                "target_kind": kind,
+                "target_key": key,
+                "excluded": True,
+                "exclusion": _serialize(ex),
+            }
+        )

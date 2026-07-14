@@ -35,6 +35,25 @@ GATEWAY_KEY_ENV_VARS = (
 )
 
 
+def _gateway_timeout(default: float) -> float:
+    """HTTP read timeout (seconds) for gateway invoke calls; env-tunable.
+
+    A ``bedrock_claude`` text generation with a large ``max_tokens`` (e.g. a
+    ~100-step executive summary) can take longer than the old hard 60s and trip
+    ``ReadTimeout`` → fallback. Default is raised to 180s and can be pushed
+    higher via ``LLM_GATEWAY_TIMEOUT``.
+    """
+    raw = os.environ.get("LLM_GATEWAY_TIMEOUT", "").strip()
+    if raw:
+        try:
+            v = float(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return default
+
+
 def gateway_api_key_source() -> str:
     """Return the env var name that supplies a static API key, or '' if unset."""
     for name in GATEWAY_KEY_ENV_VARS:
@@ -373,7 +392,7 @@ def _invoke_bedrock_claude(
         url,
         headers=_bedrock_request_headers(spec),
         body=body,
-        timeout=60.0,
+        timeout=_gateway_timeout(180.0),
         log_context=f"model={spec.name} deployment={spec.deployment}",
     )
     return parse_bedrock_response(data)

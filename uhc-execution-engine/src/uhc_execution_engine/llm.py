@@ -10,6 +10,7 @@ The current ``execution_run_id`` is carried through a ContextVar set by
 ``RuleEnginePipeline.run(...)`` for the duration of one claim, so the deeply
 nested LLM calls don't need it threaded through every signature.
 """
+
 from __future__ import annotations
 
 import contextvars
@@ -44,7 +45,11 @@ _llm_semaphore = threading.BoundedSemaphore(_LLM_CONCURRENCY)
 # the model receives byte-identical content, so verdicts/rationale are unchanged.
 # Set RULE_ENGINE_PROMPT_CACHE=0 to disable and fall back to a single flat prompt.
 _PROMPT_CACHE_ENABLED = os.environ.get("RULE_ENGINE_PROMPT_CACHE", "1").strip() not in (
-    "0", "false", "False", "no", "",
+    "0",
+    "false",
+    "False",
+    "no",
+    "",
 )
 
 
@@ -61,11 +66,13 @@ _PROMPT_CACHE_ENABLED = os.environ.get("RULE_ENGINE_PROMPT_CACHE", "1").strip() 
 # pub/sub channel ``batch:<batch_id>``.  When unset (single-claim runs,
 # ingestion-pipeline reuse, unit tests) the publish is a no-op.
 
-_current_execution_run_id: contextvars.ContextVar[str | None] = \
-    contextvars.ContextVar("uhc_execution_engine.current_run_id", default=None)
+_current_execution_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "uhc_execution_engine.current_run_id", default=None
+)
 
-_current_batch_id: contextvars.ContextVar[str | None] = \
-    contextvars.ContextVar("uhc_execution_engine.current_batch_id", default=None)
+_current_batch_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "uhc_execution_engine.current_batch_id", default=None
+)
 
 
 @contextmanager
@@ -102,6 +109,7 @@ def _get_redis():
     global _redis_client
     if _redis_client is None:
         import redis as _r  # noqa: WPS433 — lazy import is intentional
+
         url = os.environ.get("REDIS_URL")
         if not url:
             raise RuntimeError(
@@ -146,6 +154,7 @@ def publish_event(kind: str, payload: dict[str, Any]) -> None:
 
 def _make_anthropic_llm(cfg: EngineConfig, max_tokens: int):
     from langchain_anthropic import ChatAnthropic
+
     return ChatAnthropic(
         model=cfg.anthropic_model,
         api_key=cfg.anthropic_api_key,
@@ -155,6 +164,7 @@ def _make_anthropic_llm(cfg: EngineConfig, max_tokens: int):
 
 def _make_openai_llm(cfg: EngineConfig, max_tokens: int):
     from langchain_openai import ChatOpenAI
+
     return ChatOpenAI(
         model=cfg.openai_model,
         api_key=cfg.openai_api_key,
@@ -172,8 +182,35 @@ def _strip_markdown(text: str) -> str:
     return text
 
 
+def _loads_first_json(text: str) -> Any:
+    """Parse the FIRST complete JSON value in ``text``, ignoring trailing data.
+
+    Some gateway models (notably Bedrock Claude/opus via the UHG gateway) emit a
+    valid JSON object followed by extra content — a second object, a repeated
+    answer, or trailing prose/notes. ``json.loads`` rejects that with
+    "Extra data: line N column 1", failing an otherwise-usable response. We seek
+    to the first ``{``/``[`` and use ``raw_decode`` to take just the leading JSON
+    value.
+    """
+    dec = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch in "{[":
+            try:
+                obj, _end = dec.raw_decode(text[i:])
+                return obj
+            except json.JSONDecodeError:
+                continue
+    # Nothing salvageable — re-raise the original strict error for the caller.
+    return json.loads(text)
+
+
 def _parse_json(text: str) -> Any:
-    return json.loads(_strip_markdown(text))
+    cleaned = _strip_markdown(text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Tolerate leading prose / trailing "extra data" after the JSON value.
+        return _loads_first_json(cleaned)
 
 
 def _token_usage(resp) -> tuple[int, int]:
@@ -184,9 +221,18 @@ def _token_usage(resp) -> tuple[int, int]:
     )
 
 
-def _log_llm_call(*, agent_name: str, stage: str, provider: str, model: str,
-                  prompt_tokens: int, completion_tokens: int,
-                  duration_ms: int, success: bool, error: str = "") -> None:
+def _log_llm_call(
+    *,
+    agent_name: str,
+    stage: str,
+    provider: str,
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    duration_ms: int,
+    success: bool,
+    error: str = "",
+) -> None:
     """Persist one LLMCallLog row, stamped with the current execution_run_id.
 
     Best-effort: telemetry failures never break the pipeline. The console
@@ -196,8 +242,14 @@ def _log_llm_call(*, agent_name: str, stage: str, provider: str, model: str,
     run_id = _current_execution_run_id.get()
     logger.info(
         "llm_call %s/%s [%s] %s tok=%s+%s ms=%s success=%s run=%s%s",
-        provider, model, stage, agent_name,
-        prompt_tokens, completion_tokens, duration_ms, success,
+        provider,
+        model,
+        stage,
+        agent_name,
+        prompt_tokens,
+        completion_tokens,
+        duration_ms,
+        success,
         run_id or "-",
         f" err={error}" if error else "",
     )
@@ -207,6 +259,7 @@ def _log_llm_call(*, agent_name: str, stage: str, provider: str, model: str,
         return
     try:
         from sop_ingestion.models import LLMCallLog
+
         LLMCallLog.objects.create(
             job=None,
             execution_run_id=run_id,
@@ -225,8 +278,9 @@ def _log_llm_call(*, agent_name: str, stage: str, provider: str, model: str,
         logger.warning("LLMCallLog write failed (run=%s): %s", run_id, exc)
 
 
-def _validate(data: Any, expected_type: type,
-              required_keys: list[str] | None = None) -> bool:
+def _validate(
+    data: Any, expected_type: type, required_keys: list[str] | None = None
+) -> bool:
     if not isinstance(data, expected_type):
         return False
     if required_keys:
@@ -304,8 +358,9 @@ def llm_call(
         if expected_type is list:
             used_prompt += '\n\nWrap the array in a JSON object: {"items": [...]}'
 
-        def _attempt_registry(current_prompt: str, label: str,
-                              *, model_name: str | None = None):
+        def _attempt_registry(
+            current_prompt: str, label: str, *, model_name: str | None = None
+        ):
             t0 = time.time()
             meta["attempts"] += 1
             endpoint_hint = "unknown endpoint"
@@ -350,8 +405,11 @@ def llm_call(
             except Exception as exc:
                 ms = int((time.time() - t0) * 1000)
                 logger.warning(
-                    "llm_call [%s/%s] → %s: %s",
-                    agent_name, label, endpoint_hint, exc,
+                    "llm_call [%s/%s] -> %s: %s",
+                    agent_name,
+                    label,
+                    endpoint_hint,
+                    exc,
                 )
                 _log_llm_call(
                     agent_name=f"{agent_name}[{label}]",
@@ -386,12 +444,16 @@ def llm_call(
             primary_model = None
         if default_model and default_model != primary_model:
             data, _err = _attempt_registry(
-                used_prompt, "default-fallback", model_name=default_model,
+                used_prompt,
+                "default-fallback",
+                model_name=default_model,
             )
             if data is not None:
                 return data, meta
 
-        logger.error("llm_call [%s]: registry attempts failed; returning fallback", agent_name)
+        logger.error(
+            "llm_call [%s]: registry attempts failed; returning fallback", agent_name
+        )
         return fallback, meta
 
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -400,12 +462,17 @@ def llm_call(
     primary_fn = _make_anthropic_llm if provider == "anthropic" else _make_openai_llm
     fallback_fn = _make_openai_llm if alt_provider == "openai" else _make_anthropic_llm
     primary_model = cfg.anthropic_model if provider == "anthropic" else cfg.openai_model
-    fallback_model = cfg.openai_model if alt_provider == "openai" else cfg.anthropic_model
+    fallback_model = (
+        cfg.openai_model if alt_provider == "openai" else cfg.anthropic_model
+    )
 
     # ``prompt`` here is the per-rule *tail* (the only part that changes each
     # call). The JSON-format reminder must stay at the very end, after the tail.
     if provider == "anthropic":
-        prompt = prompt + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+        prompt = (
+            prompt
+            + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+        )
     elif provider == "openai" and expected_type is list:
         prompt = prompt + '\n\nWrap the array in a JSON object: {"items": [...]}'
 
@@ -426,16 +493,26 @@ def llm_call(
         if cache_this:
             msgs: list[Any] = []
             if system_prompt:
-                msgs.append(SystemMessage(content=[{
-                    "type": "text", "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"},
-                }]))
+                msgs.append(
+                    SystemMessage(
+                        content=[
+                            {
+                                "type": "text",
+                                "text": system_prompt,
+                                "cache_control": {"type": "ephemeral"},
+                            }
+                        ]
+                    )
+                )
             human_blocks: list[dict[str, Any]] = []
             if cache_prefix:
-                human_blocks.append({
-                    "type": "text", "text": cache_prefix,
-                    "cache_control": {"type": "ephemeral"},
-                })
+                human_blocks.append(
+                    {
+                        "type": "text",
+                        "text": cache_prefix,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                )
             human_blocks.append({"type": "text", "text": tail})
             msgs.append(HumanMessage(content=human_blocks))
             return msgs
@@ -456,9 +533,16 @@ def llm_call(
                 resp = llm.invoke(_messages_for(prov, tail))
             inp, out = _token_usage(resp)
             ms = int((time.time() - t0) * 1000)
-            _log_llm_call(agent_name=f"{agent_name}[{label}]", stage=stage,
-                          provider=prov, model=model, prompt_tokens=inp,
-                          completion_tokens=out, duration_ms=ms, success=True)
+            _log_llm_call(
+                agent_name=f"{agent_name}[{label}]",
+                stage=stage,
+                provider=prov,
+                model=model,
+                prompt_tokens=inp,
+                completion_tokens=out,
+                duration_ms=ms,
+                success=True,
+            )
             data = _parse_llm_payload(
                 resp.content if isinstance(resp.content, str) else str(resp.content),
                 expected_type=expected_type,
@@ -469,10 +553,17 @@ def llm_call(
         except Exception as exc:
             ms = int((time.time() - t0) * 1000)
             logger.warning("llm_call [%s/%s]: %s", agent_name, label, exc)
-            _log_llm_call(agent_name=f"{agent_name}[{label}]", stage=stage,
-                          provider=prov, model=model, prompt_tokens=0,
-                          completion_tokens=0, duration_ms=ms,
-                          success=False, error=str(exc))
+            _log_llm_call(
+                agent_name=f"{agent_name}[{label}]",
+                stage=stage,
+                provider=prov,
+                model=model,
+                prompt_tokens=0,
+                completion_tokens=0,
+                duration_ms=ms,
+                success=False,
+                error=str(exc),
+            )
             return None, str(exc)
 
     last_error = ""
@@ -483,16 +574,22 @@ def llm_call(
                 f"{prompt}\n\n[Previous attempt failed: {last_error}. "
                 "Fix the JSON format and try again.]"
             )
-        data, err = _attempt(primary_fn, provider, primary_model,
-                             current_tail, f"p{attempt}")
+        data, err = _attempt(
+            primary_fn, provider, primary_model, current_tail, f"p{attempt}"
+        )
         if data is not None:
             return data, meta
         last_error = err or "unknown error"
 
     fb_tail = prompt
     if alt_provider == "anthropic":
-        fb_tail = prompt + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
-    data, _err = _attempt(fallback_fn, alt_provider, fallback_model, fb_tail, "fallback")
+        fb_tail = (
+            prompt
+            + "\n\nIMPORTANT: Reply with valid JSON only. No markdown, no explanation."
+        )
+    data, _err = _attempt(
+        fallback_fn, alt_provider, fallback_model, fb_tail, "fallback"
+    )
     if data is not None:
         return data, meta
 

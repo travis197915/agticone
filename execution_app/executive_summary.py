@@ -29,10 +29,18 @@ logger = logging.getLogger(__name__)
 # pathologically large workflow can't blow the prompt budget.
 _MAX_STEPS = 130
 _MAX_REASONINGS_PER_STEP = 6
-# Output budget for the summary call. A claim can have ~100 steps and we ask for
-# one line each, so a small budget truncates the JSON mid-string and the parse
-# fails. Sized to comfortably cover ~130 short lines + the overall narrative.
-_SUMMARY_MAX_TOKENS = 8192
+# The summary is generated in SMALL CHUNKS rather than one giant call. A single
+# ~100-step call asking for one line each needs a huge output budget (8k+
+# tokens), and that one slow generation trips the gateway read timeout → the
+# whole summary falls back. Instead:
+#   * one small "overall" call  → headline + narrative + key_findings
+#   * N "step" calls of _STEP_CHUNK_SIZE steps each → the per-step one-liners
+# Each call has a small output budget so it returns quickly (like the fast
+# per-rule claim-processing calls) and a slow/failed chunk only degrades its own
+# steps, never the whole summary.
+_STEP_CHUNK_SIZE = 20
+_OVERALL_MAX_TOKENS = 1200
+_CHUNK_MAX_TOKENS = 2500
 
 
 def _no_llm() -> bool:
@@ -76,7 +84,26 @@ def _lob_label(run) -> str:
     return (run.claim_lob or {}).get("label", "") if isinstance(run.claim_lob, dict) else ""
 
 
-def _build_prompt(run, steps: list[dict[str, Any]], audit_status: str) -> str:
+def _compact_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "shape_id": s["shape_id"],
+            "agent": s["agent_name"],
+            "status": s["status"],
+            "decisions": s["decisions"],
+            "notes": " ".join(s["reasonings"])[:600],
+        }
+        for s in steps
+    ]
+
+
+def _build_overall_prompt(run, steps: list[dict[str, Any]], audit_status: str) -> str:
+    """Small-OUTPUT call: the whole-claim headline + narrative + key findings.
+
+    The step list is sent as INPUT context (cheap, fast) but the model is asked
+    for ONLY the executive fields — no per-step lines — so the output is small
+    and the call returns quickly.
+    """
     import json
 
     compact = {
@@ -86,16 +113,7 @@ def _build_prompt(run, steps: list[dict[str, Any]], audit_status: str) -> str:
         "audit_status": audit_status,
         "applied_codes": list(run.applied_codes or []),
         "engine_narrative": (run.narrative or "")[:2000],
-        "steps": [
-            {
-                "shape_id": s["shape_id"],
-                "agent": s["agent_name"],
-                "status": s["status"],
-                "decisions": s["decisions"],
-                "notes": " ".join(s["reasonings"])[:900],
-            }
-            for s in steps[:_MAX_STEPS]
-        ],
+        "steps": _compact_steps(steps[:_MAX_STEPS]),
     }
     return (
         "You are writing an executive audit summary for a human claims auditor.\n"
@@ -109,14 +127,32 @@ def _build_prompt(run, steps: list[dict[str, Any]], audit_status: str) -> str:
         "{\n"
         '  "headline": "<=15 word verdict headline",\n'
         '  "overall_summary": "2-4 sentence executive narrative of the whole claim",\n'
-        '  "key_findings": ["<=5 short bullets a human should notice"],\n'
-        '  "steps": [{"shape_id": "<echo the shape_id>", "summary": "one plain sentence for this step"}]\n'
+        '  "key_findings": ["<=5 short bullets a human should notice"]\n'
         "}\n\n"
-        "Rules: include one steps[] entry per input step, echoing its shape_id. "
-        "Keep each step summary to a single sentence in auditor language "
-        "(e.g. 'Coverage validated — member eligible, no defect'). If the claim "
-        "is clean, say so plainly; if there is a defect, lead with it.\n\n"
+        "If the claim is clean, say so plainly; if there is a defect, lead with "
+        "it.\n\n"
         f"AUDIT DATA:\n{json.dumps(compact, ensure_ascii=False)}"
+    )
+
+
+def _build_chunk_prompt(run, chunk: list[dict[str, Any]]) -> str:
+    """One call for a SMALL batch of steps → a one-line summary per step."""
+    import json
+
+    compact = {
+        "claim_id": run.claim_id or "",
+        "final_verdict": run.final_decision_type or "",
+        "steps": _compact_steps(chunk),
+    }
+    return (
+        "You are labeling individual audit steps for one healthcare claim. For "
+        "EACH step below, write one plain-English sentence in auditor language "
+        "(e.g. 'Coverage validated — member eligible, no defect').\n\n"
+        "Return ONLY JSON with this exact shape:\n"
+        '{ "steps": [{"shape_id": "<echo the shape_id>", '
+        '"summary": "one sentence for this step"}] }\n\n'
+        "Include exactly one entry per input step, echoing its shape_id.\n\n"
+        f"STEPS:\n{json.dumps(compact, ensure_ascii=False)}"
     )
 
 
@@ -167,34 +203,89 @@ def _fallback(run, steps: list[dict[str, Any]], audit_status: str) -> dict[str, 
     }
 
 
-def _call_llm(run, steps: list[dict[str, Any]], audit_status: str
-              ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    """Return (parsed, meta) or (None, {}) on failure."""
+def _guarded_call(run, prompt: str, *, stage: str, required_keys: list[str],
+                  max_tokens: int, fallback: dict[str, Any]
+                  ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One guarded llm_call in the engine's run context.
+
+    Returns ``(data, meta)``. ``meta['provider']`` is set only on a genuine LLM
+    success; on any failure the engine's ``llm_call`` hands back ``fallback``
+    with an empty provider, so callers can detect fallback via ``meta``.
+    """
     try:
         from uhc_execution_engine.config import get_config
         from uhc_execution_engine.llm import execution_run_context, llm_call
     except Exception:  # pragma: no cover - engine must be importable in prod
         logger.warning("executive_summary: engine LLM helpers unavailable")
-        return None, {}
-
-    prompt = _build_prompt(run, steps, audit_status)
-    fallback = _fallback(run, steps, audit_status)
+        return fallback, {}
     try:
         with execution_run_context(str(run.id)):
-            data, meta = llm_call(
-                get_config(),
-                prompt,
-                agent_name="executive_summary",
-                stage="executive_summary",
-                fallback=fallback,
-                expected_type=dict,
-                required_keys=["overall_summary"],
-                max_tokens=_SUMMARY_MAX_TOKENS,
+            return llm_call(
+                get_config(), prompt,
+                agent_name="executive_summary", stage=stage,
+                fallback=fallback, expected_type=dict,
+                required_keys=required_keys, max_tokens=max_tokens,
             )
-        return data, meta
     except Exception:  # pragma: no cover - never break the run
-        logger.exception("executive_summary: llm_call failed run=%s", run.id)
-        return None, {}
+        logger.exception("executive_summary: llm_call failed run=%s stage=%s",
+                         run.id, stage)
+        return fallback, {}
+
+
+def _chunks(seq: list[Any], size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _call_chunked(run, steps: list[dict[str, Any]], audit_status: str
+                  ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    """Generate the summary in small chunks (fast, timeout-safe).
+
+    One small "overall" call for headline/narrative/findings, then N per-step
+    chunk calls. Returns ``(data, meta, llm_ok)`` where ``llm_ok`` is True only
+    when the overall call was genuinely LLM-authored. A slow/failed step chunk
+    degrades only its own steps to the deterministic line.
+    """
+    fb = _fallback(run, steps, audit_status)
+
+    overall, ometa = _guarded_call(
+        run, _build_overall_prompt(run, steps, audit_status),
+        stage="executive_summary",
+        required_keys=["overall_summary"],
+        max_tokens=_OVERALL_MAX_TOKENS,
+        fallback={k: fb[k] for k in ("headline", "overall_summary", "key_findings")},
+    )
+    llm_ok = bool(
+        isinstance(overall, dict)
+        and overall.get("overall_summary")
+        and ometa.get("provider")
+    )
+
+    fb_lines = {s["shape_id"]: s["summary"] for s in fb["steps"]}
+    line_by_id: dict[str, str] = {}
+    for chunk in _chunks(steps, _STEP_CHUNK_SIZE):
+        cdata, _cmeta = _guarded_call(
+            run, _build_chunk_prompt(run, chunk),
+            stage="executive_summary_steps",
+            required_keys=["steps"],
+            max_tokens=_CHUNK_MAX_TOKENS,
+            fallback={"steps": [
+                {"shape_id": s["shape_id"], "summary": fb_lines.get(s["shape_id"], "")}
+                for s in chunk
+            ]},
+        )
+        for item in (cdata.get("steps") if isinstance(cdata, dict) else []) or []:
+            if isinstance(item, dict) and item.get("shape_id"):
+                line_by_id[str(item["shape_id"])] = str(item.get("summary") or "").strip()
+
+    data = {
+        "headline": (overall.get("headline") if isinstance(overall, dict) else "") or "",
+        "overall_summary": (overall.get("overall_summary") if isinstance(overall, dict) else "") or "",
+        "key_findings": (overall.get("key_findings") if isinstance(overall, dict) else []) or [],
+        "steps": [{"shape_id": sid, "summary": summ}
+                  for sid, summ in line_by_id.items() if summ],
+    }
+    return data, ometa, llm_ok
 
 
 def _merge_steps(steps: list[dict[str, Any]],
@@ -242,19 +333,15 @@ def generate_for_run(run, *, source: str = "agent",
 
     audit_status = _audit_status(run, steps)
 
-    data: dict[str, Any] | None = None
+    data: dict[str, Any] = {}
     meta: dict[str, Any] = {}
     used_source = source
+    llm_ok = False
     if not _no_llm():
-        data, meta = _call_llm(run, steps, audit_status)
-    # A real LLM success stamps meta["provider"]; if it is empty the guarded
-    # call exhausted every attempt and handed back our fallback dict, so label
-    # the row honestly as a fallback rather than an LLM-authored summary.
-    llm_ok = (
-        isinstance(data, dict)
-        and bool(data.get("overall_summary"))
-        and bool(meta.get("provider"))
-    )
+        # Chunked generation: small "overall" call + per-step chunks, each with a
+        # small output budget so no single call is slow enough to trip the
+        # gateway timeout. ``llm_ok`` reflects the overall (executive) call only.
+        data, meta, llm_ok = _call_chunked(run, steps, audit_status)
     if not llm_ok:
         data = _fallback(run, steps, audit_status)
         used_source = "fallback"

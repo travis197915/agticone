@@ -315,6 +315,76 @@ def claim_status(trace_list: list[dict[str, Any]]) -> str:
     )
 
 
+# Plain-language verbs per sub-rule verdict. Auditors asked that the agent
+# *explicitly state* each checklist item's result (e.g. "Received date is
+# correct in Facets per SOP") rather than leaving it implicit behind a raw
+# subrule id. ``subrule_label`` + ``subrule_statement`` produce exactly that.
+_STATEMENT_VERB = {
+    MET: "Verified",
+    NOT_MET: "Discrepancy found",
+    INCONCLUSIVE_RULE: "Could not be verified",
+    SKIPPED_RULE: "Not applicable",
+}
+
+
+def subrule_label(ev_or_condition: Any) -> str:
+    """Human-readable name for a checklist sub-rule.
+
+    Rule conditions are authored as ``"<Item Name> AND <predicate>"`` (e.g.
+    ``"Receive Date (Julian Date) AND Received Date ... must match ..."``), so
+    the item name is the text before the first `` AND ``. Falls back to the part
+    before `` from `` and finally to a trimmed slice, so the auditor sees
+    "Receive Date (Julian Date)" instead of "RULE-001-003".
+    """
+    if isinstance(ev_or_condition, dict):
+        cond = str(ev_or_condition.get("condition") or "")
+        fallback = str(
+            ev_or_condition.get("subrule_id")
+            or ev_or_condition.get("rule_key")
+            or ""
+        )
+    else:
+        cond = str(ev_or_condition or "")
+        fallback = ""
+    cond = cond.strip()
+    for sep in (" AND ", " from ", " must "):
+        idx = cond.find(sep)
+        if idx > 0:
+            return cond[:idx].strip(" .:-")
+    if cond:
+        return (cond[:60].strip(" .:-") + ("…" if len(cond) > 60 else ""))
+    return fallback
+
+
+def _last_condition_note(conditions: list[dict[str, Any]]) -> str:
+    """Most conclusive human note across a sub-rule's conditions.
+
+    The final condition usually carries the comparison conclusion (e.g. "exact
+    match confirmed, no discrepancy"), which is the phrase auditors want to see.
+    """
+    note = ""
+    for c in conditions or []:
+        vals = c.get("values") if isinstance(c, dict) else None
+        if isinstance(vals, dict):
+            n = vals.get("notes")
+            if isinstance(n, str) and n.strip():
+                note = n.strip()
+    return note
+
+
+def subrule_statement(
+    label: str, status: str, conditions: list[dict[str, Any]], reasoning: str = "",
+) -> str:
+    """One-line, plain-language statement of the sub-rule's outcome per SOP."""
+    verb = _STATEMENT_VERB.get(status, "Reviewed")
+    detail = _last_condition_note(conditions)
+    if not detail:
+        first = (reasoning or "").strip().split(". ")[0].strip()
+        detail = first[:200]
+    base = f"{label}: {verb} per SOP"
+    return f"{base} — {detail}" if detail else f"{base}."
+
+
 def _subrule_entry(ev: dict[str, Any]) -> dict[str, Any]:
     conditions = ev.get("conditions")
     if not isinstance(conditions, list) or not conditions:
@@ -324,9 +394,15 @@ def _subrule_entry(ev: dict[str, Any]) -> dict[str, Any]:
             "using_fields": [],
             "values": {},
         }]
+    status = _status_for_eval(ev)
+    label = subrule_label(ev)
     return {
         "subrule_id": ev.get("subrule_id") or ev.get("rule_key", ""),
-        "status": _status_for_eval(ev),
+        "label": label,
+        "status": status,
+        "statement": subrule_statement(
+            label, status, conditions, str(ev.get("reasoning") or ""),
+        ),
         "conditions": conditions,
     }
 
