@@ -45,6 +45,7 @@ from typing import Any
 from ..claim_fetcher import FETCH_TOOL, PARSE_TOOL
 from ..config import get_config
 from ..llm import publish_event
+from ..lob import tool_in_lob_scope
 from ..state import ExecutionState
 from ..tool_runner import invoke_tool
 from ._eval_common import _tool_context_for_rule, evaluate_one_rule
@@ -295,6 +296,29 @@ def execute_shapes(state: ExecutionState) -> dict:
             with _tool_lock:
                 if bid in tool_results:
                     continue
+            # LOB gating: never invoke a Medicare-only tool for a non-Medicare
+            # claim. Record it skipped so the trace greys it with a reason.
+            if not tool_in_lob_scope(tb.get("lob_scope"), lob_product, lob_label):
+                who = lob_label or lob_product or "non-Medicare"
+                scope = tb.get("lob_scope") or []
+                skip_rec = {
+                    "binding_id": bid,
+                    "tool_name": name,
+                    "phase": "EVALUATE",
+                    "args": {},
+                    "ok": True,
+                    "result": None,
+                    "error": "",
+                    "duration_ms": 0,
+                    "skipped": True,
+                    "skip_reason": (
+                        f"LOB {who}: {name} applies to "
+                        f"{', '.join(scope)} claims only; not invoked"),
+                }
+                with _tool_lock:
+                    tool_invocations.append(skip_rec)
+                    tool_results[bid] = skip_rec
+                continue
             args = _merge_args(tb.get("args_template") or {}, claim)
             out = invoke_tool(
                 name, args,

@@ -265,6 +265,11 @@ def _tool_context_for_rule(rule: dict[str, Any],
         rec = tool_results.get(bid)
         if not rec:
             continue
+        # LOB-gated tools were never invoked — keep their (absent) output out of
+        # the prompt entirely, but keep the binding id in ``binding_ids`` so the
+        # trace can still surface them under ``tools_skipped``.
+        if rec.get("skipped"):
+            continue
         compact.append({
             "tool": rec["tool_name"],
             "ok": rec["ok"],

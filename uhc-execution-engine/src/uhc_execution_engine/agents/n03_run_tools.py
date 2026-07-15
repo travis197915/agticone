@@ -15,6 +15,7 @@ from typing import Any
 
 from ..claim_fetcher import FETCH_TOOL, PARSE_TOOL
 from ..config import get_config
+from ..lob import tool_in_lob_scope
 from ..mcp_client import parallel_tool_invoke_timeout_seconds
 from ..memory import lookup_reusable_tool
 from ..state import ExecutionState
@@ -24,6 +25,30 @@ from ..tool_telemetry import log_tool_call
 logger = logging.getLogger(__name__)
 
 _SKIP_TOOLS = {FETCH_TOOL, PARSE_TOOL}
+
+
+def _lob_skip_record(tb: dict[str, Any], product: str, label: str) -> dict[str, Any]:
+    """A tool record for a binding that was NOT invoked because it is scoped to
+    LOBs that exclude this claim. Marked ``skipped`` (and ``ok=True`` so it is
+    never treated as a failure) so the trace shows it greyed with a reason and
+    the LLM never sees its output."""
+    who = label or product or "non-Medicare"
+    scope = tb.get("lob_scope") or []
+    return {
+        "binding_id": tb["binding_id"],
+        "tool_name": tb["tool_name"],
+        "phase": "EVALUATE",
+        "args": {},
+        "ok": True,
+        "result": None,
+        "error": "",
+        "duration_ms": 0,
+        "reused_from_run": "",
+        "skipped": True,
+        "skip_reason": (
+            f"LOB {who}: {tb['tool_name']} applies to "
+            f"{', '.join(scope)} claims only; not invoked"),
+    }
 
 
 def _dedup_key(tool_name: str, args: dict[str, Any]) -> str:
@@ -80,6 +105,12 @@ def run_tools(state: ExecutionState) -> dict:
             "stages": stages,
         }
 
+    # LOB gating inputs: a Medicare-only tool (e.g. check_medicare_coverage)
+    # must not be invoked for a non-Medicare claim.
+    claim_lob = state.get("claim_lob") or {}
+    lob_product = str(claim_lob.get("product") or "").strip()
+    lob_label = str(claim_lob.get("label") or "").strip()
+
     # Collect every unique tool binding from both scoping maps (tools_by_shape
     # is a superset of tools_by_rule_key, so it covers rule-scoped tools too).
     seen: set[str] = set()
@@ -94,6 +125,14 @@ def run_tools(state: ExecutionState) -> dict:
             # re-invoking the tool live. Backward compatible: empty seed map
             # means every binding is invoked as before.
             if tb["binding_id"] in results_by_binding:
+                continue
+            # Skip (do not invoke) a tool scoped to LOBs that exclude this claim;
+            # record it as skipped so the UI can show it greyed with the reason.
+            if not tool_in_lob_scope(tb.get("lob_scope"), lob_product, lob_label):
+                seen.add(tb["binding_id"])
+                rec = _lob_skip_record(tb, lob_product, lob_label)
+                invocations.append(rec)
+                results_by_binding[tb["binding_id"]] = rec
                 continue
             seen.add(tb["binding_id"])
             bindings.append(tb)

@@ -11,6 +11,8 @@ import logging
 import re
 from typing import Any
 
+from .lob import default_tool_lob_scope
+
 logger = logging.getLogger(__name__)
 
 _GOTO_VERB_RE = re.compile(
@@ -463,6 +465,13 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
 
     # Tool binding dicts + scoping lookups
     def _tool_dict(tb) -> dict[str, Any]:
+        args = dict(tb.args_template or {})
+        # Per-binding LOB scope lives in a reserved args key (``_lob_scope``) so
+        # no schema migration is needed; pop it so it is never sent to the tool.
+        # Fall back to the built-in default for known Medicare-only tools.
+        scope = args.pop("_lob_scope", None)
+        if scope is None:
+            scope = default_tool_lob_scope(tb.tool.name)
         return {
             "binding_id":      str(tb.id),
             "shape_id":        str(tb.shape_id),
@@ -470,7 +479,8 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
             "tool_name":       tb.tool.name,
             "tool_kind":       tb.tool.kind,
             "invoke_url":      tb.tool.invoke_url,
-            "args_template":   dict(tb.args_template or {}),
+            "args_template":   args,
+            "lob_scope":       list(scope or []),
         }
 
     all_tool_bindings = [_tool_dict(tb) for tb in tool_bindings]

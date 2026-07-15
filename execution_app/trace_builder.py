@@ -411,7 +411,11 @@ def _tool_lookup(tool_invocations: list[dict[str, Any]]) -> dict[str, dict[str, 
     """binding_id -> {tool_name, ok}. Falls back to tool_name keys too."""
     out: dict[str, dict[str, Any]] = {}
     for inv in tool_invocations or []:
-        rec = {"tool_name": inv.get("tool_name", ""), "ok": bool(inv.get("ok", True))}
+        rec = {
+            "tool_name": inv.get("tool_name", ""),
+            "ok": bool(inv.get("ok", True)),
+            "skipped": bool(inv.get("skipped")),
+        }
         bid = inv.get("binding_id") or inv.get("tool_binding_id")
         if bid:
             out[str(bid)] = rec
@@ -473,13 +477,22 @@ def build_trace(
         used: list[str] = []
         succeeded: list[str] = []
         failed: list[str] = []
+        skipped_tools: list[str] = []
         for e in evs:
             for bid in (e.get("tool_results_used") or []):
                 rec = tool_by_binding.get(str(bid))
                 if not rec:
                     continue
                 name = rec["tool_name"]
-                if name and name not in used:
+                if not name:
+                    continue
+                # LOB-gated (not-invoked) tool → show as skipped, not used, and
+                # never let it count toward tool-failure escalation below.
+                if rec.get("skipped"):
+                    if name not in skipped_tools:
+                        skipped_tools.append(name)
+                    continue
+                if name not in used:
                     used.append(name)
                     (succeeded if rec["ok"] else failed).append(name)
         for name in used:
@@ -524,7 +537,7 @@ def build_trace(
             "tools_used": used,
             "tools_succeeded": succeeded,
             "tools_failed": failed,
-            "tools_skipped": [],
+            "tools_skipped": skipped_tools,
             "decision_type": parent.get("decision_type", ""),
             "codes": list(parent.get("codes") or []),
             "subrule_results": sub_results,

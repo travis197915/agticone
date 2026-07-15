@@ -174,6 +174,10 @@ def _persist(state: ExecutionState) -> None:
                 reused_from_run=inv.get("reused_from_run") or None,
             )
             for inv in (state.get("tool_invocations") or [])
+            # LOB-gated tools were never actually invoked — keep them out of the
+            # persisted invocation log (and thus the node rollup + cost), while
+            # they still surface under ``tools_skipped`` in the trace.
+            if not inv.get("skipped")
         ])
 
         # Real-time per-claim cost snapshot. Computed AFTER the children are

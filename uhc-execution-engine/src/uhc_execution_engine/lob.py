@@ -30,6 +30,40 @@ NETWORK_INN = "INN"
 NETWORK_OON = "OON"
 NETWORK_UNKNOWN = "UNKNOWN"
 
+# Tools that only make sense for Medicare claims (per the SOP flowcharts, which
+# gate them behind "Is the plan Medicare? → Yes"). Used as a built-in default
+# LOB scope so a Medicare-only tool is never invoked for a non-Medicare claim
+# even before anyone sets a per-binding ``_lob_scope``. An auditor flagged
+# ``check_medicare_coverage`` firing on a Commercial claim — this is the guard.
+MEDICARE_ONLY_TOOLS = {
+    "check_medicare_coverage",
+    "medicare_optout_checker",
+    "medicare_opt_out_checker",
+    "provider_optout_lookup",
+}
+
+
+def default_tool_lob_scope(tool_name: str) -> list[str]:
+    """Built-in LOB scope for a tool when no per-binding scope is configured."""
+    return [LOB_MEDICARE] if (tool_name or "") in MEDICARE_ONLY_TOOLS else []
+
+
+def tool_in_lob_scope(lob_scope, product: str, label: str = "") -> bool:
+    """False when a tool is scoped to LOBs that exclude this claim.
+
+    Empty scope → always in scope. Unknown claim LOB (no product) → in scope
+    (never skip on missing data). Mirrors ``_rule_in_lob_scope`` in the shape
+    executor so tool-level and SOP-level gating behave identically.
+    """
+    scope = lob_scope or []
+    if not scope:
+        return True
+    p = (product or "").strip()
+    if not p:
+        return True
+    lab = (label or "").strip()
+    return p in scope or (bool(lab) and lab in scope)
+
 # Checked in order; first hit wins (medicare before medicaid, like the tool).
 _PRODUCT_KEYWORDS = ((("medicare",), LOB_MEDICARE), (("medicaid",), LOB_MEDICAID))
 
