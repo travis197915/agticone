@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 from celery.schedules import crontab
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -183,6 +184,36 @@ DATABASES = {
         },
     }
 }
+
+# claims-corebackend's user table normally lives on this same Postgres
+# instance under a different schema (see execution_app.models.CorebackendUser
+# / COREBACKEND_DB_SCHEMA). When corebackend is actually a separate Postgres
+# instance, set COREBACKEND_DB_HOST (+ port/name/user/password) to register a
+# second connection here — sop_backend.db_routers.CorebackendRouter then
+# routes CorebackendUser reads to it automatically. Leave COREBACKEND_DB_HOST
+# unset to keep the same-instance/different-schema behavior (the default).
+_COREBACKEND_DB_HOST = os.environ.get("COREBACKEND_DB_HOST", "").strip()
+if _COREBACKEND_DB_HOST:
+    if not os.environ.get("COREBACKEND_DB_NAME", "").strip():
+        raise ImproperlyConfigured(
+            "COREBACKEND_DB_HOST is set but COREBACKEND_DB_NAME is not — "
+            "the corebackend Postgres connection needs a database name."
+        )
+    DATABASES["corebackend"] = {
+        "ENGINE":   "django.db.backends.postgresql",
+        "NAME":     os.environ.get("COREBACKEND_DB_NAME", ""),
+        "USER":     os.environ.get("COREBACKEND_DB_USER", ""),
+        "PASSWORD": os.environ.get("COREBACKEND_DB_PASSWORD", ""),
+        "HOST":     _COREBACKEND_DB_HOST,
+        "PORT":     os.environ.get("COREBACKEND_DB_PORT", "5432"),
+        # A genuinely separate instance being unreachable (not just refusing
+        # the connection) must fail fast, not hang the claims-list request on
+        # the OS TCP timeout — reviewer-name lookups already degrade to the
+        # raw userID on any DatabaseError (see reviewer_lookup.py).
+        "OPTIONS": {"connect_timeout": 5},
+    }
+
+DATABASE_ROUTERS = ["sop_backend.db_routers.CorebackendRouter"]
 
 # ── Auth / i18n ───────────────────────────────────────────────────────────────
 AUTH_PASSWORD_VALIDATORS = [
