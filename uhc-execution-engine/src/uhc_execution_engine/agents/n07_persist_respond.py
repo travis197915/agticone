@@ -129,6 +129,7 @@ def _persist(state: ExecutionState) -> None:
                 narrative=state.get("narrative") or "",
                 error_message=state.get("error_message") or "",
                 claim_lob=state.get("claim_lob") or {},
+                original_auditor=state.get("original_auditor") or "",
             ),
         )
 

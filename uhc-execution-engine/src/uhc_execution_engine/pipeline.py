@@ -35,7 +35,8 @@ class RuleEnginePipeline:
             run_id: str | None = None,
             tool_results: dict[str, dict[str, Any]] | None = None,
             fetch_tool: str | None = None,
-            skip_mcp_health_check: bool = False) -> dict[str, Any]:
+            skip_mcp_health_check: bool = False,
+            original_auditor: str = "") -> dict[str, Any]:
         # Mint the run_id up here (instead of inside n01_validate) so we can
         # stamp it on every LLMCallLog row via the contextvar set below.
         run_id = run_id or str(uuid.uuid4())
@@ -98,6 +99,7 @@ class RuleEnginePipeline:
             "raw_fetch": raw_fetch or {},
             "claim_id": resolved_claim_id,
             "batch_id": batch_id,
+            "original_auditor": original_auditor,
             "stages": [],
             "tool_invocations": [],
             "tool_results": tool_results or {},

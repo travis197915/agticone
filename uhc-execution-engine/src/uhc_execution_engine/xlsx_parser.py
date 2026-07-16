@@ -23,6 +23,13 @@ _OPTIONAL_COLUMNS: dict[str, tuple[str, ...]] = {
 
 EXCEL_BILLING_FIELDS = tuple(_OPTIONAL_COLUMNS.keys())
 
+# Kept separate from _OPTIONAL_COLUMNS/EXCEL_BILLING_FIELDS: this one feeds
+# RuleExecutionRun.original_auditor (a dedicated model column resolved via
+# execution_app.reviewer_lookup), not the generic claim-payload spread —
+# mixing it into EXCEL_BILLING_FIELDS would let the raw sheet value clobber
+# the resolved name in API responses.
+_AUDITOR_NAME_ALIASES = ("auditorname", "auditor_name", "auditor name")
+
 
 class XlsxParseError(ValueError):
     pass
@@ -109,6 +116,8 @@ def extract_claim_rows(
         if idx >= 0:
             extra_idxs[field] = idx
 
+    auditor_idx = _find_column(norm, _AUDITOR_NAME_ALIASES)
+
     claim_rows: list[dict[str, Any]] = []
     for row in rows:
         if claim_idx >= len(row):
@@ -126,6 +135,10 @@ def extract_claim_rows(
                 value = _cell_value(row[idx])
                 if value is not None:
                     record[field] = value
+        if auditor_idx >= 0 and auditor_idx < len(row):
+            auditor_name = _cell_value(row[auditor_idx])
+            if auditor_name is not None:
+                record["original_auditor"] = str(auditor_name).strip()
         claim_rows.append(record)
 
     return claim_rows, resolved

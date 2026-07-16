@@ -352,6 +352,7 @@ class BatchRunner:
         from execution_app.models import RuleExecutionRun, ToolInvocationRecord
 
         excel_payload = _excel_fields(excel_row)
+        original_auditor = str((excel_row or {}).get("original_auditor") or "")
 
         if should_run_mcp_health_check(fetch_tool=fetch_tool):
             logger.info(
@@ -380,6 +381,7 @@ class BatchRunner:
                     finished_at=timezone.now(),
                     status="FAILED",
                     error_message=error_message,
+                    original_auditor=original_auditor,
                 )
                 return {
                     "run_id": run_id,
@@ -402,6 +404,7 @@ class BatchRunner:
                 finished_at=timezone.now(),
                 status="FETCH_FAILED",
                 error_message=f"{fetch_out['tool']}: {fetch_out['error']}",
+                original_auditor=original_auditor,
             )
             ToolInvocationRecord.objects.create(
                 run=run, tool_name=fetch_out["tool"], phase="FETCH",
@@ -457,6 +460,7 @@ class BatchRunner:
             batch_id=batch_id,
             run_id=run_id,
             skip_mcp_health_check=True,
+            original_auditor=original_auditor,
         )
 
         # Splice outer invocations onto the response + persist them too.
