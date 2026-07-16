@@ -9,6 +9,7 @@ from uhc_execution_engine.xlsx_parser import EXCEL_BILLING_FIELDS
 from . import trace_builder
 from .models import (BatchExecutionRun, RuleEvaluation, RuleExecutionRun,
                       ToolInvocationRecord)
+from .reviewer_lookup import resolve_reviewer_names
 
 
 def _processing_time_min(run: RuleExecutionRun) -> float:
@@ -34,8 +35,19 @@ def _excel_claim_fields(payload: dict | None) -> dict:
     }
 
 
-def serialize_run_summary(run: RuleExecutionRun) -> dict:
-    """Lightweight row for batch detail and the all-runs list."""
+def serialize_run_summary(
+    run: RuleExecutionRun, *, reviewer_names: dict[str, str] | None = None,
+) -> dict:
+    """Lightweight row for batch detail and the all-runs list.
+
+    ``reviewer_names`` lets callers batch-resolve userID -> name once for a
+    whole page/batch instead of a query per row; falls back to a per-row
+    lookup when omitted.
+    """
+    if reviewer_names is None:
+        reviewer_names = resolve_reviewer_names(
+            [run.htl_reviewer, run.original_auditor]
+        )
     return {
         "id": str(run.id),
         "run_id": str(run.id),
@@ -63,6 +75,12 @@ def serialize_run_summary(run: RuleExecutionRun) -> dict:
         "feedback": run.review_feedback or None,
         "review_started_at": _format_time(run.review_started_at),
         "reviewed_at": _format_time(run.reviewed_at),
+        "htl_reviewer": (
+            reviewer_names.get(run.htl_reviewer) or (run.htl_reviewer or None)
+        ),
+        "original_auditor": (
+            reviewer_names.get(run.original_auditor) or (run.original_auditor or None)
+        ),
         **_excel_claim_fields(run.claim_payload),
         **skip_metadata(run.claim_payload),
     }
@@ -120,6 +138,8 @@ class RuleEvaluationSerializer(serializers.ModelSerializer):
 class RuleExecutionRunSerializer(serializers.ModelSerializer):
     evaluations = RuleEvaluationSerializer(many=True, read_only=True)
     tool_invocations = ToolInvocationRecordSerializer(many=True, read_only=True)
+    htl_reviewer = serializers.SerializerMethodField()
+    original_auditor = serializers.SerializerMethodField()
 
     class Meta:
         model = RuleExecutionRun
@@ -128,7 +148,25 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
                   "final_decision_type", "applied_codes", "narrative",
                   "claim_lob", "error_message", "review_status", "review_feedback",
                   "auditor_status", "review_started_at", "reviewed_at",
+                  "htl_reviewer", "original_auditor",
                   "evaluations", "tool_invocations"]
+
+    def _reviewer_names(self, run: RuleExecutionRun) -> dict[str, str]:
+        cached = getattr(self, "_reviewer_names_cache", None)
+        if cached is None:
+            cached = resolve_reviewer_names(
+                [run.htl_reviewer, run.original_auditor]
+            )
+            self._reviewer_names_cache = cached
+        return cached
+
+    def get_htl_reviewer(self, run: RuleExecutionRun) -> str | None:
+        names = self._reviewer_names(run)
+        return names.get(run.htl_reviewer) or (run.htl_reviewer or None)
+
+    def get_original_auditor(self, run: RuleExecutionRun) -> str | None:
+        names = self._reviewer_names(run)
+        return names.get(run.original_auditor) or (run.original_auditor or None)
 
 
 class BatchExecutionRunSerializer(serializers.ModelSerializer):
@@ -144,7 +182,10 @@ class BatchExecutionRunSerializer(serializers.ModelSerializer):
     def get_runs(self, obj):
         # select_related('trace') so claim_audit_status doesn't fan out into a
         # per-run query for the reverse OneToOne.
+        runs = list(obj.runs.select_related("trace").all())
+        reviewer_names = resolve_reviewer_names(
+            [r.htl_reviewer for r in runs] + [r.original_auditor for r in runs]
+        )
         return [
-            serialize_run_summary(r)
-            for r in obj.runs.select_related("trace").all()
+            serialize_run_summary(r, reviewer_names=reviewer_names) for r in runs
         ]

@@ -166,13 +166,17 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["reviewStatus"], "in_progress")
+        self.assertEqual(body["htlReviewer"], "test-user")
         run.refresh_from_db()
         self.assertEqual(run.auditor_status, "IN_PROGRESS")
         self.assertIsNotNone(run.review_started_at)
+        self.assertEqual(run.htl_reviewer, "test-user")
+        self.assertEqual(run.original_auditor, "")
         self.assertIn("reviewStartedAt", body)
 
         summary = self.client.get("/api/claims/REVIEW-CLAIM/summary/")
         self.assertEqual(summary.json()["reviewStatus"], "in_progress")
+        self.assertEqual(summary.json()["htlReviewer"], "test-user")
 
     def test_patch_claim_review_status_endpoint(self):
         run = self._create_run(claim_id="REVIEW-CLAIM-2")
@@ -184,6 +188,7 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["runId"], str(run.id))
         self.assertEqual(resp.json()["reviewStatus"], "in_progress")
+        self.assertEqual(resp.json()["htlReviewer"], "test-user")
 
     def test_approve_review_optional_feedback(self):
         run = self._create_run(claim_id="APPROVE-CLAIM")
@@ -197,11 +202,13 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(body["reviewStatus"], "approved")
         self.assertEqual(body["auditorStatus"], "APPROVED")
         self.assertEqual(body["feedback"], "Looks good")
+        self.assertEqual(body["htlReviewer"], "test-user")
         run.refresh_from_db()
         self.assertEqual(run.review_status, "approved")
         self.assertEqual(run.auditor_status, "APPROVED")
         self.assertIsNotNone(run.reviewed_at)
         self.assertEqual(run.review_feedback, "Looks good")
+        self.assertEqual(run.htl_reviewer, "test-user")
 
     def test_approve_review_without_feedback(self):
         run = self._create_run(claim_id="APPROVE-NO-FB")
@@ -213,6 +220,7 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["reviewStatus"], "approved")
         self.assertIsNone(resp.json()["feedback"])
+        self.assertEqual(resp.json()["htlReviewer"], "test-user")
 
     def test_reject_review_requires_feedback(self):
         run = self._create_run(claim_id="REJECT-CLAIM")
@@ -236,8 +244,10 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(body["reviewStatus"], "rejected")
         self.assertEqual(body["auditorStatus"], "REJECTED")
         self.assertEqual(body["feedback"], "Missing documentation")
+        self.assertEqual(body["htlReviewer"], "test-user")
         run.refresh_from_db()
         self.assertIsNotNone(run.reviewed_at)
+        self.assertEqual(run.htl_reviewer, "test-user")
 
 
 class PersistFailureRegressionTests(TestCase):

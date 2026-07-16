@@ -36,6 +36,7 @@ from rest_framework.views import APIView
 
 from . import trace_builder
 from .models import BatchExecutionRun, RuleExecutionRun
+from .reviewer_lookup import resolve_reviewer_names
 from .serializers import (BatchExecutionRunSerializer,
                           RuleExecutionRunSerializer, _excel_claim_fields,
                           claim_audit_status,
@@ -705,6 +706,7 @@ def _run_header_payload_light(run: RuleExecutionRun, trace=None) -> dict[str, An
         "auditorStatus": run.auditor_status or None,
         "feedback": run.review_feedback or None,
         **_review_date_fields(run),
+        **_reviewer_fields(run),
         **_excel_claim_fields(run.claim_payload),
     }
 
@@ -734,6 +736,7 @@ def _run_header_payload(
         "auditorStatus": run.auditor_status or None,
         "feedback": run.review_feedback or None,
         **_review_date_fields(run),
+        **_reviewer_fields(run),
         **_excel_claim_fields(run.claim_payload),
     }
 
@@ -1002,13 +1005,19 @@ class RunListView(APIView):
         )
         qs = _filter_run_list_queryset(request, qs)
         total = qs.count()
-        runs = qs[offset: offset + limit]
+        runs = list(qs[offset: offset + limit])
+        reviewer_names = resolve_reviewer_names(
+            [r.htl_reviewer for r in runs] + [r.original_auditor for r in runs]
+        )
         return Response({
             "count": total,
             "limit": limit,
             "offset": offset,
             "avg_processing_time_min": _avg_processing_time_min(qs),
-            "results": [serialize_run_summary(r) for r in runs],
+            "results": [
+                serialize_run_summary(r, reviewer_names=reviewer_names)
+                for r in runs
+            ],
         })
 
 
@@ -1068,6 +1077,34 @@ def _review_date_fields(run: RuleExecutionRun) -> dict[str, Any]:
     }
 
 
+def _reviewer_fields(run: RuleExecutionRun) -> dict[str, Any]:
+    names = resolve_reviewer_names([run.htl_reviewer, run.original_auditor])
+    return {
+        "htlReviewer": names.get(run.htl_reviewer) or (run.htl_reviewer or None),
+        "originalAuditor": names.get(run.original_auditor) or (run.original_auditor or None),
+    }
+
+
+def _reviewer_from_request(request: Request) -> str:
+    """userID (JWT ``sub``) of the authenticated reviewer.
+
+    Empty when unauthenticated. Resolved to a display name at response time
+    via ``resolve_reviewer_names`` — this stores the raw corebackend userID.
+    """
+    user = getattr(request, "user", None)
+    if user is None or not getattr(user, "is_authenticated", False):
+        return ""
+    uid = str(getattr(user, "id", "") or "").strip()
+    if uid:
+        return uid
+    auth = getattr(request, "auth", None)
+    if isinstance(auth, dict):
+        sub = str(auth.get("sub") or "").strip()
+        if sub:
+            return sub
+    return ""
+
+
 def _serialize_review_status_update(run: RuleExecutionRun) -> dict[str, Any]:
     return {
         "runId": str(run.id),
@@ -1079,6 +1116,7 @@ def _serialize_review_status_update(run: RuleExecutionRun) -> dict[str, Any]:
         "auditorStatus": run.auditor_status or None,
         "feedback": run.review_feedback or None,
         **_review_date_fields(run),
+        **_reviewer_fields(run),
     }
 
 
@@ -1102,6 +1140,7 @@ def _apply_review_decision(
     *,
     review_status: str,
     feedback: str,
+    htl_reviewer: str = "",
 ) -> RuleExecutionRun:
     now = dj_timezone.now()
     run.review_status = review_status
@@ -1110,11 +1149,19 @@ def _apply_review_decision(
     if review_status in {"approved", "rejected"}:
         run.reviewed_at = now
     fields = ["review_status", "auditor_status", "review_feedback", "reviewed_at"]
+    if htl_reviewer:
+        run.htl_reviewer = htl_reviewer
+        fields.append("htl_reviewer")
     run.save(update_fields=fields)
     return run
 
 
-def _apply_review_status(run: RuleExecutionRun, review_status: str) -> RuleExecutionRun:
+def _apply_review_status(
+    run: RuleExecutionRun,
+    review_status: str,
+    *,
+    htl_reviewer: str = "",
+) -> RuleExecutionRun:
     now = dj_timezone.now()
     run.review_status = review_status
     run.auditor_status = _auditor_status_for_review(review_status)
@@ -1122,9 +1169,11 @@ def _apply_review_status(run: RuleExecutionRun, review_status: str) -> RuleExecu
     if review_status == "in_progress":
         run.review_started_at = now
         fields.append("review_started_at")
+    if htl_reviewer:
+        run.htl_reviewer = htl_reviewer
+        fields.append("htl_reviewer")
     run.save(update_fields=fields)
     return run
-
 
 class RunReviewApproveView(APIView):
     """POST /api/execute/runs/<run_id>/review/approve/"""
@@ -1141,7 +1190,12 @@ class RunReviewApproveView(APIView):
             return err
         assert feedback is not None
 
-        _apply_review_decision(run, review_status="approved", feedback=feedback)
+        _apply_review_decision(
+            run,
+            review_status="approved",
+            feedback=feedback,
+            htl_reviewer=_reviewer_from_request(request),
+        )
         return Response(_serialize_review_status_update(run))
 
 
@@ -1160,7 +1214,12 @@ class RunReviewRejectView(APIView):
             return err
         assert feedback is not None
 
-        _apply_review_decision(run, review_status="rejected", feedback=feedback)
+        _apply_review_decision(
+            run,
+            review_status="rejected",
+            feedback=feedback,
+            htl_reviewer=_reviewer_from_request(request),
+        )
         return Response(_serialize_review_status_update(run))
 
 
@@ -1183,7 +1242,12 @@ class ClaimReviewApproveView(APIView):
             return err
         assert feedback is not None
 
-        _apply_review_decision(run, review_status="approved", feedback=feedback)
+        _apply_review_decision(
+            run,
+            review_status="approved",
+            feedback=feedback,
+            htl_reviewer=_reviewer_from_request(request),
+        )
         return Response(_serialize_review_status_update(run))
 
 
@@ -1206,7 +1270,12 @@ class ClaimReviewRejectView(APIView):
             return err
         assert feedback is not None
 
-        _apply_review_decision(run, review_status="rejected", feedback=feedback)
+        _apply_review_decision(
+            run,
+            review_status="rejected",
+            feedback=feedback,
+            htl_reviewer=_reviewer_from_request(request),
+        )
         return Response(_serialize_review_status_update(run))
 
 
@@ -1229,7 +1298,11 @@ class RunReviewStatusView(APIView):
             return err
         assert review_status is not None
 
-        _apply_review_status(run, review_status)
+        _apply_review_status(
+            run,
+            review_status,
+            htl_reviewer=_reviewer_from_request(request),
+        )
         return Response(_serialize_review_status_update(run))
 
 
@@ -1256,7 +1329,11 @@ class ClaimReviewStatusView(APIView):
             return err
         assert review_status is not None
 
-        _apply_review_status(run, review_status)
+        _apply_review_status(
+            run,
+            review_status,
+            htl_reviewer=_reviewer_from_request(request),
+        )
         return Response(_serialize_review_status_update(run))
 
 

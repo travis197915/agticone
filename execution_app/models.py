@@ -101,6 +101,10 @@ class RuleExecutionRun(_UUIDPK):
     )
     review_started_at = models.DateTimeField(null=True, blank=True)
     reviewed_at = models.DateTimeField(null=True, blank=True)
+    # HTL reviewer identity captured from the JWT (email preferred, else sub).
+    htl_reviewer = models.CharField(max_length=255, blank=True, default="")
+    # Reserved for a later original-auditor attribution path (not set yet).
+    original_auditor = models.CharField(max_length=255, blank=True, default="")
     # Identified Line of Business for this claim (SOW deliverable):
     # {"product", "network", "label", "source"}. Empty for legacy/failed runs.
     claim_lob = models.JSONField(default=dict, blank=True)
@@ -298,4 +302,23 @@ class ClaimMemory(_UUIDPK):
     class Meta:
         db_table = "execution_claim_memory"
         ordering = ["-updated_at"]
-        unique_together = ("claim_id", "sop_id")
+
+
+class CorebackendUser(models.Model):
+    """Read-only mirror of claims-corebackend's ``app_user`` table.
+
+    Corebackend is just an API relay in front of this table — it lives in
+    the same Postgres instance under the ``claims_corebackend`` schema, so
+    reviewer identity (``RuleExecutionRun.htl_reviewer`` / ``original_auditor``,
+    stored as the JWT ``sub``/userID) is resolved to a display name by
+    reading it directly instead of round-tripping through corebackend's API.
+    """
+    id = models.CharField(max_length=50, primary_key=True)
+    email = models.CharField(max_length=50)
+    name = models.CharField(max_length=50)
+    role = models.CharField(max_length=50)
+    is_active = models.BooleanField()
+
+    class Meta:
+        managed = False
+        db_table = 'claims_corebackend"."app_user'

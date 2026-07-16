@@ -15,9 +15,9 @@ class BatchExecutionRunAdmin(admin.ModelAdmin):
 @admin.register(RuleExecutionRun)
 class RuleExecutionRunAdmin(admin.ModelAdmin):
     list_display = ("id", "claim_id", "workflow", "status",
-                    "final_decision_type", "started_at")
+                    "final_decision_type", "htl_reviewer", "started_at")
     list_filter = ("status", "final_decision_type")
-    search_fields = ("claim_id",)
+    search_fields = ("claim_id", "htl_reviewer", "original_auditor")
     readonly_fields = ("started_at", "finished_at")
 
 
