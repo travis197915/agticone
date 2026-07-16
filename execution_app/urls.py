@@ -9,7 +9,7 @@ from django.urls import path
 from .views import (BatchDetailView, BatchEventsView, BatchLatestView,
                      RunBatchAsyncView, RunBatchView, RunDetailView, RunListView,
                      RunNodesView, RunReviewApproveView, RunReviewRejectView,
-                     RunReviewStatusView)
+                     RunReviewReleaseView, RunReviewStatusView)
 
 app_name = "execution_app"
 
@@ -34,6 +34,8 @@ urlpatterns = [
          RunReviewApproveView.as_view(), name="run-review-approve"),
     path("runs/<uuid:run_id>/review/reject/",
          RunReviewRejectView.as_view(), name="run-review-reject"),
+    path("runs/<uuid:run_id>/review/release/",
+         RunReviewReleaseView.as_view(), name="run-review-release"),
     path("runs/<uuid:run_id>/nodes/",
          RunNodesView.as_view(), name="run-nodes"),
 ]

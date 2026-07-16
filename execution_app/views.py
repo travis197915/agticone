@@ -1105,6 +1105,56 @@ def _reviewer_from_request(request: Request) -> str:
     return ""
 
 
+def _current_uid_or_401(request: Request) -> tuple[str | None, Response | None]:
+    """Resolve the caller's userID, or a 401 if somehow unauthenticated.
+
+    ``IsAuthenticated`` is the global DRF default, so this should never
+    actually trip in practice — it's a defensive backstop for the lock/
+    release checks below, which need a concrete identity to compare against.
+    """
+    uid = _reviewer_from_request(request)
+    if not uid:
+        return None, Response(
+            {"detail": "authentication required to review a claim"},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+    return uid, None
+
+
+def _holder_display_name(run: RuleExecutionRun) -> str:
+    names = resolve_reviewer_names([run.htl_reviewer])
+    return names.get(run.htl_reviewer) or run.htl_reviewer
+
+
+def _locked_by_other_response(
+    run: RuleExecutionRun, current_uid: str,
+) -> Response | None:
+    """409 when another reviewer currently holds this claim ``in_progress``.
+
+    Only the holder can start/approve/reject/release while locked; anyone
+    (including the holder) may act once it's unlocked (never started, or
+    already released back to pending).
+    """
+    if run.review_status == "in_progress" and run.htl_reviewer and run.htl_reviewer != current_uid:
+        holder = _holder_display_name(run)
+        return Response(
+            {"detail": f"already being reviewed by {holder}", "heldBy": holder},
+            status=status.HTTP_409_CONFLICT,
+        )
+    return None
+
+
+def _apply_review_release(run: RuleExecutionRun) -> RuleExecutionRun:
+    run.review_status = "pending"
+    run.auditor_status = _auditor_status_for_review("pending")
+    run.htl_reviewer = ""
+    run.review_started_at = None
+    run.save(update_fields=[
+        "review_status", "auditor_status", "htl_reviewer", "review_started_at",
+    ])
+    return run
+
+
 def _serialize_review_status_update(run: RuleExecutionRun) -> dict[str, Any]:
     return {
         "runId": str(run.id),
@@ -1185,16 +1235,21 @@ class RunReviewApproveView(APIView):
             return Response({"detail": "not found"},
                             status=status.HTTP_404_NOT_FOUND)
 
+        current_uid, err = _current_uid_or_401(request)
+        if err is not None:
+            return err
+        lock_err = _locked_by_other_response(run, current_uid)
+        if lock_err is not None:
+            return lock_err
+
         feedback, err = _parse_feedback_body(request, required=False)
         if err is not None:
             return err
         assert feedback is not None
 
         _apply_review_decision(
-            run,
-            review_status="approved",
-            feedback=feedback,
-            htl_reviewer=_reviewer_from_request(request),
+            run, review_status="approved", feedback=feedback,
+            htl_reviewer=current_uid,
         )
         return Response(_serialize_review_status_update(run))
 
@@ -1209,16 +1264,21 @@ class RunReviewRejectView(APIView):
             return Response({"detail": "not found"},
                             status=status.HTTP_404_NOT_FOUND)
 
+        current_uid, err = _current_uid_or_401(request)
+        if err is not None:
+            return err
+        lock_err = _locked_by_other_response(run, current_uid)
+        if lock_err is not None:
+            return lock_err
+
         feedback, err = _parse_feedback_body(request, required=True)
         if err is not None:
             return err
         assert feedback is not None
 
         _apply_review_decision(
-            run,
-            review_status="rejected",
-            feedback=feedback,
-            htl_reviewer=_reviewer_from_request(request),
+            run, review_status="rejected", feedback=feedback,
+            htl_reviewer=current_uid,
         )
         return Response(_serialize_review_status_update(run))
 
@@ -1237,16 +1297,21 @@ class ClaimReviewApproveView(APIView):
             return err
         assert run is not None
 
+        current_uid, err = _current_uid_or_401(request)
+        if err is not None:
+            return err
+        lock_err = _locked_by_other_response(run, current_uid)
+        if lock_err is not None:
+            return lock_err
+
         feedback, err = _parse_feedback_body(request, required=False)
         if err is not None:
             return err
         assert feedback is not None
 
         _apply_review_decision(
-            run,
-            review_status="approved",
-            feedback=feedback,
-            htl_reviewer=_reviewer_from_request(request),
+            run, review_status="approved", feedback=feedback,
+            htl_reviewer=current_uid,
         )
         return Response(_serialize_review_status_update(run))
 
@@ -1265,16 +1330,21 @@ class ClaimReviewRejectView(APIView):
             return err
         assert run is not None
 
+        current_uid, err = _current_uid_or_401(request)
+        if err is not None:
+            return err
+        lock_err = _locked_by_other_response(run, current_uid)
+        if lock_err is not None:
+            return lock_err
+
         feedback, err = _parse_feedback_body(request, required=True)
         if err is not None:
             return err
         assert feedback is not None
 
         _apply_review_decision(
-            run,
-            review_status="rejected",
-            feedback=feedback,
-            htl_reviewer=_reviewer_from_request(request),
+            run, review_status="rejected", feedback=feedback,
+            htl_reviewer=current_uid,
         )
         return Response(_serialize_review_status_update(run))
 
@@ -1283,7 +1353,9 @@ class RunReviewStatusView(APIView):
     """PATCH /api/execute/runs/<run_id>/review-status/
 
     Mark the human audit / review workflow for one claim run (e.g.
-    ``{"reviewStatus": "in_progress"}``).
+    ``{"reviewStatus": "in_progress"}``). Blocked with 409 while another
+    reviewer already holds the claim ``in_progress`` — see
+    ``RunReviewReleaseView``.
     """
 
     def patch(self, request: Request, run_id: str) -> Response:
@@ -1298,11 +1370,14 @@ class RunReviewStatusView(APIView):
             return err
         assert review_status is not None
 
-        _apply_review_status(
-            run,
-            review_status,
-            htl_reviewer=_reviewer_from_request(request),
-        )
+        current_uid, err = _current_uid_or_401(request)
+        if err is not None:
+            return err
+        lock_err = _locked_by_other_response(run, current_uid)
+        if lock_err is not None:
+            return lock_err
+
+        _apply_review_status(run, review_status, htl_reviewer=current_uid)
         return Response(_serialize_review_status_update(run))
 
 
@@ -1329,11 +1404,83 @@ class ClaimReviewStatusView(APIView):
             return err
         assert review_status is not None
 
-        _apply_review_status(
-            run,
-            review_status,
-            htl_reviewer=_reviewer_from_request(request),
+        current_uid, err = _current_uid_or_401(request)
+        if err is not None:
+            return err
+        lock_err = _locked_by_other_response(run, current_uid)
+        if lock_err is not None:
+            return lock_err
+
+        _apply_review_status(run, review_status, htl_reviewer=current_uid)
+        return Response(_serialize_review_status_update(run))
+
+
+class RunReviewReleaseView(APIView):
+    """POST /api/execute/runs/<run_id>/review/release/
+
+    Only the reviewer currently holding a claim (``review_status=in_progress``,
+    ``htl_reviewer`` = them) can release it — sets it back to ``pending`` with
+    no holder, so another auditor can start it.
+    """
+
+    def post(self, request: Request, run_id: str) -> Response:
+        try:
+            run = RuleExecutionRun.objects.get(id=run_id)
+        except RuleExecutionRun.DoesNotExist:
+            return Response({"detail": "not found"},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        current_uid, err = _current_uid_or_401(request)
+        if err is not None:
+            return err
+
+        if run.review_status != "in_progress" or not run.htl_reviewer:
+            return Response(
+                {"detail": "claim is not currently in progress"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if run.htl_reviewer != current_uid:
+            holder = _holder_display_name(run)
+            return Response(
+                {"detail": f"only {holder} can release this claim"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        _apply_review_release(run)
+        return Response(_serialize_review_status_update(run))
+
+
+class ClaimReviewReleaseView(APIView):
+    """POST /api/claims/<claim_id>/review/release/"""
+
+    def post(self, request: Request, claim_id: str) -> Response:
+        run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
+        if err is not None:
+            return err
+        run, err = _load_run_for_claim(
+            claim_id, run_uuid, batch_uuid, lightweight=True,
         )
+        if err is not None:
+            return err
+        assert run is not None
+
+        current_uid, err = _current_uid_or_401(request)
+        if err is not None:
+            return err
+
+        if run.review_status != "in_progress" or not run.htl_reviewer:
+            return Response(
+                {"detail": "claim is not currently in progress"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if run.htl_reviewer != current_uid:
+            holder = _holder_display_name(run)
+            return Response(
+                {"detail": f"only {holder} can release this claim"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        _apply_review_release(run)
         return Response(_serialize_review_status_update(run))
 
 
