@@ -11,9 +11,17 @@ doesn't delete history.
 """
 from __future__ import annotations
 
+import os
 import uuid
 
 from django.db import models
+
+# claims-corebackend's user table, read directly (see CorebackendUser below).
+# Same Postgres instance as PG_*, different schema — corebackend is just an
+# API relay in front of it. Overridable per-env; defaults match every env
+# corebackend has actually used so far.
+_COREBACKEND_DB_SCHEMA = os.environ.get("COREBACKEND_DB_SCHEMA", "claims_corebackend")
+_COREBACKEND_DB_TABLE = os.environ.get("COREBACKEND_DB_TABLE", "app_user")
 
 
 class _UUIDPK(models.Model):
@@ -321,4 +329,4 @@ class CorebackendUser(models.Model):
 
     class Meta:
         managed = False
-        db_table = 'claims_corebackend"."app_user'
+        db_table = f'{_COREBACKEND_DB_SCHEMA}"."{_COREBACKEND_DB_TABLE}'
