@@ -4,6 +4,8 @@ anthropic==0.102.0
 anyio==4.12.1
 asgiref==3.11.1
 azure-core==1.41.0
+azure-identity==1.23.0
+azure-keyvault-secrets==4.10.0
 azure-storage-blob==12.29.0
 beautifulsoup4==4.14.3
 billiard==4.2.4
@@ -100,6 +102,7 @@ zstandard==0.25.0
 -e ./uhc-sop-ingestion
 -e ./uhc-api-agent
 -e ./uhc-execution-engine
--e ./uhc-llm
+# [keyvault] pulls azure-identity + azure-keyvault-secrets (also pinned above for Docker --no-deps)
+-e "./uhc-llm[keyvault]"
  
  
