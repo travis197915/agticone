@@ -435,6 +435,31 @@ def _load_run_for_claim(
 ) -> tuple[RuleExecutionRun | None, Response | None]:
     try:
         base = RuleExecutionRun.objects.select_related("workflow", "batch")
+        if lightweight:
+            # Summary/agents endpoints do not need heavyweight blobs like
+            # raw_fetch/cost_breakdown; avoid transferring/de-serializing them.
+            base = base.only(
+                "id",
+                "batch_id",
+                "workflow_id",
+                "claim_id",
+                "claim_payload",
+                "started_at",
+                "finished_at",
+                "status",
+                "final_decision_type",
+                "applied_codes",
+                "narrative",
+                "error_message",
+                "review_status",
+                "review_feedback",
+                "auditor_status",
+                "review_started_at",
+                "reviewed_at",
+                "htl_reviewer",
+                "original_auditor",
+                "claim_lob",
+            )
         if not lightweight:
             base = base.prefetch_related(
                 "evaluations__rule_binding__shape",
@@ -499,10 +524,9 @@ def _build_summary_rollup(
     """Lightweight rollup for GET /claims/<id>/summary/ — reasoning + status only."""
     nodes: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 
-    evals = (
+    eval_rows = (
         run.evaluations
-        .select_related("rule_binding__shape")
-        .only(
+        .values(
             "order_index",
             "reasoning",
             "matched",
@@ -511,19 +535,18 @@ def _build_summary_rollup(
             "skip_reason",
             "codes",
             "rule_key",
-            "rule_binding_id",
             "rule_binding__shape_id",
             "rule_binding__shape__label",
         )
         .order_by("order_index")
     )
-    for ev in evals:
-        rb = ev.rule_binding
-        if rb is not None:
-            shape_id = str(rb.shape_id)
-            shape_label = (rb.shape.label or "") if rb.shape else ""
+    for ev in eval_rows:
+        shape_fk = ev.get("rule_binding__shape_id")
+        if shape_fk:
+            shape_id = str(shape_fk)
+            shape_label = (ev.get("rule_binding__shape__label") or "")
         else:
-            shape_id = f"orphaned:{ev.rule_key}"
+            shape_id = f"orphaned:{ev.get('rule_key') or ''}"
             shape_label = ""
         slot = nodes.get(shape_id)
         if slot is None:
@@ -536,18 +559,18 @@ def _build_summary_rollup(
                 "terminated_here": False,
             }
             nodes[shape_id] = slot
-        reasoning = (ev.reasoning or "").strip()
+        reasoning = (ev.get("reasoning") or "").strip()
         if reasoning:
             slot["reasonings"].append(reasoning)
         slot["evals"].append({
-            "matched": ev.matched,
-            "skipped": getattr(ev, "skipped", False),
-            "skip_reason": getattr(ev, "skip_reason", ""),
-            "decision_type": ev.decision_type,
-            "codes": list(ev.codes or []),
+            "matched": bool(ev.get("matched")),
+            "skipped": bool(ev.get("skipped")),
+            "skip_reason": ev.get("skip_reason") or "",
+            "decision_type": ev.get("decision_type") or "",
+            "codes": list(ev.get("codes") or []),
         })
-        if ev.matched and not getattr(ev, "skipped", False):
-            dt = (ev.decision_type or "").upper()
+        if ev.get("matched") and not ev.get("skipped"):
+            dt = str(ev.get("decision_type") or "").upper()
             if dt and dt not in slot["matched_decisions"]:
                 slot["matched_decisions"].append(dt)
 
@@ -559,15 +582,15 @@ def _build_summary_rollup(
 
     outer_tools = [
         {
-            "tool_name": inv.tool_name,
-            "phase": inv.phase,
-            "ok": inv.ok,
-            "duration_ms": inv.duration_ms,
+            "tool_name": inv.get("tool_name") or "",
+            "phase": inv.get("phase") or "",
+            "ok": bool(inv.get("ok")),
+            "duration_ms": int(inv.get("duration_ms") or 0),
         }
         for inv in (
             run.tool_invocations
             .filter(Q(tool_binding__isnull=True) | Q(phase__in=("FETCH", "PARSE")))
-            .only("tool_name", "phase", "ok", "duration_ms")
+            .values("tool_name", "phase", "ok", "duration_ms")
             .order_by("called_at")
         )
     ]
