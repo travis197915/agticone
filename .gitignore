@@ -126,6 +126,9 @@ _rowcounts.py
 
 poc/*
 
+COVERAGE_TOOL_FIX_SUMMARY.md
+MEDICARE_COVERAGE_TOOL_LOB_FIX.md
+
 claim_run_logs/*
 
 DUPLICATE_CDD_ISSUE_REPORT.md

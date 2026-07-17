@@ -305,6 +305,23 @@ def _serialize_agent(
     }
 
 
+def _eval_status_label(ev: dict[str, Any]) -> str:
+    """Human-readable per-sub-rule status for the claim-detail chip.
+
+    A skipped row is a NON-FINDING — it must not read as "not matched". We
+    surface it as Not Applicable / Out of Scope (driven by the skip_reason the
+    engine / a scoping fix wrote) so the auditor sees the correct disposition.
+    """
+    if ev.get("skipped"):
+        reason = (ev.get("skip_reason") or "").lower()
+        if reason.startswith("not-applicable") or "not applicable" in reason:
+            return "Not Applicable"
+        if "out of scope" in reason:
+            return "Out of Scope"
+        return "Not Applicable"
+    return "Matched" if ev.get("matched") else "Not Matched"
+
+
 def _serialize_evaluation(ev: dict[str, Any]) -> dict[str, Any]:
     return {
         "orderIndex": ev["order_index"],
@@ -313,6 +330,9 @@ def _serialize_evaluation(ev: dict[str, Any]) -> dict[str, Any]:
         "condition": ev["condition"],
         "action": ev["action"],
         "matched": ev["matched"],
+        "skipped": bool(ev.get("skipped")),
+        "skipReason": ev.get("skip_reason") or "",
+        "status": _eval_status_label(ev),
         "decisionType": ev["decision_type"],
         "confidence": ev["confidence"],
         "reasoning": ev["reasoning"],
