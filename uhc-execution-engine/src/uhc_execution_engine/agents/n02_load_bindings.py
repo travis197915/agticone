@@ -53,6 +53,12 @@ def load_bindings(state: ExecutionState) -> dict:
     claim = dict(state.get("claim") or {})
     claim_lob = determine_claim_lob(claim, state.get("raw_fetch") or {})
     claim["line_of_business"] = claim_lob["label"]
+    # Surface the derived Coverage/Benefit (CBD) path "<Payer> > <LOB>" so the
+    # coverage rule-eval prompt reasons over the real plan path (e.g.
+    # "Avmed > Commercial") instead of the legacy Medicare stub. Only set when
+    # the payer is confidently derivable (never fabricate a path).
+    if claim_lob.get("cbd_path"):
+        claim["cbd_coverage_path"] = claim_lob["cbd_path"]
     lob_out_of_scope = bool(
         supported_lob
         and claim_lob["product"] not in supported_lob

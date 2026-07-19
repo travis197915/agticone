@@ -329,6 +329,51 @@ DOMAIN GUIDANCE — PROVIDER SELECTION (apply before deciding `matched`)
 """
 
 
+# ── Domain guidance (subscriber-ID verification) ─────────────────────────────
+# Physician Claim Checklist sub-rule "Subscriber ID" compares the FACETS
+# Subscriber ID (SBSB_ID) against the Doc360 image "Insured's ID Number". The IR
+# gives the evaluator only SBSB_ID, so a naive string compare reports a false
+# mismatch (and a prior heuristic then mislabeled it "masked / Not Applicable").
+# In reality the Doc360 image carries the full MEMBER ID = subscriber base +
+# member suffix, sometimes with a plan/product prefix; and FACETS also holds
+# alternate identifiers on a Transfer-Subscriber-Family "Additional ID" screen
+# our tools do not return. This block re-injects those semantics, scoped to the
+# subscriber-ID check. Policy guidance only — it never dictates a verdict.
+_SUBSCRIBER_SIGNALS = (
+    "subscriber id", "insured's id", "insured id", "member id", "sbsb_id",
+    "sbsb id",
+)
+
+_SUBSCRIBER_GUIDANCE = """\
+DOMAIN GUIDANCE — SUBSCRIBER ID (image vs FACETS; apply before deciding `matched`)
+----------------------------------------------------------------------------------
+The Doc360 claim image "Insured's ID Number" is the full MEMBER ID. The FACETS
+`SBSB_ID` is the SUBSCRIBER BASE. They identify the SAME member when they differ
+only by a member/dependent suffix and/or a plan/product prefix, e.g.:
+  SBSB_ID K61297021  == image K6129702101 (base + suffix 01)
+  SBSB_ID 999095985  == image M2K999095985 (plan prefix + base)
+  SBSB_ID C77772744  == image OSC7777274401 (prefix + base + suffix)
+  SBSB_ID 00112854   == image STAS00112854 (prefix + base)
+
+DECIDE `matched` like this:
+1. Normalize both values — uppercase and strip all non-alphanumerics (and ignore
+   leading zeros for purely numeric ids).
+2. If the normalized SBSB_ID equals, or is a contiguous substring of, the
+   normalized image id (or their digit cores contain one another), they are the
+   SAME member -> Subscriber ID is MATCHED (status="Met"). A trailing member
+   suffix and/or a leading plan/product prefix is NOT a discrepancy.
+3. If they do NOT relate by base+suffix/prefix, the image id may still be a valid
+   alternate identifier recorded in FACETS under `Transfer Subscriber Family >
+   Subscriber > Additional ID` — a field NOT present in these tool results. In
+   that case you CANNOT confirm or refute the match from the available data: set
+   status="Inconclusive" (the Additional ID must be checked manually). Do NOT
+   report a discrepancy/defect, and do NOT claim a clean match, based solely on
+   SBSB_ID != image id.
+4. Never treat a Subscriber-ID mismatch as a claim defect on its own — this is a
+   verification/reconciliation check, not an adverse determination.
+"""
+
+
 _MATCHING_CONTRACT = """\
 MATCHING CONTRACT (read this BEFORE deciding `matched`)
 -------------------------------------------------------
@@ -412,8 +457,15 @@ def _domain_context(rule: dict[str, Any]) -> str:
     """
     blob = " ".join(str(rule.get(k, "")) for k in
                     ("condition", "action", "section_label")).lower()
-    hits = sum(1 for s in _PROVSEL_SIGNALS if s in blob)
-    return f"\n{_PROVSEL_GUIDANCE}" if hits >= 2 else ""
+    parts: list[str] = []
+    if sum(1 for s in _PROVSEL_SIGNALS if s in blob) >= 2:
+        parts.append(_PROVSEL_GUIDANCE)
+    # Subscriber-ID verification: the rule compares an "Insured's ID"/"Subscriber
+    # ID" against FACETS. Trigger on any subscriber-id signal (the check is a
+    # single, distinctively-worded rule so one hit is enough).
+    if any(s in blob for s in _SUBSCRIBER_SIGNALS):
+        parts.append(_SUBSCRIBER_GUIDANCE)
+    return ("\n" + "\n".join(parts)) if parts else ""
 
 
 def _workbench_context_section(rule: dict[str, Any]) -> str:

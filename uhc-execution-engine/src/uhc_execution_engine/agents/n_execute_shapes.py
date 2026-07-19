@@ -45,7 +45,7 @@ from typing import Any
 from ..claim_fetcher import FETCH_TOOL, PARSE_TOOL
 from ..config import get_config
 from ..llm import publish_event
-from ..lob import tool_in_lob_scope
+from ..lob import CBD_TOOL, enrich_cbd_result, tool_in_lob_scope
 from ..state import ExecutionState
 from ..tool_runner import invoke_tool
 from ._eval_common import _tool_context_for_rule, evaluate_one_rule
@@ -313,7 +313,8 @@ def execute_shapes(state: ExecutionState) -> dict:
                     "skipped": True,
                     "skip_reason": (
                         f"LOB {who}: {name} applies to "
-                        f"{', '.join(scope)} claims only; not invoked"),
+                        f"{', '.join(scope)} claims only; not invoked"
+                    ),
                 }
                 with _tool_lock:
                     tool_invocations.append(skip_rec)
@@ -321,18 +322,24 @@ def execute_shapes(state: ExecutionState) -> dict:
                 continue
             args = _merge_args(tb.get("args_template") or {}, claim)
             out = invoke_tool(
-                name, args,
+                name,
+                args,
                 phase="EVALUATE",
                 binding_id=bid or "",
                 claim_id=claim_id or "",
             )
+            result = out["result"]
+            if name == CBD_TOOL and out.get("ok"):
+                cbd_path = str(claim_lob.get("cbd_path") or "")
+                if cbd_path:
+                    result = enrich_cbd_result(result, cbd_path)
             record = {
                 "binding_id": bid,
                 "tool_name": name,
                 "phase": "EVALUATE",
                 "args": out.get("args") or args,
                 "ok": out["ok"],
-                "result": out["result"],
+                "result": result,
                 "error": out["error"],
                 "duration_ms": out["duration_ms"],
             }
@@ -348,8 +355,7 @@ def execute_shapes(state: ExecutionState) -> dict:
         )
 
     # ── helpers ──────────────────────────────────────────────────────────────
-    def _evaluate(rule: dict, sink: _Sink,
-                  prior: list[dict] | None = None) -> dict:
+    def _evaluate(rule: dict, sink: _Sink, prior: list[dict] | None = None) -> dict:
         """Evaluate one rule (one LLM call), append + emit, return verdict.
 
         Returns the verdict dict augmented with ``_matched``/``_skipped`` flags
@@ -364,7 +370,11 @@ def execute_shapes(state: ExecutionState) -> dict:
             rule, tools_by_rule, tools_by_shape, tool_results
         )
         verdict, meta = evaluate_one_rule(
-            cfg, rule=rule, claim=claim, tool_context=ctx, stage="execute_shapes",
+            cfg,
+            rule=rule,
+            claim=claim,
+            tool_context=ctx,
+            stage="execute_shapes",
             prior_findings=prior,
         )
 
@@ -427,8 +437,9 @@ def execute_shapes(state: ExecutionState) -> dict:
         verdict["_skipped"] = skipped
         return verdict
 
-    def _mark_skipped(rules: list[dict], reason: str, step_no: Any,
-                      sink: _Sink) -> None:
+    def _mark_skipped(
+        rules: list[dict], reason: str, step_no: Any, sink: _Sink
+    ) -> None:
         """Record a SKIPPED row per rule and emit a step_skipped SSE — no LLM."""
         for rule in rules:
             sink.results.append(
@@ -506,7 +517,9 @@ def execute_shapes(state: ExecutionState) -> dict:
             )
         logger.info(
             "execute_shapes claim=%s LOB %s out of scope — %d rules skipped, no LLM",
-            claim_id or "-", lob_label or lob_product, len(main_sink.results),
+            claim_id or "-",
+            lob_label or lob_product,
+            len(main_sink.results),
         )
         return _merge_and_finish([])
 
@@ -515,7 +528,12 @@ def execute_shapes(state: ExecutionState) -> dict:
         # Auditor marked this node out of scope on the canvas — exclude its
         # rules from execution entirely (no LLM call), record as SKIPPED.
         if rule.get("manual_oos"):
-            _mark_skipped([rule], "manually marked out of scope (excluded from execution)", None, main_sink)
+            _mark_skipped(
+                [rule],
+                "manually marked out of scope (excluded from execution)",
+                None,
+                main_sink,
+            )
             continue
         verdict = _evaluate(rule, main_sink)
         # In parallel mode a precondition match is just another contributing
@@ -563,7 +581,9 @@ def execute_shapes(state: ExecutionState) -> dict:
             sop_order.append(sid)
         decisions_by_sop.setdefault(sid, []).append(rule)
 
-    def _run_sop_cursor(sop_decisions: list[dict], sink: _Sink) -> tuple[str, bool, int, int]:
+    def _run_sop_cursor(
+        sop_decisions: list[dict], sink: _Sink
+    ) -> tuple[str, bool, int, int]:
         """Run one SOP's step cursor. Returns
         ``(halt_shape_id, terminated_clean, visited_count, step_count)``.
 
@@ -571,6 +591,7 @@ def execute_shapes(state: ExecutionState) -> dict:
         the caller propagates as a whole-claim TERMINATED_EARLY. Writes all
         rows into ``sink`` so cursors can run concurrently without contention.
         """
+
         def mark_skipped(rules, reason, step_no):
             _mark_skipped(rules, reason, step_no, sink)
 
@@ -665,8 +686,11 @@ def execute_shapes(state: ExecutionState) -> dict:
                 # that DO carry codes (e.g. "Deny F24 ... out of scope") are
                 # real findings and still evaluated. Terminal OOS exclusions
                 # keep is_final=True and fall through to the clean-stop handling.
-                if (rule.get("is_out_of_scope") and not rule.get("is_final")
-                        and not rule.get("codes")):
+                if (
+                    rule.get("is_out_of_scope")
+                    and not rule.get("is_final")
+                    and not rule.get("codes")
+                ):
                     mark_skipped(
                         [rule], "out of scope: no rule defined for this step", step_no
                     )
@@ -688,15 +712,19 @@ def execute_shapes(state: ExecutionState) -> dict:
                 for rule in to_eval:
                     if applicable_only and satisfied_applicable:
                         mark_skipped(
-                            [rule], "not-applicable: sibling already applicable",
+                            [rule],
+                            "not-applicable: sibling already applicable",
                             step_no,
                         )
                         continue
                     verdict = _evaluate(rule, sink, prior=_prior_ctx())
                     verdicts.append((rule, verdict))
                     sop_findings.append(_finding(rule, verdict))
-                    if (applicable_only and verdict["_matched"]
-                            and not verdict["_skipped"]):
+                    if (
+                        applicable_only
+                        and verdict["_matched"]
+                        and not verdict["_skipped"]
+                    ):
                         satisfied_applicable = True
             elif len(to_eval) <= 1:
                 snapshot = _prior_ctx()
@@ -718,6 +746,7 @@ def execute_shapes(state: ExecutionState) -> dict:
                     finally:
                         try:
                             from django.db import connections
+
                             connections.close_all()
                         except Exception:  # pragma: no cover — best effort
                             pass
@@ -726,7 +755,8 @@ def execute_shapes(state: ExecutionState) -> dict:
                     sib_futs = {
                         sx.submit(
                             contextvars.copy_context().run,
-                            _sibling_worker, rule,
+                            _sibling_worker,
+                            rule,
                         ): rule
                         for rule in to_eval
                     }
@@ -845,8 +875,9 @@ def execute_shapes(state: ExecutionState) -> dict:
     # One sink per SOP so cursors never share a list.
     sop_sinks: dict[Any, _Sink] = {sid: _Sink() for sid in sop_order}
 
-    eval_workers = max(1, min(int(getattr(cfg, "sop_eval_workers", 8) or 8),
-                              len(sop_order) or 1))
+    eval_workers = max(
+        1, min(int(getattr(cfg, "sop_eval_workers", 8) or 8), len(sop_order) or 1)
+    )
 
     if parallel and len(sop_order) > 1 and eval_workers > 1:
         # PARALLEL: the SOPs are independent, so run their step cursors
@@ -861,6 +892,7 @@ def execute_shapes(state: ExecutionState) -> dict:
             finally:
                 try:
                     from django.db import connections
+
                     connections.close_all()
                 except Exception:  # pragma: no cover — best effort
                     pass

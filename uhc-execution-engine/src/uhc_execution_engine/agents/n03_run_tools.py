@@ -15,7 +15,7 @@ from typing import Any
 
 from ..claim_fetcher import FETCH_TOOL, PARSE_TOOL
 from ..config import get_config
-from ..lob import tool_in_lob_scope
+from ..lob import CBD_TOOL, enrich_cbd_result, tool_in_lob_scope
 from ..mcp_client import parallel_tool_invoke_timeout_seconds
 from ..memory import lookup_reusable_tool
 from ..state import ExecutionState
@@ -251,17 +251,23 @@ def run_tools(state: ExecutionState) -> dict:
                     rep_tb["tool_name"], rep_args, rep_tb["binding_id"],
                 )
 
+    # Derived CBD path ("<Payer> > <LOB>") to stamp onto cbd_coverage results.
+    cbd_path = str(claim_lob.get("cbd_path") or "")
+
     # Fan each distinct outcome out to every binding that shared the call.
     for key, members in groups.items():
         out = outcomes.get(key) or {"ok": False, "result": None, "error": "no result", "duration_ms": 0}
         for tb, args in members:
+            result = out["result"]
+            if tb["tool_name"] == CBD_TOOL and out.get("ok") and cbd_path:
+                result = enrich_cbd_result(result, cbd_path)
             record = {
                 "binding_id": tb["binding_id"],
                 "tool_name": tb["tool_name"],
                 "phase": "EVALUATE",
                 "args": out.get("args") or args,
                 "ok": out["ok"],
-                "result": out["result"],
+                "result": result,
                 "error": out["error"],
                 "duration_ms": out["duration_ms"],
                 "reused_from_run": out.get("reused_from_run") or "",

@@ -18,6 +18,10 @@ __pycache__/
 sop_uploads/
 OBH_Facets_Timely_Filing.pdf
 c9f37941-1121-46fc-832b-e2b29075a62a_OBH Facets Duplicate Claim Handling_masked.pdf
+UHC-architecture-diagrams.pdf
+03-execution-flow (1).mermaid
+03-small-scale-kube-10-20k.mermaid
+04-scale-architecture-1.2M.mermaid
 
 # ── Editable installs / build artefacts ──────────────────────────────────
 build/
