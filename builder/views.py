@@ -27,6 +27,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.renderers import BaseRenderer
 from rest_framework.response import Response
 
+from builder.auth import HasPermission
+
 from .models import (
     DashboardWidget,
     NavItem,
@@ -190,6 +192,13 @@ class WorkflowViewSet(viewsets.ModelViewSet):
     queryset = Workflow.objects.all()
     serializer_class = WorkflowSerializer
     permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        # Matches Node's requireBuilderAccess exactly: AUDITOR may only list
+        # workflows (the audit-review-dashboard's workflow picker) — every
+        # other action here, including custom @action routes, is ADMIN-only.
+        key = "workflows:list" if self.action == "list" else "builder:manage"
+        return [IsAuthenticated(), HasPermission(key)()]
 
     def get_queryset(self):
         qs = super().get_queryset()

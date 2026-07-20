@@ -18,8 +18,12 @@ from sop_ingestion.models import AuditSop, IngestionJob
 class ClaimProcessingEndpointTests(TestCase):
     def setUp(self) -> None:
         self.client = APIClient()
+        # Wildcard permission — this suite exercises view/business logic, not
+        # the ACL itself (see execution_app/tests/test_permissions.py for that).
         self.client.force_authenticate(
-            user=CorebackendUser(id="test-user", email="t@example.com", role="MEMBER"),
+            user=CorebackendUser(
+                id="test-user", email="t@example.com", role="MEMBER", permissions=["*"],
+            ),
         )
         self.workflow = Workflow.objects.create(name="WF", slug=f"wf-{uuid.uuid4().hex[:8]}")
         self.batch = BatchExecutionRun.objects.create(
