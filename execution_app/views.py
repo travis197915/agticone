@@ -34,6 +34,8 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from builder.auth import HasPermission
+
 from . import trace_builder
 from .models import BatchExecutionRun, RuleExecutionRun
 from .reviewer_lookup import resolve_reviewer_names
@@ -855,6 +857,7 @@ class RunBatchView(APIView):
     HTTP response is still synchronous — caller blocks until the batch
     finishes — but the work no longer runs inside the gunicorn worker.
     """
+    permission_classes = [HasPermission("execution:manage")]
     parser_classes = [MultiPartParser]
     # Bound on how long the sync HTTP request will wait. Overridable via env
     # for CI/large batches; align with the gunicorn / proxy timeout in prod.
@@ -934,6 +937,7 @@ class RunBatchView(APIView):
 
 class BatchLatestView(APIView):
     """GET /api/execute/batches/latest/ — most recent batch from shared DB."""
+    permission_classes = [HasPermission("execution:read")]
 
     def get(self, _request: Request) -> Response:
         batch = (
@@ -949,6 +953,8 @@ class BatchLatestView(APIView):
 
 
 class BatchDetailView(APIView):
+    permission_classes = [HasPermission("execution:read")]
+
     def get(self, _request: Request, batch_id: str) -> Response:
         try:
             batch = BatchExecutionRun.objects.prefetch_related("runs").get(id=batch_id)
@@ -1024,6 +1030,7 @@ def _avg_processing_time_min(qs) -> float:
 
 class RunListView(APIView):
     """GET /api/execute/runs/ — all processed claims across every batch."""
+    permission_classes = [HasPermission("execution:read")]
 
     _DEFAULT_LIMIT = 25
     _MAX_LIMIT = 200
@@ -1065,6 +1072,8 @@ class RunListView(APIView):
 
 
 class RunDetailView(APIView):
+    permission_classes = [HasPermission("execution:read")]
+
     def get(self, _request: Request, run_id: str) -> Response:
         try:
             run = (RuleExecutionRun.objects
@@ -1270,6 +1279,7 @@ def _apply_review_status(
 
 class RunReviewApproveView(APIView):
     """POST /api/execute/runs/<run_id>/review/approve/"""
+    permission_classes = [HasPermission("execution:review:approve")]
 
     def post(self, request: Request, run_id: str) -> Response:
         try:
@@ -1299,6 +1309,7 @@ class RunReviewApproveView(APIView):
 
 class RunReviewRejectView(APIView):
     """POST /api/execute/runs/<run_id>/review/reject/"""
+    permission_classes = [HasPermission("execution:review:reject")]
 
     def post(self, request: Request, run_id: str) -> Response:
         try:
@@ -1328,6 +1339,7 @@ class RunReviewRejectView(APIView):
 
 class ClaimReviewApproveView(APIView):
     """POST /api/claims/<claim_id>/review/approve/"""
+    permission_classes = [HasPermission("claims:review:approve")]
 
     def post(self, request: Request, claim_id: str) -> Response:
         run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
@@ -1361,6 +1373,7 @@ class ClaimReviewApproveView(APIView):
 
 class ClaimReviewRejectView(APIView):
     """POST /api/claims/<claim_id>/review/reject/"""
+    permission_classes = [HasPermission("claims:review:reject")]
 
     def post(self, request: Request, claim_id: str) -> Response:
         run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
@@ -1400,6 +1413,7 @@ class RunReviewStatusView(APIView):
     reviewer already holds the claim ``in_progress`` — see
     ``RunReviewReleaseView``.
     """
+    permission_classes = [HasPermission("execution:review-status:update")]
 
     def patch(self, request: Request, run_id: str) -> Response:
         try:
@@ -1430,6 +1444,7 @@ class ClaimReviewStatusView(APIView):
     Same as ``RunReviewStatusView`` but resolves the run via ``claim_id`` and
     optional ``?run_id=`` / ``?batch_id=`` query params.
     """
+    permission_classes = [HasPermission("claims:review-status:update")]
 
     def patch(self, request: Request, claim_id: str) -> Response:
         run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
@@ -1465,6 +1480,7 @@ class RunReviewReleaseView(APIView):
     ``htl_reviewer`` = them) can release it — sets it back to ``pending`` with
     no holder, so another auditor can start it.
     """
+    permission_classes = [HasPermission("execution:review:release")]
 
     def post(self, request: Request, run_id: str) -> Response:
         try:
@@ -1495,6 +1511,7 @@ class RunReviewReleaseView(APIView):
 
 class ClaimReviewReleaseView(APIView):
     """POST /api/claims/<claim_id>/review/release/"""
+    permission_classes = [HasPermission("claims:review:release")]
 
     def post(self, request: Request, claim_id: str) -> Response:
         run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
@@ -1537,6 +1554,8 @@ class RunNodesView(APIView):
 
     No new tables; this is purely a derived view.
     """
+    permission_classes = [HasPermission("execution:read")]
+
     def get(self, _request: Request, run_id: str) -> Response:
         try:
             run = (RuleExecutionRun.objects
@@ -1591,6 +1610,7 @@ def _serialize_executive_summary(row) -> dict[str, Any] | None:
 
 class ClaimSummaryView(APIView):
     """GET /api/claims/<claim_id>/summary/ — header + outer tools + summaries."""
+    permission_classes = [HasPermission("claims:read")]
 
     def get(self, request: Request, claim_id: str) -> Response:
         from .models import ClaimExecutiveSummary, ClaimTrace
@@ -1637,6 +1657,7 @@ class ClaimSummaryView(APIView):
 
 class ClaimAgentsView(APIView):
     """GET /api/claims/<claim_id>/agents/ — per-node execution + evaluations."""
+    permission_classes = [HasPermission("claims:read")]
 
     def get(self, request: Request, claim_id: str) -> Response:
         from .models import ClaimTrace
@@ -1669,6 +1690,7 @@ class ClaimAgentsView(APIView):
 
 class ClaimProcessingView(APIView):
     """GET /api/claims/<claim_id>/processing/ — legacy full snapshot (all tabs)."""
+    permission_classes = [HasPermission("claims:read")]
 
     def get(self, request: Request, claim_id: str) -> Response:
         run_uuid, batch_uuid, err = _parse_run_lookup_uuids(request)
@@ -1839,6 +1861,7 @@ class ClaimTraceView(APIView):
     claim lookup; ``?batch_id=`` scopes it; ``?download=1`` returns the JSON as
     a file attachment. ``kind`` is set per URL route ("trace" | "explainability").
     """
+    permission_classes = [HasPermission("claims:read")]
     kind = "trace"
 
     def get(self, request: Request, claim_id: str) -> Response:
@@ -1908,6 +1931,7 @@ class RunBatchAsyncView(APIView):
     Celery task. The SPA subscribes to ``stream_url`` via EventSource to
     receive per-Shape / per-rule / per-claim events as they happen.
     """
+    permission_classes = [HasPermission("execution:manage")]
     parser_classes = [MultiPartParser]
     def post(self, request: Request, workflow_id: str) -> Response:
         err, batch_id = _dispatch_batch(request=request, workflow_id=workflow_id)
@@ -1979,6 +2003,7 @@ class BatchEventsView(APIView):
     Terminates when a ``summary`` or ``error`` event arrives (the task's
     final publish) or when the client disconnects.
     """
+    permission_classes = [HasPermission("execution:read")]
     renderer_classes = [_EventStreamRenderer]
 
     def get(self, _request: Request, batch_id: str) -> StreamingHttpResponse:
