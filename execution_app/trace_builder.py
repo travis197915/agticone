@@ -23,6 +23,11 @@ from typing import Any
 MET = "Met"
 NOT_MET = "Not-Met"
 INCONCLUSIVE_RULE = "Inconclusive"
+# A rule that fired correctly to APPLY a system disposition the SOP expects (e.g.
+# "allow the system to deny for timely filing") — the agent surfaces this as an
+# ERROR badge so the auditor sees the claim is (correctly) denying, but it is NOT
+# an audit defect: it rolls up to CLEAN like a Met rule.
+ERROR = "Error"
 # A rule/step the SOP routed past (goto / out-of-scope) or that was not
 # applicable. Skipped entries are excluded from the claim rollup — they are
 # neither a pass nor a defect — and the UI greys them out.
@@ -105,6 +110,8 @@ def _normalize_rule_status(raw: str) -> str:
         return ""
     if s in ("skipped", "skip"):
         return SKIPPED_RULE
+    if s == "error":
+        return MET   # ERROR badge is a correctly-applied disposition → clean rollup
     if s in _MET_TOKENS:
         return MET
     if s in _NOT_MET_TOKENS:
@@ -136,6 +143,22 @@ def _status_for_eval(ev: dict[str, Any]) -> str:
     if matched:
         return MET
     return INCONCLUSIVE_RULE
+
+
+def _eval_is_inconclusive(ev: dict[str, Any]) -> bool:
+    """True when an evaluation carries an EXPLICIT inconclusive verdict.
+
+    A rule can be flagged as "undetermined / needs manual auditor review" by
+    writing ``verdict = "INCONCLUSIVE"`` (or ``llm_status``) on the row. The
+    engine only ever writes ``verdict = decision_type`` for a matched rule
+    (ALLOW / DENY / CONDITIONAL / …) — never ``INCONCLUSIVE`` — so this is an
+    explicit, opt-in signal that never fires for a normally-adjudicated claim.
+    Skipped rows are non-findings and never inconclusive.
+    """
+    if ev.get("skipped"):
+        return False
+    raw = ev.get("verdict") or ev.get("llm_status") or ""
+    return _normalize_rule_status(raw) == INCONCLUSIVE_RULE
 
 
 def _eval_applies_defect(ev: dict[str, Any]) -> bool:
@@ -175,6 +198,9 @@ def _step_audit_status(evs: list[dict[str, Any]]) -> str:
         return SKIPPED_RULE
     if any(_eval_applies_defect(e) for e in considered):
         return NOT_MET
+    # An explicit inconclusive verdict (manual-review) outranks a clean Met.
+    if any(_eval_is_inconclusive(e) for e in considered):
+        return INCONCLUSIVE_RULE
     evaluated = any(
         e.get("matched") or _normalize_rule_status(e.get("llm_status", ""))
         for e in considered
@@ -220,6 +246,8 @@ def node_audit_status(evals: list[dict[str, Any]]) -> str:
       1. DEFECT         — an evaluated (non-skipped) rule applied an adverse
                           disposition (DENY/STOP/REFER/PEND) or referenced an EOB
                           code → the SOP was not handled cleanly.
+      1b. INCONCLUSIVE  — an evaluated rule carries an explicit inconclusive
+                          verdict (manual-review), short of a defect.
       2. CLEAN          — at least one rule actually executed against this claim
                           (non-skipped, not a code-less out-of-scope exclusion)
                           with no adverse finding → steps ran per SOP.
@@ -238,6 +266,11 @@ def node_audit_status(evals: list[dict[str, Any]]) -> str:
         if not e.get("skipped")
         and not (e.get("is_out_of_scope") and not e.get("codes"))
     ]
+    # An explicit inconclusive verdict on an executed rule (e.g. "a claim exists
+    # in history → stop and route to manual auditor review") makes the whole SOP
+    # undetermined, short of a defect.
+    if any(_eval_is_inconclusive(e) for e in executed):
+        return INCONCLUSIVE
     if executed:
         return CLEAN
     if any(scope_category(e.get("skip_reason", "")) == OUT_OF_SCOPE for e in evals):
@@ -256,6 +289,8 @@ def rule_to_audit(status: str) -> str:
     key = (status or "").strip().upper().replace("-", "_").replace(" ", "_")
     if key in ("SKIPPED", "SKIP", "NOT_APPLICABLE", "NA", "OUT_OF_SCOPE"):
         return ""   # ignored at the claim level
+    if key == "ERROR":
+        return CLEAN   # a correctly-applied system disposition is not a defect
     s = _normalize_rule_status(status)
     if s == MET:
         return CLEAN

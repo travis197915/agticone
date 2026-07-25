@@ -154,6 +154,7 @@ def _build_node_rollup(run: RuleExecutionRun) -> tuple[list[dict[str, Any]], lis
             "confidence": ev.confidence,
             "reasoning": ev.reasoning,
             "decision_type": ev.decision_type,
+            "verdict": getattr(ev, "verdict", "") or "",
             "codes": list(ev.codes or []),
             "llm_provider": ev.llm_provider,
             "llm_ms": ev.llm_ms,
@@ -326,8 +327,13 @@ def _eval_status_label(ev: dict[str, Any]) -> str:
         if "out of scope" in reason:
             return "Out of Scope"
         return "Not Applicable"
+<<<<<<< Updated upstream
     if (ev.get("verdict") or "").upper() == "ERROR":
         return "Error"
+=======
+    if trace_builder._eval_is_inconclusive(ev):
+        return "Inconclusive"
+>>>>>>> Stashed changes
     return "Matched" if ev.get("matched") else "Not Matched"
 
 
@@ -560,6 +566,7 @@ def _build_summary_rollup(
             "reasoning",
             "matched",
             "decision_type",
+            "verdict",
             "skipped",
             "skip_reason",
             "codes",
@@ -596,6 +603,7 @@ def _build_summary_rollup(
             "skipped": bool(ev.get("skipped")),
             "skip_reason": ev.get("skip_reason") or "",
             "decision_type": ev.get("decision_type") or "",
+            "verdict": ev.get("verdict") or "",
             "codes": list(ev.get("codes") or []),
         })
         if ev.get("matched") and not ev.get("skipped"):
@@ -690,6 +698,7 @@ def _build_agents_rollup(
             "confidence": ev.confidence,
             "reasoning": ev.reasoning,
             "decision_type": ev.decision_type,
+            "verdict": getattr(ev, "verdict", "") or "",
             "codes": list(ev.codes or []),
             "llm_provider": ev.llm_provider,
             "llm_ms": ev.llm_ms,

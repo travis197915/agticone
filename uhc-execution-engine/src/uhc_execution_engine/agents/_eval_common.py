@@ -156,15 +156,49 @@ def _dominant_list(d: dict[str, Any]) -> tuple[str | None, list | None]:
     return key, (d[key] if key is not None else None)
 
 
+def _coverage_target_categories(claim_codes: set[str]) -> set[str]:
+    """Normalised benefit-category descNames for the claim's CPT/HCPCS codes.
+
+    The CBD grid is keyed by benefit *category* (descCode/descName), not by CPT,
+    so we translate each claim code to its category via the crosswalk. Soft
+    import keeps the engine runnable standalone (no hard dep on agent_tools)."""
+    try:
+        from agent_tools.tools.cbd_crosswalk import cpt_category, _norm
+    except Exception:
+        return set()
+    cats: set[str] = set()
+    for c in claim_codes:
+        cat = cpt_category(c)
+        if cat:
+            cats.add(_norm(cat))
+    return cats
+
+
 def filter_coverage_grid(rows: list[Any], claim_codes: set[str]
                          ) -> list[dict[str, Any]] | None:
     """Return only the coverage rows for the claim's procedure code(s),
-    projected to decision-relevant columns. ``None`` when no row matched."""
+    projected to decision-relevant columns. ``None`` when no row matched.
+
+    The CBD grid rows are keyed by benefit *category* (``descCode``/``descName``),
+    which never equals a CPT code. So we match rows by the benefit category each
+    claim CPT maps to (via the crosswalk), keeping a legacy ``descCode in
+    claim_codes`` match for any mock/API shape that keys rows on the CPT itself.
+    """
     if not claim_codes:
         return None
+    target_cats = _coverage_target_categories(claim_codes)
+
+    def _keep(r: dict[str, Any]) -> bool:
+        if str(r.get(_COVERAGE_ROW_KEY)) in claim_codes:
+            return True  # legacy: row keyed on the CPT
+        if target_cats:
+            from agent_tools.tools.cbd_crosswalk import _norm
+            return _norm(r.get("descName")) in target_cats
+        return False
+
     kept = [
         _project_coverage_row(r) for r in rows
-        if isinstance(r, dict) and str(r.get(_COVERAGE_ROW_KEY)) in claim_codes
+        if isinstance(r, dict) and _keep(r)
     ]
     return kept or None
 
@@ -374,6 +408,35 @@ DECIDE `matched` like this:
 """
 
 
+_RECVDATE_SIGNALS = (
+    "julian", "fln/dcc", "fln dcc", "receive date (julian", "received date (julian",
+)
+
+_RECVDATE_GUIDANCE = """\
+DOMAIN GUIDANCE — RECEIVED DATE (JULIAN) FROM DOC360 (apply before deciding `matched`)
+-------------------------------------------------------------------------------------
+The Doc360 claim-image "Received Date (Julian Date)" is encoded in the image's
+FLN/DCC value (a.k.a. `micro_image_id` / `lookupId`; also printed as the
+`1 FLN/DCC <digits>` header on the image). Derive it DETERMINISTICALLY:
+
+  1. Take the FLN/DCC value and strip non-digits (e.g. 2532460184204).
+  2. The receive date is the **leading 5 digits = YYDDD** (Julian):
+       YY  = 2-digit year   -> calendar year 2000 + YY
+       DDD = day-of-year    -> Jan 1 of that year + (DDD − 1) days
+     Example: 2532460184204 -> 25324 -> year 2025, day 324 -> 11/20/2025.
+     (The remaining trailing digits are batch/queue/sequence — NOT a date.)
+  3. Compare that decoded date to the FACETS received date `CLCL_RECD_DT`.
+
+DO NOT use the image header "DATE mm/dd/yy" or the "KEYER DT" — those are the
+keying/processing dates, not the received date, and are frequently 1–2 days off.
+Do NOT read only the first 3 digits as the day; the day is digits 3–5 of the
+leading-5 (after the 2-digit year). If the FLN/DCC value is genuinely absent from
+the tool results, set status="Inconclusive" (do not fall back to the keyer date).
+Only a real difference between the leading-5 Julian date and `CLCL_RECD_DT` is a
+discrepancy; this is a verification check and is not by itself a claim defect.
+"""
+
+
 _MATCHING_CONTRACT = """\
 MATCHING CONTRACT (read this BEFORE deciding `matched`)
 -------------------------------------------------------
@@ -465,6 +528,10 @@ def _domain_context(rule: dict[str, Any]) -> str:
     # single, distinctively-worded rule so one hit is enough).
     if any(s in blob for s in _SUBSCRIBER_SIGNALS):
         parts.append(_SUBSCRIBER_GUIDANCE)
+    # Received-Date (Julian) verification: the rule reads the received date from
+    # the Doc360 image FLN/DCC. "julian" is a distinctive single-hit signal.
+    if any(s in blob for s in _RECVDATE_SIGNALS):
+        parts.append(_RECVDATE_GUIDANCE)
     return ("\n" + "\n".join(parts)) if parts else ""
 
 

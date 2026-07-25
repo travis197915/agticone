@@ -82,17 +82,38 @@ def _check_coverage(**kwargs: Any) -> dict[str, Any]:
             "not_found_codes": cpt_codes,
             "errors": [resp.get("error") or f"HTTP {status}"],
         }
+
+    # The CBD API returns a benefit-category grid (rows keyed by ``descCode`` /
+    # ``descName`` with a per-plan ``covered`` flag), NOT per-CPT coverage. Map
+    # each CPT to its benefit category via the crosswalk and read the category's
+    # ``covered`` flag. Fall back to any pre-resolved ``coverage_details`` the API
+    # might already supply (mock / newer API shape).
     details = resp.get("coverage_details") or []
-    found_codes = {d.get("cpt_code") for d in details if d.get("cpt_code")}
-    not_found = [c for c in cpt_codes if c not in found_codes]
+    if details:
+        found_codes = {d.get("cpt_code") for d in details if d.get("cpt_code")}
+        not_found = [c for c in cpt_codes if c not in found_codes]
+        return {
+            "success": True,
+            "group_name": group_name,
+            "plan_name": plan_name,
+            "total_codes_queried": len(cpt_codes),
+            "codes_found": len(details),
+            "coverage_details": details,
+            "not_found_codes": not_found,
+            "errors": [],
+        }
+
+    from .cbd_crosswalk import resolve_coverage
+
+    resolved = resolve_coverage(resp, cpt_codes)
     return {
         "success": True,
         "group_name": group_name,
         "plan_name": plan_name,
         "total_codes_queried": len(cpt_codes),
-        "codes_found": len(details),
-        "coverage_details": details,
-        "not_found_codes": not_found,
+        "codes_found": resolved["codes_found"],
+        "coverage_details": resolved["coverage_details"],
+        "not_found_codes": resolved["not_found_codes"],
         "errors": [],
     }
 
