@@ -253,6 +253,83 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertIsNotNone(run.reviewed_at)
         self.assertEqual(run.htl_reviewer, "test-user")
 
+    def test_runs_list_filters_by_review_status(self):
+        pending_blank = self._create_run(claim_id="LIST-PENDING-BLANK")
+        pending_explicit = self._create_run(claim_id="LIST-PENDING-EXPLICIT")
+        in_progress = self._create_run(claim_id="LIST-IN-PROGRESS")
+        approved = self._create_run(claim_id="LIST-APPROVED")
+        rejected = self._create_run(claim_id="LIST-REJECTED")
+
+        pending_explicit.review_status = "pending"
+        pending_explicit.save(update_fields=["review_status"])
+        in_progress.review_status = "in_progress"
+        in_progress.save(update_fields=["review_status"])
+        approved.review_status = "approved"
+        approved.save(update_fields=["review_status"])
+        rejected.review_status = "rejected"
+        rejected.save(update_fields=["review_status"])
+
+        pending_resp = self.client.get("/api/execute/runs/?review_status=pending")
+        self.assertEqual(pending_resp.status_code, 200)
+        pending_ids = {row["claimId"] for row in pending_resp.json()["results"]}
+        self.assertIn("LIST-PENDING-BLANK", pending_ids)
+        self.assertIn("LIST-PENDING-EXPLICIT", pending_ids)
+        self.assertNotIn("LIST-IN-PROGRESS", pending_ids)
+
+        in_progress_resp = self.client.get("/api/execute/runs/?review_status=in_progress")
+        self.assertEqual(in_progress_resp.status_code, 200)
+        in_progress_ids = {row["claimId"] for row in in_progress_resp.json()["results"]}
+        self.assertEqual(in_progress_ids, {"LIST-IN-PROGRESS"})
+
+        completed_resp = self.client.get("/api/execute/runs/?review_status=completed")
+        self.assertEqual(completed_resp.status_code, 200)
+        completed_ids = {row["claimId"] for row in completed_resp.json()["results"]}
+        self.assertEqual(completed_ids, {"LIST-APPROVED", "LIST-REJECTED"})
+
+    def test_runs_list_filters_by_second_reviewer(self):
+        mine = self._create_run(claim_id="LIST-REVIEWER-MINE")
+        other = self._create_run(claim_id="LIST-REVIEWER-OTHER")
+        unassigned = self._create_run(claim_id="LIST-REVIEWER-UNASSIGNED")
+
+        mine.htl_reviewer = "reviewer-a"
+        mine.save(update_fields=["htl_reviewer"])
+        other.htl_reviewer = "reviewer-b"
+        other.save(update_fields=["htl_reviewer"])
+        unassigned.htl_reviewer = ""
+        unassigned.save(update_fields=["htl_reviewer"])
+
+        resp = self.client.get("/api/execute/runs/?second_reviewer=reviewer-a")
+        self.assertEqual(resp.status_code, 200)
+        claim_ids = {row["claimId"] for row in resp.json()["results"]}
+        self.assertEqual(claim_ids, {"LIST-REVIEWER-MINE"})
+
+        camel_resp = self.client.get("/api/execute/runs/?secondReviewer=reviewer-b")
+        self.assertEqual(camel_resp.status_code, 200)
+        camel_claim_ids = {row["claimId"] for row in camel_resp.json()["results"]}
+        self.assertEqual(camel_claim_ids, {"LIST-REVIEWER-OTHER"})
+
+    def test_runs_list_includes_approved_review_count(self):
+        approved_a = self._create_run(claim_id="LIST-ACC-APPROVED-A")
+        approved_b = self._create_run(claim_id="LIST-ACC-APPROVED-B")
+        rejected = self._create_run(claim_id="LIST-ACC-REJECTED")
+        pending = self._create_run(claim_id="LIST-ACC-PENDING")
+
+        approved_a.review_status = "approved"
+        approved_a.save(update_fields=["review_status"])
+        approved_b.review_status = "approved"
+        approved_b.save(update_fields=["review_status"])
+        rejected.review_status = "rejected"
+        rejected.save(update_fields=["review_status"])
+        pending.review_status = "pending"
+        pending.save(update_fields=["review_status"])
+
+        resp = self.client.get("/api/execute/runs/")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["count"], 4)
+        self.assertEqual(body["approved_review_count"], 2)
+        self.assertEqual(body["rejected_review_count"], 1)
+
 
 class PersistFailureRegressionTests(TestCase):
     """If RuleEvaluation.bulk_create raises, the parent RuleExecutionRun

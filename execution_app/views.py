@@ -24,6 +24,8 @@ from time import monotonic as _monotonic
 from typing import Any, Iterator
 
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
+from django.db import DatabaseError, router
 from django.db.models import Avg, DurationField, ExpressionWrapper, F, Q
 from django.http import StreamingHttpResponse
 from django.utils import timezone as dj_timezone
@@ -35,7 +37,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from . import trace_builder
-from .models import BatchExecutionRun, RuleExecutionRun
+from .models import BatchExecutionRun, CorebackendUser, RuleExecutionRun
 from .reviewer_lookup import resolve_reviewer_names
 from .serializers import (BatchExecutionRunSerializer,
                           RuleExecutionRunSerializer, _excel_claim_fields,
@@ -976,8 +978,30 @@ def _parse_yyyy_mm_dd(value: str) -> datetime | None:
         return None
 
 
+def _normalize_review_status_query(value: str) -> str:
+    return (value or "").strip().lower().replace("-", "_")
+
+
+def _reviewer_ids_matching_name(term: str) -> set[str]:
+    lookup = (term or "").strip()
+    if not lookup:
+        return set()
+    alias = router.db_for_read(CorebackendUser) or "default"
+    try:
+        return set(
+            CorebackendUser.objects.using(alias)
+            .filter(name__icontains=lookup)
+            .values_list("id", flat=True)[:200]
+        )
+    except (DatabaseError, ImproperlyConfigured):
+        # Reviewer name lookups are best-effort. Falling back to plain userID
+        # matching keeps list filtering available even when corebackend is down.
+        logger.warning("second reviewer lookup failed for term=%r", lookup, exc_info=True)
+        return set()
+
+
 def _filter_run_list_queryset(request: Request, qs):
-    """Apply list-view filters from query params (claim id, status, date range)."""
+    """Apply list-view filters from query params (claim id, status, reviewer, date range)."""
     claim_id = (request.query_params.get("claim_id") or "").strip()
     if claim_id:
         qs = qs.filter(claim_id__icontains=claim_id)
@@ -998,6 +1022,26 @@ def _filter_run_list_queryset(request: Request, qs):
         )
     elif claim_status == IN_PROGRESS:
         qs = qs.filter(status="RUNNING")
+
+    review_status_raw = request.query_params.get("review_status", request.query_params.get("reviewStatus", ""))
+    review_status = _normalize_review_status_query(review_status_raw)
+    if review_status == "pending":
+        # Empty DB values represent not-started review and should show under Pending.
+        qs = qs.filter(Q(review_status="pending") | Q(review_status=""))
+    elif review_status == "in_progress":
+        qs = qs.filter(review_status="in_progress")
+    elif review_status == "completed":
+        qs = qs.filter(review_status__in=["completed", "approved", "rejected"])
+    elif review_status in {"approved", "rejected"}:
+        qs = qs.filter(review_status=review_status)
+
+    second_reviewer = (request.query_params.get("second_reviewer", request.query_params.get("secondReviewer", "")) or "").strip()
+    if second_reviewer:
+        reviewer_filter = Q(htl_reviewer__icontains=second_reviewer)
+        reviewer_ids = _reviewer_ids_matching_name(second_reviewer)
+        if reviewer_ids:
+            reviewer_filter |= Q(htl_reviewer__in=reviewer_ids)
+        qs = qs.filter(reviewer_filter)
 
     from_date = _parse_yyyy_mm_dd(request.query_params.get("from_date", ""))
     if from_date is not None:
@@ -1064,6 +1108,8 @@ class RunListView(APIView):
             "count": total,
             "limit": limit,
             "offset": offset,
+            "approved_review_count": qs.filter(review_status="approved").count(),
+            "rejected_review_count": qs.filter(review_status="rejected").count(),
             "avg_processing_time_min": _avg_processing_time_min(qs),
             "results": [
                 serialize_run_summary(r, reviewer_names=reviewer_names)
