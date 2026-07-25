@@ -327,13 +327,10 @@ def _eval_status_label(ev: dict[str, Any]) -> str:
         if "out of scope" in reason:
             return "Out of Scope"
         return "Not Applicable"
-<<<<<<< Updated upstream
     if (ev.get("verdict") or "").upper() == "ERROR":
         return "Error"
-=======
     if trace_builder._eval_is_inconclusive(ev):
         return "Inconclusive"
->>>>>>> Stashed changes
     return "Matched" if ev.get("matched") else "Not Matched"
 
 
