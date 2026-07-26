@@ -136,3 +136,14 @@ MEDICARE_COVERAGE_TOOL_LOB_FIX.md
 claim_run_logs/*
 
 DUPLICATE_CDD_ISSUE_REPORT.md
+
+# ── Patents, UAT PDFs, and local data dumps ──────────────────────────────
+patents/
+PATENT_DISCLOSURES.md
+Coverage_Item54_H0032SA_NotCovered_B05_Confirmed.pdf
+Timely_Filing_Item52_Within_but_TF_Denied_Defect.pdf
+Timely_Filing_Item55_Late_TF_Denial_Correct_Revert.pdf
+Timely_Filing_Items_52_55_UAT_Fix.pdf
+datadump-udpated-22nd-july.zip
+datadump-udpated-22nd-july/
+scripts.zip

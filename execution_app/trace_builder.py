@@ -13,6 +13,7 @@ through ``n_execute_shapes``) and projects them into two denormalized arrays:
 Nothing here mutates engine state or existing rows; the output is stored in the
 ``ClaimTrace`` table and served by the new read endpoints.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -56,8 +57,10 @@ _HALT_DECISION_TYPES = _DEFECT_DECISIONS
 # silent pass. Every other tool that a step relied on, when it fails, leaves the
 # auditor unable to conclude → INCONCLUSIVE (never auto-CLEAN).
 _COVERAGE_TOOLS = {
-    "cbd_coverage", "check_medicare_coverage",
-    "check_coverage_commercial", "check_coverage_medicaid",
+    "cbd_coverage",
+    "check_medicare_coverage",
+    "check_coverage_commercial",
+    "check_coverage_medicaid",
 }
 
 
@@ -76,10 +79,21 @@ def tool_failure_status(failed_tool_names) -> str:
         return NOT_MET
     return INCONCLUSIVE_RULE
 
+
 _MET_TOKENS = {"met", "match", "matched", "pass", "passed", "clean", "allow", "ok"}
 _NOT_MET_TOKENS = {
-    "not-met", "notmet", "fail", "failed", "deny", "denied", "defect",
-    "stop", "refer", "referral", "pend", "pended",
+    "not-met",
+    "notmet",
+    "fail",
+    "failed",
+    "deny",
+    "denied",
+    "defect",
+    "stop",
+    "refer",
+    "referral",
+    "pend",
+    "pended",
 }
 _INCONCLUSIVE_TOKENS = {"inconclusive", "unknown", "indeterminate", "n/a", "na"}
 
@@ -114,6 +128,28 @@ def _normalize_rule_status(raw: str) -> str:
     return ""
 
 
+_INCONCLUSIVE_VERDICT_TOKENS = {"inconclusive", "indeterminate", "unknown"}
+
+
+def _eval_is_inconclusive(ev: dict[str, Any]) -> bool:
+    """True when an evaluation is *explicitly* attested INCONCLUSIVE.
+
+    A matched rule can carry an INCONCLUSIVE ``verdict`` (e.g. a Timely-Filing
+    Step-10 match-in-history that a human must review, or a duplicate/E51 line
+    with no history) without applying any adverse disposition. Such a rule is
+    neither a clean pass nor a defect, so it must surface as INCONCLUSIVE at the
+    step/agent level rather than silently rolling up to CLEAN. Skipped rows are
+    never inconclusive — they are non-findings routed past.
+    """
+    if ev.get("skipped"):
+        return False
+    for key in ("verdict", "llm_status"):
+        v = (ev.get(key) or "").strip().lower().replace("_", "-").replace(" ", "-")
+        if v in _INCONCLUSIVE_VERDICT_TOKENS:
+            return True
+    return False
+
+
 def _status_for_eval(ev: dict[str, Any]) -> str:
     """Rule-level verdict for one evaluation (Met / Not-Met / Inconclusive / Skipped)."""
     if ev.get("skipped"):
@@ -129,6 +165,10 @@ def _status_for_eval(ev: dict[str, Any]) -> str:
     explicit = _normalize_rule_status(ev.get("llm_status", ""))
     if explicit:
         return explicit
+    # An explicit INCONCLUSIVE verdict outranks the matched→Met default: a rule
+    # attested inconclusive must never read as a clean pass.
+    if _eval_is_inconclusive(ev):
+        return INCONCLUSIVE_RULE
     matched = bool(ev.get("matched"))
     decision_type = (ev.get("decision_type") or "").upper()
     if matched and decision_type in _HALT_DECISION_TYPES:
@@ -167,7 +207,8 @@ def _step_audit_status(evs: list[dict[str, Any]]) -> str:
     does not apply"). Steps with nothing to evaluate roll up to Skipped.
     """
     considered = [
-        e for e in evs
+        e
+        for e in evs
         if not e.get("skipped")
         and not (e.get("is_out_of_scope") and not e.get("codes"))
     ]
@@ -175,6 +216,11 @@ def _step_audit_status(evs: list[dict[str, Any]]) -> str:
         return SKIPPED_RULE
     if any(_eval_applies_defect(e) for e in considered):
         return NOT_MET
+    # A rule explicitly attested INCONCLUSIVE (e.g. Step-10 match-in-history that
+    # must be manually reviewed) makes the whole step inconclusive — it is not a
+    # clean pass even though it matched without an adverse disposition.
+    if any(_eval_is_inconclusive(e) for e in considered):
+        return INCONCLUSIVE_RULE
     evaluated = any(
         e.get("matched") or _normalize_rule_status(e.get("llm_status", ""))
         for e in considered
@@ -214,12 +260,15 @@ def scope_category(skip_reason: str) -> str:
 
 
 def node_audit_status(evals: list[dict[str, Any]]) -> str:
-    """SOP/agent-level status: DEFECT | CLEAN | OUT_OF_SCOPE | NOT_APPLICABLE.
+    """SOP/agent-level status: DEFECT | INCONCLUSIVE | CLEAN | OUT_OF_SCOPE | NOT_APPLICABLE.
 
     Precedence, from the persisted rule rows (no re-run needed):
       1. DEFECT         — an evaluated (non-skipped) rule applied an adverse
                           disposition (DENY/STOP/REFER/PEND) or referenced an EOB
                           code → the SOP was not handled cleanly.
+      1.5 INCONCLUSIVE  — an evaluated rule is explicitly attested INCONCLUSIVE
+                          (verdict/llm_status) → must be manually reviewed; it is
+                          neither a clean pass nor a defect.
       2. CLEAN          — at least one rule actually executed against this claim
                           (non-skipped, not a code-less out-of-scope exclusion)
                           with no adverse finding → steps ran per SOP.
@@ -233,8 +282,14 @@ def node_audit_status(evals: list[dict[str, Any]]) -> str:
         return NOT_APPLICABLE
     if any(_eval_applies_defect(e) for e in evals):
         return DEFECT
+    # An evaluated (non-skipped) rule attested INCONCLUSIVE (verdict/llm_status)
+    # routes the whole node to INCONCLUSIVE — a match-in-history / no-history
+    # duplicate that must be manually reviewed is neither CLEAN nor a DEFECT.
+    if any(_eval_is_inconclusive(e) for e in evals):
+        return INCONCLUSIVE
     executed = [
-        e for e in evals
+        e
+        for e in evals
         if not e.get("skipped")
         and not (e.get("is_out_of_scope") and not e.get("codes"))
     ]
@@ -255,14 +310,14 @@ def rule_to_audit(status: str) -> str:
     """
     key = (status or "").strip().upper().replace("-", "_").replace(" ", "_")
     if key in ("SKIPPED", "SKIP", "NOT_APPLICABLE", "NA", "OUT_OF_SCOPE"):
-        return ""   # ignored at the claim level
+        return ""  # ignored at the claim level
     s = _normalize_rule_status(status)
     if s == MET:
         return CLEAN
     if s == NOT_MET:
         return DEFECT
     if s == SKIPPED_RULE:
-        return ""   # ignored at the claim level
+        return ""  # ignored at the claim level
     return INCONCLUSIVE
 
 
@@ -310,9 +365,7 @@ def claim_status(trace_list: list[dict[str, Any]]) -> str:
     The per-step ``status`` is rule-level (Met/Not-Met/Inconclusive); this rolls
     those up to the claim-level audit value (CLEAN/DEFECT/INCONCLUSIVE).
     """
-    return aggregate_status(
-        [str(t.get("status") or "") for t in (trace_list or [])]
-    )
+    return aggregate_status([str(t.get("status") or "") for t in (trace_list or [])])
 
 
 # Plain-language verbs per sub-rule verdict. Auditors asked that the agent
@@ -339,9 +392,7 @@ def subrule_label(ev_or_condition: Any) -> str:
     if isinstance(ev_or_condition, dict):
         cond = str(ev_or_condition.get("condition") or "")
         fallback = str(
-            ev_or_condition.get("subrule_id")
-            or ev_or_condition.get("rule_key")
-            or ""
+            ev_or_condition.get("subrule_id") or ev_or_condition.get("rule_key") or ""
         )
     else:
         cond = str(ev_or_condition or "")
@@ -352,7 +403,7 @@ def subrule_label(ev_or_condition: Any) -> str:
         if idx > 0:
             return cond[:idx].strip(" .:-")
     if cond:
-        return (cond[:60].strip(" .:-") + ("…" if len(cond) > 60 else ""))
+        return cond[:60].strip(" .:-") + ("…" if len(cond) > 60 else "")
     return fallback
 
 
@@ -373,7 +424,10 @@ def _last_condition_note(conditions: list[dict[str, Any]]) -> str:
 
 
 def subrule_statement(
-    label: str, status: str, conditions: list[dict[str, Any]], reasoning: str = "",
+    label: str,
+    status: str,
+    conditions: list[dict[str, Any]],
+    reasoning: str = "",
 ) -> str:
     """One-line, plain-language statement of the sub-rule's outcome per SOP."""
     verb = _STATEMENT_VERB.get(status, "Reviewed")
@@ -388,12 +442,14 @@ def subrule_statement(
 def _subrule_entry(ev: dict[str, Any]) -> dict[str, Any]:
     conditions = ev.get("conditions")
     if not isinstance(conditions, list) or not conditions:
-        conditions = [{
-            "condition": ev.get("condition", ""),
-            "evaluated": bool(ev.get("matched")),
-            "using_fields": [],
-            "values": {},
-        }]
+        conditions = [
+            {
+                "condition": ev.get("condition", ""),
+                "evaluated": bool(ev.get("matched")),
+                "using_fields": [],
+                "values": {},
+            }
+        ]
     status = _status_for_eval(ev)
     label = subrule_label(ev)
     return {
@@ -401,7 +457,10 @@ def _subrule_entry(ev: dict[str, Any]) -> dict[str, Any]:
         "label": label,
         "status": status,
         "statement": subrule_statement(
-            label, status, conditions, str(ev.get("reasoning") or ""),
+            label,
+            status,
+            conditions,
+            str(ev.get("reasoning") or ""),
         ),
         "conditions": conditions,
     }
@@ -469,7 +528,7 @@ def build_trace(
         # Evidence refs: merge any LLM-supplied refs across the group.
         evidence_refs: list[str] = []
         for e in evs:
-            for ref in (e.get("evidence_refs") or []):
+            for ref in e.get("evidence_refs") or []:
                 if ref not in evidence_refs:
                     evidence_refs.append(ref)
 
@@ -479,7 +538,7 @@ def build_trace(
         failed: list[str] = []
         skipped_tools: list[str] = []
         for e in evs:
-            for bid in (e.get("tool_results_used") or []):
+            for bid in e.get("tool_results_used") or []:
                 rec = tool_by_binding.get(str(bid))
                 if not rec:
                     continue
@@ -512,39 +571,50 @@ def build_trace(
 
         llm_ms = sum(int(e.get("llm_ms") or 0) for e in evs)
         rationale = "; ".join(
-            (e.get("reasoning") or "").strip() for e in evs if (e.get("reasoning") or "").strip()
+            (e.get("reasoning") or "").strip()
+            for e in evs
+            if (e.get("reasoning") or "").strip()
         )
 
-        trace.append({
-            "timestamp": ts,
-            "claim_id": claim_id,
-            "execution_id": execution_id,
-            "agent_name": head.get("shape_label") or shape_id,
-            "shape_id": shape_id,
-            "sop_name": head.get("sop_title", ""),
-            "sop_step_number": head.get("section_id"),
-            "sop_step_name": head.get("yaml_rule_id") or head.get("section_label", ""),
-            "sop_rule_id": head.get("yaml_rule_id", ""),
-            "sop_step_description": head.get("step_question") or head.get("section_label", ""),
-            "sop_action": parent.get("action", ""),
-            "step_exec_status": "success",
-            "status": step_status,
-            "rationale": rationale,
-            "evidence_refs": evidence_refs,
-            "started_at": started_at,
-            "ended_at": ended_at,
-            "transaction_time_sec": round(llm_ms / 1000.0, 3),
-            "tools_used": used,
-            "tools_succeeded": succeeded,
-            "tools_failed": failed,
-            "tools_skipped": skipped_tools,
-            "decision_type": parent.get("decision_type", ""),
-            "codes": list(parent.get("codes") or []),
-            "subrule_results": sub_results,
-        })
+        trace.append(
+            {
+                "timestamp": ts,
+                "claim_id": claim_id,
+                "execution_id": execution_id,
+                "agent_name": head.get("shape_label") or shape_id,
+                "shape_id": shape_id,
+                "sop_name": head.get("sop_title", ""),
+                "sop_step_number": head.get("section_id"),
+                "sop_step_name": head.get("yaml_rule_id")
+                or head.get("section_label", ""),
+                "sop_rule_id": head.get("yaml_rule_id", ""),
+                "sop_step_description": head.get("step_question")
+                or head.get("section_label", ""),
+                "sop_action": parent.get("action", ""),
+                "step_exec_status": "success",
+                "status": step_status,
+                "rationale": rationale,
+                "evidence_refs": evidence_refs,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "transaction_time_sec": round(llm_ms / 1000.0, 3),
+                "tools_used": used,
+                "tools_succeeded": succeeded,
+                "tools_failed": failed,
+                "tools_skipped": skipped_tools,
+                "decision_type": parent.get("decision_type", ""),
+                "codes": list(parent.get("codes") or []),
+                "subrule_results": sub_results,
+            }
+        )
 
     explainability = _build_explainability(
-        trace, execution_id, claim_id, started_at, ended_at, run,
+        trace,
+        execution_id,
+        claim_id,
+        started_at,
+        ended_at,
+        run,
     )
     return trace, explainability
 
@@ -561,15 +631,18 @@ def _build_explainability(
     agents: dict[tuple[str, str], dict[str, Any]] = {}
     for entry in trace:
         key = (entry["agent_name"], entry["sop_name"])
-        bucket = agents.setdefault(key, {
-            "claim_id": claim_id,
-            "execution_id": execution_id,
-            "agent_name": entry["agent_name"],
-            "sop_name": entry["sop_name"],
-            "started_at": started_at,
-            "ended_at": ended_at,
-            "_steps": [],
-        })
+        bucket = agents.setdefault(
+            key,
+            {
+                "claim_id": claim_id,
+                "execution_id": execution_id,
+                "agent_name": entry["agent_name"],
+                "sop_name": entry["sop_name"],
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "_steps": [],
+            },
+        )
         bucket["_steps"].append(entry)
 
     out: list[dict[str, Any]] = []
@@ -588,39 +661,41 @@ def _build_explainability(
                 f" ({first_failing.get('sop_step_description', '')})"
             )
         total_sec = sum(float(s.get("transaction_time_sec") or 0.0) for s in steps)
-        out.append({
-            **bucket,
-            "sop_step_summary": [
-                f"SOP executed for agent '{bucket['agent_name']}' with outcome {final_status}."
-            ],
-            "sop_action_summary": ["Actions were executed per SOP steps."],
-            "rationale_summary": rationale_summary,
-            "duration": round(total_sec, 1),
-            "final_status": final_status,
-            "step_results": {
-                "steps": [
-                    {
-                        "sop_step_number": s.get("sop_step_number"),
-                        "sop_step_name": s.get("sop_step_name"),
-                        "sop_rule_id": s.get("sop_rule_id"),
-                        "status": s.get("status"),
-                        "step_exec_status": s.get("step_exec_status"),
-                        "subrule_results": s.get("subrule_results", []),
-                        "evidence_refs": s.get("evidence_refs", []),
-                        "timestamp": s.get("timestamp"),
-                        "result_summary": _result_summary(s),
-                        "sop_step_description": s.get("sop_step_description"),
-                        "sop_action": s.get("sop_action"),
-                        "rationale": s.get("rationale"),
-                        "started_at": s.get("started_at"),
-                        "ended_at": s.get("ended_at"),
-                        "transaction_time_sec": s.get("transaction_time_sec"),
-                    }
-                    for s in steps
+        out.append(
+            {
+                **bucket,
+                "sop_step_summary": [
+                    f"SOP executed for agent '{bucket['agent_name']}' with outcome {final_status}."
                 ],
-            },
-            "router_errors": [],
-        })
+                "sop_action_summary": ["Actions were executed per SOP steps."],
+                "rationale_summary": rationale_summary,
+                "duration": round(total_sec, 1),
+                "final_status": final_status,
+                "step_results": {
+                    "steps": [
+                        {
+                            "sop_step_number": s.get("sop_step_number"),
+                            "sop_step_name": s.get("sop_step_name"),
+                            "sop_rule_id": s.get("sop_rule_id"),
+                            "status": s.get("status"),
+                            "step_exec_status": s.get("step_exec_status"),
+                            "subrule_results": s.get("subrule_results", []),
+                            "evidence_refs": s.get("evidence_refs", []),
+                            "timestamp": s.get("timestamp"),
+                            "result_summary": _result_summary(s),
+                            "sop_step_description": s.get("sop_step_description"),
+                            "sop_action": s.get("sop_action"),
+                            "rationale": s.get("rationale"),
+                            "started_at": s.get("started_at"),
+                            "ended_at": s.get("ended_at"),
+                            "transaction_time_sec": s.get("transaction_time_sec"),
+                        }
+                        for s in steps
+                    ],
+                },
+                "router_errors": [],
+            }
+        )
     return out
 
 
