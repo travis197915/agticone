@@ -128,26 +128,27 @@ def _normalize_rule_status(raw: str) -> str:
     return ""
 
 
-_INCONCLUSIVE_VERDICT_TOKENS = {"inconclusive", "indeterminate", "unknown"}
+_INCONCLUSIVE_VERDICT_TOKENS = {"inconclusive"}
 
 
 def _eval_is_inconclusive(ev: dict[str, Any]) -> bool:
-    """True when an evaluation is *explicitly* attested INCONCLUSIVE.
+    """True ONLY for a non-skipped rule carrying the deterministic ``verdict``
+    ``INCONCLUSIVE`` (set by the auditor fix scripts, e.g. a Timely-Filing
+    Step-10 genuine match-in-history, or a duplicate/E51 line with no history).
 
-    A matched rule can carry an INCONCLUSIVE ``verdict`` (e.g. a Timely-Filing
-    Step-10 match-in-history that a human must review, or a duplicate/E51 line
-    with no history) without applying any adverse disposition. Such a rule is
-    neither a clean pass nor a defect, so it must surface as INCONCLUSIVE at the
-    step/agent level rather than silently rolling up to CLEAN. Skipped rows are
-    never inconclusive — they are non-findings routed past.
+    Such a rule needs manual auditor review, so it must surface as INCONCLUSIVE
+    at the step/agent level rather than silently rolling up to CLEAN.
+
+    Deliberately strict: it looks ONLY at the persisted ``verdict`` field and
+    ONLY for the exact token ``inconclusive``. It intentionally IGNORES
+    ``llm_status`` and softer tokens (``unknown``/``indeterminate``) — those are
+    noisy per-rule LLM sub-statuses present on ordinary clean rules, and using
+    them would wrongly promote entire clean steps/claims to INCONCLUSIVE.
     """
     if ev.get("skipped"):
         return False
-    for key in ("verdict", "llm_status"):
-        v = (ev.get(key) or "").strip().lower().replace("_", "-").replace(" ", "-")
-        if v in _INCONCLUSIVE_VERDICT_TOKENS:
-            return True
-    return False
+    v = (ev.get("verdict") or "").strip().lower().replace("_", "-").replace(" ", "-")
+    return v in _INCONCLUSIVE_VERDICT_TOKENS
 
 
 def _status_for_eval(ev: dict[str, Any]) -> str:

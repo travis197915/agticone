@@ -328,6 +328,10 @@ def _eval_status_label(ev: dict[str, Any]) -> str:
         return "Not Applicable"
     if (ev.get("verdict") or "").upper() == "ERROR":
         return "Error"
+    # A rule the auditor fix scripts attested INCONCLUSIVE (needs manual review)
+    # surfaces as a distinct Inconclusive chip, not a plain Matched/Not-Matched.
+    if (ev.get("verdict") or "").upper() == "INCONCLUSIVE":
+        return "Inconclusive"
     return "Matched" if ev.get("matched") else "Not Matched"
 
 
