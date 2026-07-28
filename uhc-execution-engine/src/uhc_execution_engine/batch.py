@@ -215,6 +215,8 @@ class BatchRunner:
         for row in claim_rows:
             cid = str(row["claim_id"])
             excel_payload = _excel_fields(row)
+            original_auditor = str(row.get("original_auditor") or "")
+            auditor_status = str(row.get("auditor_status") or "")
             if cid in seen_in_batch:
                 res = record_skipped_claim(
                     batch_id=batch_id,
@@ -223,6 +225,8 @@ class BatchRunner:
                     excel_payload=excel_payload,
                     prior=seen_in_batch[cid],
                     skip_reason=SKIP_REASON_BATCH_DUPLICATE,
+                    original_auditor=original_auditor,
+                    auditor_status=auditor_status,
                 )
             else:
                 prior_clean = find_prior_clean_run(
@@ -238,6 +242,8 @@ class BatchRunner:
                         excel_payload=excel_payload,
                         prior=prior_clean,
                         skip_reason=SKIP_REASON_PRIOR_CLEAN,
+                        original_auditor=original_auditor,
+                        auditor_status=auditor_status,
                     )
                 else:
                     res = self._run_one(
@@ -353,6 +359,7 @@ class BatchRunner:
 
         excel_payload = _excel_fields(excel_row)
         original_auditor = str((excel_row or {}).get("original_auditor") or "")
+        auditor_status = str((excel_row or {}).get("auditor_status") or "")
 
         if should_run_mcp_health_check(fetch_tool=fetch_tool):
             logger.info(
@@ -382,6 +389,7 @@ class BatchRunner:
                     status="FAILED",
                     error_message=error_message,
                     original_auditor=original_auditor,
+                    auditor_status=auditor_status,
                 )
                 return {
                     "run_id": run_id,
@@ -405,6 +413,7 @@ class BatchRunner:
                 status="FETCH_FAILED",
                 error_message=f"{fetch_out['tool']}: {fetch_out['error']}",
                 original_auditor=original_auditor,
+                auditor_status=auditor_status,
             )
             ToolInvocationRecord.objects.create(
                 run=run, tool_name=fetch_out["tool"], phase="FETCH",
@@ -461,6 +470,7 @@ class BatchRunner:
             run_id=run_id,
             skip_mcp_health_check=True,
             original_auditor=original_auditor,
+            auditor_status=auditor_status,
         )
 
         # Splice outer invocations onto the response + persist them too.

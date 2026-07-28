@@ -172,7 +172,8 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(body["reviewStatus"], "in_progress")
         self.assertEqual(body["htlReviewer"], "test-user")
         run.refresh_from_db()
-        self.assertEqual(run.auditor_status, "IN_PROGRESS")
+        self.assertEqual(run.review_status, "in_progress")
+        self.assertEqual(run.auditor_status, "")  # ERA Audit_Sts; unchanged by review
         self.assertIsNotNone(run.review_started_at)
         self.assertEqual(run.htl_reviewer, "test-user")
         self.assertEqual(run.original_auditor, "")
@@ -204,12 +205,12 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["reviewStatus"], "approved")
-        self.assertEqual(body["auditorStatus"], "APPROVED")
+        self.assertIsNone(body["auditorStatus"])  # no ERA Audit_Sts on this run
         self.assertEqual(body["feedback"], "Looks good")
         self.assertEqual(body["htlReviewer"], "test-user")
         run.refresh_from_db()
         self.assertEqual(run.review_status, "approved")
-        self.assertEqual(run.auditor_status, "APPROVED")
+        self.assertEqual(run.auditor_status, "")
         self.assertIsNotNone(run.reviewed_at)
         self.assertEqual(run.review_feedback, "Looks good")
         self.assertEqual(run.htl_reviewer, "test-user")
@@ -246,10 +247,12 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["reviewStatus"], "rejected")
-        self.assertEqual(body["auditorStatus"], "REJECTED")
+        self.assertIsNone(body["auditorStatus"])  # no ERA Audit_Sts on this run
         self.assertEqual(body["feedback"], "Missing documentation")
         self.assertEqual(body["htlReviewer"], "test-user")
         run.refresh_from_db()
+        self.assertEqual(run.review_status, "rejected")
+        self.assertEqual(run.auditor_status, "")
         self.assertIsNotNone(run.reviewed_at)
         self.assertEqual(run.htl_reviewer, "test-user")
 

@@ -1138,19 +1138,6 @@ _VALID_REVIEW_STATUSES = frozenset({
     "", "pending", "in_progress", "approved", "rejected", "completed",
 })
 
-_REVIEW_TO_AUDITOR_STATUS = {
-    "": "",
-    "pending": "PENDING",
-    "in_progress": "IN_PROGRESS",
-    "approved": "APPROVED",
-    "rejected": "REJECTED",
-    "completed": "COMPLETED",
-}
-
-
-def _auditor_status_for_review(review_status: str) -> str:
-    return _REVIEW_TO_AUDITOR_STATUS.get(review_status, "")
-
 
 def _parse_review_status_body(request: Request) -> tuple[str | None, Response | None]:
     if "reviewStatus" not in request.data and "review_status" not in request.data:
@@ -1247,11 +1234,10 @@ def _locked_by_other_response(
 
 def _apply_review_release(run: RuleExecutionRun) -> RuleExecutionRun:
     run.review_status = "pending"
-    run.auditor_status = _auditor_status_for_review("pending")
     run.htl_reviewer = ""
     run.review_started_at = None
     run.save(update_fields=[
-        "review_status", "auditor_status", "htl_reviewer", "review_started_at",
+        "review_status", "htl_reviewer", "review_started_at",
     ])
     return run
 
@@ -1295,11 +1281,10 @@ def _apply_review_decision(
 ) -> RuleExecutionRun:
     now = dj_timezone.now()
     run.review_status = review_status
-    run.auditor_status = _auditor_status_for_review(review_status)
     run.review_feedback = feedback
     if review_status in {"approved", "rejected"}:
         run.reviewed_at = now
-    fields = ["review_status", "auditor_status", "review_feedback", "reviewed_at"]
+    fields = ["review_status", "review_feedback", "reviewed_at"]
     if htl_reviewer:
         run.htl_reviewer = htl_reviewer
         fields.append("htl_reviewer")
@@ -1315,8 +1300,7 @@ def _apply_review_status(
 ) -> RuleExecutionRun:
     now = dj_timezone.now()
     run.review_status = review_status
-    run.auditor_status = _auditor_status_for_review(review_status)
-    fields = ["review_status", "auditor_status"]
+    fields = ["review_status"]
     if review_status == "in_progress":
         run.review_started_at = now
         fields.append("review_started_at")

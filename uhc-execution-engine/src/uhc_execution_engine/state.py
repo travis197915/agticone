@@ -13,6 +13,7 @@ class ExecutionState(TypedDict, total=False):
     batch_id: Optional[str]                       # set when run from BatchRunner
     claim_id: str                                 # the id we keyed off
     original_auditor: str                         # from the upload's AuditorName column, if present
+    auditor_status: str                           # from the upload's Audit_Sts column, if present
     execution_mode: str                           # "linear" (default) | "parallel"
     claim_lob: dict[str, Any]                     # {product, network, label, source}
     lob_out_of_scope: bool                        # claim LOB not in workflow's supported set

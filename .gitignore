@@ -59,7 +59,7 @@ yaml_explained/
 datadump/
 yaml/
 .mypy_cache/
-
+sql_backup/
 # ── Claim audit scratch data & scripts ───────────────────────────────────
 CBD_Coverage.json
 claimid_*.json

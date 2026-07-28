@@ -23,12 +23,12 @@ _OPTIONAL_COLUMNS: dict[str, tuple[str, ...]] = {
 
 EXCEL_BILLING_FIELDS = tuple(_OPTIONAL_COLUMNS.keys())
 
-# Kept separate from _OPTIONAL_COLUMNS/EXCEL_BILLING_FIELDS: this one feeds
-# RuleExecutionRun.original_auditor (a dedicated model column resolved via
-# execution_app.reviewer_lookup), not the generic claim-payload spread —
-# mixing it into EXCEL_BILLING_FIELDS would let the raw sheet value clobber
-# the resolved name in API responses.
+# Kept separate from _OPTIONAL_COLUMNS/EXCEL_BILLING_FIELDS: these feed
+# dedicated RuleExecutionRun columns (original_auditor / auditor_status),
+# not the generic claim-payload spread — mixing them into
+# EXCEL_BILLING_FIELDS would let the raw sheet value clobber API fields.
 _AUDITOR_NAME_ALIASES = ("auditorname", "auditor_name", "auditor name")
+_AUDIT_STS_ALIASES = ("audit_sts", "audit sts", "auditor_status", "auditor status")
 
 
 class XlsxParseError(ValueError):
@@ -74,7 +74,8 @@ def extract_claim_rows(
     """Return ``(claim_rows, resolved_claim_id_column)``.
 
     Each row dict contains at minimum ``claim_id``. When present in the
-    workbook, also extracts ``paid_dt``, ``total_billed``, and ``total_paid``
+    workbook, also extracts ``paid_dt``, ``total_billed``, ``total_paid``,
+    ``original_auditor`` (AuditorName), and ``auditor_status`` (Audit_Sts)
     (header matching is case/whitespace tolerant).
     """
     try:
@@ -117,6 +118,7 @@ def extract_claim_rows(
             extra_idxs[field] = idx
 
     auditor_idx = _find_column(norm, _AUDITOR_NAME_ALIASES)
+    audit_sts_idx = _find_column(norm, _AUDIT_STS_ALIASES)
 
     claim_rows: list[dict[str, Any]] = []
     for row in rows:
@@ -139,6 +141,12 @@ def extract_claim_rows(
             auditor_name = _cell_value(row[auditor_idx])
             if auditor_name is not None:
                 record["original_auditor"] = str(auditor_name).strip()
+        if audit_sts_idx >= 0 and audit_sts_idx < len(row):
+            audit_sts = _cell_value(row[audit_sts_idx])
+            if audit_sts is not None:
+                # Normalize to uppercase for StatusChip / API consistency
+                # (ERA sheets use title case like "Clean").
+                record["auditor_status"] = str(audit_sts).strip().upper()
         claim_rows.append(record)
 
     return claim_rows, resolved

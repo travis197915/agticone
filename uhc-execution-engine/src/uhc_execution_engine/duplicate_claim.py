@@ -105,6 +105,8 @@ def record_skipped_claim(
     prior: Any,
     skip_reason: str,
     run_id: str | None = None,
+    original_auditor: str = "",
+    auditor_status: str = "",
 ) -> dict[str, Any]:
     """Persist a SKIPPED run row and return the per-claim response dict."""
     from execution_app.models import RuleExecutionRun
@@ -131,6 +133,8 @@ def record_skipped_claim(
         narrative=fields["narrative"],
         claim_lob=fields["claim_lob"],
         error_message=_skip_message(skip_reason, reused_from_run_id),
+        original_auditor=original_auditor,
+        auditor_status=auditor_status,
     )
     logger.info(
         "batch=%s claim=%s skipped reason=%s reused_run=%s",

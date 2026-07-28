@@ -47,3 +47,20 @@ def test_extract_claim_ids_backward_compatible():
     ids, col = extract_claim_ids(data)
     assert col == "subscriber_id"
     assert ids == ["SUB-9"]
+
+
+def test_extract_claim_rows_audit_sts_and_auditor_name():
+    data = _workbook_bytes([
+        ["ClaimID", "AuditorName", "Audit_Sts", "Audit_Sts_DT"],
+        ["CLM100", "Jane Auditor", "Clean", datetime(2025, 10, 8)],
+        ["CLM101", None, "Defect", None],
+    ])
+    rows, col = extract_claim_rows(data)
+    assert col == "ClaimID"
+    assert len(rows) == 2
+    assert rows[0]["claim_id"] == "CLM100"
+    assert rows[0]["original_auditor"] == "Jane Auditor"
+    assert rows[0]["auditor_status"] == "CLEAN"
+    assert rows[1]["claim_id"] == "CLM101"
+    assert "original_auditor" not in rows[1]
+    assert rows[1]["auditor_status"] == "DEFECT"

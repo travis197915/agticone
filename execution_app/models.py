@@ -74,13 +74,14 @@ class RuleExecutionRun(_UUIDPK):
         ("rejected", "Rejected"),
         ("completed", "Completed"),
     ]
+    # ERA Audit_Sts values (not HTL review — that lives on review_status).
     AUDITOR_STATUS_CHOICES = [
         ("", "Not started"),
-        ("PENDING", "Pending"),
-        ("IN_PROGRESS", "In progress"),
-        ("APPROVED", "Approved"),
-        ("REJECTED", "Rejected"),
-        ("COMPLETED", "Completed"),
+        ("CLEAN", "Clean"),
+        ("DEFECT", "Defect"),
+        ("INCONCLUSIVE", "Inconclusive"),
+        ("NOT_APPLICABLE", "Not applicable"),
+        ("OUT_OF_SCOPE", "Out of scope"),
     ]
 
     batch = models.ForeignKey(
@@ -104,6 +105,7 @@ class RuleExecutionRun(_UUIDPK):
         max_length=32, choices=REVIEW_STATUS_CHOICES, blank=True, default="",
     )
     review_feedback = models.TextField(blank=True, default="")
+    # Original auditor finding from the ERA upload's Audit_Sts column.
     auditor_status = models.CharField(
         max_length=32, choices=AUDITOR_STATUS_CHOICES, blank=True, default="",
     )
@@ -111,7 +113,7 @@ class RuleExecutionRun(_UUIDPK):
     reviewed_at = models.DateTimeField(null=True, blank=True)
     # HTL reviewer identity captured from the JWT (email preferred, else sub).
     htl_reviewer = models.CharField(max_length=255, blank=True, default="")
-    # Reserved for a later original-auditor attribution path (not set yet).
+    # From the upload's AuditorName column, if present.
     original_auditor = models.CharField(max_length=255, blank=True, default="")
     # Identified Line of Business for this claim (SOW deliverable):
     # {"product", "network", "label", "source"}. Empty for legacy/failed runs.
