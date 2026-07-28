@@ -140,6 +140,7 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
     tool_invocations = ToolInvocationRecordSerializer(many=True, read_only=True)
     htl_reviewer = serializers.SerializerMethodField()
     original_auditor = serializers.SerializerMethodField()
+    field_history = serializers.SerializerMethodField()
 
     class Meta:
         model = RuleExecutionRun
@@ -148,7 +149,7 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
                   "final_decision_type", "applied_codes", "narrative",
                   "claim_lob", "error_message", "review_status", "review_feedback",
                   "auditor_status", "review_started_at", "reviewed_at",
-                  "htl_reviewer", "original_auditor",
+                  "htl_reviewer", "original_auditor", "field_history",
                   "evaluations", "tool_invocations"]
 
     def _reviewer_names(self, run: RuleExecutionRun) -> dict[str, str]:
@@ -167,6 +168,18 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
     def get_original_auditor(self, run: RuleExecutionRun) -> str | None:
         names = self._reviewer_names(run)
         return names.get(run.original_auditor) or (run.original_auditor or None)
+
+    def get_field_history(self, run: RuleExecutionRun) -> list[dict[str, object]]:
+        return [
+            {
+                "fieldName": change.field_name,
+                "oldValue": change.old_value,
+                "newValue": change.new_value,
+                "changedAt": _format_time(change.changed_at),
+                "changedBy": change.changed_by,
+            }
+            for change in run.field_changes.all()[:20]
+        ]
 
 
 class BatchExecutionRunSerializer(serializers.ModelSerializer):

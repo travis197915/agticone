@@ -24,8 +24,8 @@ from time import monotonic as _monotonic
 from typing import Any, Iterator
 
 from django.conf import settings
-from django.core.exceptions import ImproperlyConfigured
-from django.db import DatabaseError, router
+from django.core.exceptions import ImproperlyConfigured, ValidationError
+from django.db import DatabaseError, router, transaction
 from django.db.models import Avg, DurationField, ExpressionWrapper, F, Q
 from django.http import StreamingHttpResponse
 from django.utils import timezone as dj_timezone
@@ -1132,6 +1132,111 @@ class RunDetailView(APIView):
             return Response({"detail": "not found"},
                             status=status.HTTP_404_NOT_FOUND)
         return Response(RuleExecutionRunSerializer(run).data)
+
+    def patch(self, request: Request, run_id: str) -> Response:
+        try:
+            run = RuleExecutionRun.objects.get(id=run_id)
+        except RuleExecutionRun.DoesNotExist:
+            return Response({"detail": "not found"},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        if not isinstance(request.data, dict):
+            return Response(
+                {"detail": "request body must be a JSON object"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not request.data:
+            return Response(
+                {"detail": "at least one field is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        field_aliases = {
+            "reviewStatus": "review_status",
+            "reviewFeedback": "review_feedback",
+            "auditorStatus": "auditor_status",
+            "htlReviewer": "htl_reviewer",
+            "originalAuditor": "original_auditor",
+            "finalDecisionType": "final_decision_type",
+            "claimLob": "claim_lob",
+            "totalPromptTokens": "total_prompt_tokens",
+            "totalCompletionTokens": "total_completion_tokens",
+            "totalCostUsd": "total_cost_usd",
+            "costBreakdown": "cost_breakdown",
+        }
+        allowed_fields = {
+            field.name for field in RuleExecutionRun._meta.get_fields()
+            if field.concrete and not field.many_to_many and not field.one_to_many
+            and field.name not in {"id", "started_at"}
+        }
+
+        normalized_payload: dict[str, Any] = {}
+        unsupported_fields: list[str] = []
+        for raw_key, value in request.data.items():
+            normalized_key = field_aliases.get(raw_key, raw_key)
+            if normalized_key.endswith("_id") and normalized_key[:-3] in allowed_fields:
+                normalized_key = normalized_key[:-3]
+            if normalized_key in allowed_fields:
+                normalized_payload[normalized_key] = value
+            else:
+                unsupported_fields.append(raw_key)
+        if unsupported_fields:
+            return Response(
+                {"detail": f"unsupported fields: {', '.join(unsupported_fields)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        changes_to_apply: list[tuple[str, Any, Any]] = []
+        for field_name, new_value in normalized_payload.items():
+            old_value = getattr(run, field_name)
+            if old_value != new_value:
+                changes_to_apply.append((field_name, old_value, new_value))
+
+        if not changes_to_apply:
+            return Response({
+                "id": str(run.id),
+                "updatedFields": [],
+                "history": [],
+                "run": RuleExecutionRunSerializer(run).data,
+            })
+
+        changed_by = _reviewer_from_request(request)
+        created_changes: list[dict[str, Any]] = []
+        try:
+            with transaction.atomic():
+                for field_name, _, new_value in changes_to_apply:
+                    setattr(run, field_name, new_value)
+                run.save(update_fields=[field_name for field_name, _, _ in changes_to_apply])
+                for field_name, old_value, new_value in changes_to_apply:
+                    change = run.field_changes.create(
+                        field_name=field_name,
+                        old_value=old_value,
+                        new_value=new_value,
+                        changed_by=changed_by,
+                    )
+                    created_changes.append(
+                        {
+                            "fieldName": change.field_name,
+                            "oldValue": change.old_value,
+                            "newValue": change.new_value,
+                            "changedAt": _iso_utc(change.changed_at),
+                            "changedBy": change.changed_by,
+                        }
+                    )
+        except (ValidationError, ValueError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        history = created_changes
+        return Response({
+            "id": str(run.id),
+            "updatedFields": [field_name for field_name, _, _ in changes_to_apply],
+            "history": history,
+            "run": RuleExecutionRunSerializer(run).data,
+        })
+
+    def put(self, request: Request, run_id: str) -> Response:
+        return self.patch(request, run_id)
 
 
 _VALID_REVIEW_STATUSES = frozenset({

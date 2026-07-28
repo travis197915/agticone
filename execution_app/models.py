@@ -134,6 +134,22 @@ class RuleExecutionRun(_UUIDPK):
         indexes = [models.Index(fields=["batch", "claim_id"])]
 
 
+class RuleExecutionRunFieldChange(models.Model):
+    """Append-only history of field-level updates for a RuleExecutionRun."""
+    run = models.ForeignKey(
+        RuleExecutionRun, on_delete=models.CASCADE, related_name="field_changes"
+    )
+    field_name = models.CharField(max_length=64)
+    old_value = models.JSONField(null=True, blank=True)
+    new_value = models.JSONField(null=True, blank=True)
+    changed_at = models.DateTimeField(auto_now_add=True)
+    changed_by = models.CharField(max_length=255, blank=True, default="")
+
+    class Meta:
+        db_table = "execution_rule_run_field_change"
+        ordering = ["-changed_at"]
+
+
 class RuleEvaluation(models.Model):
     SOURCE_CHOICES = [("PRECONDITION", "Precondition"), ("DECISION", "Decision")]
 

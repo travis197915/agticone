@@ -11,7 +11,9 @@ from rest_framework.test import APIClient
 from agent_tools.models import NodeRuleBinding, NodeToolBinding, Tool
 from builder.auth import CorebackendUser
 from builder.models import Shape, ShapeCategory, ShapeDefinition, WorkArea, Workbench, Workflow
-from execution_app.models import BatchExecutionRun, RuleEvaluation, RuleExecutionRun, ToolInvocationRecord
+from execution_app.models import (BatchExecutionRun, RuleEvaluation,
+                                   RuleExecutionRun, RuleExecutionRunFieldChange,
+                                   ToolInvocationRecord)
 from sop_ingestion.models import AuditSop, IngestionJob
 
 
@@ -194,6 +196,48 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertEqual(resp.json()["runId"], str(run.id))
         self.assertEqual(resp.json()["reviewStatus"], "in_progress")
         self.assertEqual(resp.json()["htlReviewer"], "test-user")
+
+    def test_patch_run_updates_fields_and_preserves_history(self):
+        run = self._create_run(claim_id="PATCH-CLAIM")
+
+        resp = self.client.patch(
+            f"/api/execute/runs/{run.id}/",
+            {"reviewStatus": "approved", "narrative": "Updated narrative"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["updatedFields"], ["review_status", "narrative"])
+        self.assertEqual(resp.json()["history"][0]["fieldName"], "review_status")
+        self.assertEqual(resp.json()["history"][0]["oldValue"], "")
+        self.assertEqual(resp.json()["history"][0]["newValue"], "approved")
+        self.assertEqual(resp.json()["history"][1]["fieldName"], "narrative")
+
+        run.refresh_from_db()
+        self.assertEqual(run.review_status, "approved")
+        self.assertEqual(run.narrative, "Updated narrative")
+        self.assertEqual(
+            RuleExecutionRunFieldChange.objects.filter(run=run).count(),
+            2,
+        )
+
+    def test_patch_run_rejects_unknown_fields_and_empty_payload(self):
+        run = self._create_run(claim_id="PATCH-CLAIM-2")
+
+        resp = self.client.patch(
+            f"/api/execute/runs/{run.id}/",
+            {"does_not_exist": "value"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("does_not_exist", resp.json()["detail"])
+
+        empty_resp = self.client.patch(
+            f"/api/execute/runs/{run.id}/",
+            {},
+            format="json",
+        )
+        self.assertEqual(empty_resp.status_code, 400)
 
     def test_approve_review_optional_feedback(self):
         run = self._create_run(claim_id="APPROVE-CLAIM")
