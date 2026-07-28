@@ -1125,8 +1125,8 @@ class RunListView(APIView):
 class RunDetailView(APIView):
     def get(self, _request: Request, run_id: str) -> Response:
         try:
-            run = (RuleExecutionRun.objects 
-                   .prefetch_related("evaluations", "tool_invocations")
+            run = (RuleExecutionRun.objects
+                   .prefetch_related("evaluations", "tool_invocations", "field_changes")
                    .get(id=run_id))
         except RuleExecutionRun.DoesNotExist:
             return Response({"detail": "not found"},
@@ -1389,14 +1389,65 @@ def _parse_feedback_body(
     return value, None
 
 
+_COMPLETED_REVIEW_STATUSES = frozenset({"approved", "rejected", "completed"})
+
+
+def _reevaluate_forbidden_response(
+    run: RuleExecutionRun,
+    current_uid: str,
+    new_status: str,
+) -> Response | None:
+    """Only the 2nd reviewer who completed a claim may reopen it for re-evaluate."""
+    if new_status != "in_progress":
+        return None
+    if run.review_status not in _COMPLETED_REVIEW_STATUSES:
+        return None
+    if not run.htl_reviewer:
+        return Response(
+            {"detail": "no reviewer is assigned to re-evaluate this claim"},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if run.htl_reviewer != current_uid:
+        holder = _holder_display_name(run)
+        return Response(
+            {
+                "detail": f"only {holder} can re-evaluate this claim",
+                "heldBy": holder,
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    return None
+
+
+def _record_field_change(
+    run: RuleExecutionRun,
+    *,
+    field_name: str,
+    old_value: Any,
+    new_value: Any,
+    changed_by: str,
+) -> None:
+    if old_value == new_value:
+        return
+    run.field_changes.create(
+        field_name=field_name,
+        old_value=old_value,
+        new_value=new_value,
+        changed_by=changed_by,
+    )
+
+
 def _apply_review_decision(
     run: RuleExecutionRun,
     *,
     review_status: str,
     feedback: str,
     htl_reviewer: str = "",
+    changed_by: str = "",
 ) -> RuleExecutionRun:
     now = dj_timezone.now()
+    old_status = run.review_status
+    old_feedback = run.review_feedback
     run.review_status = review_status
     run.review_feedback = feedback
     if review_status in {"approved", "rejected"}:
@@ -1406,6 +1457,21 @@ def _apply_review_decision(
         run.htl_reviewer = htl_reviewer
         fields.append("htl_reviewer")
     run.save(update_fields=fields)
+    actor = changed_by or htl_reviewer
+    _record_field_change(
+        run,
+        field_name="review_status",
+        old_value=old_status or None,
+        new_value=review_status or None,
+        changed_by=actor,
+    )
+    _record_field_change(
+        run,
+        field_name="review_feedback",
+        old_value=old_feedback or None,
+        new_value=feedback or None,
+        changed_by=actor,
+    )
     return run
 
 
@@ -1451,7 +1517,7 @@ class RunReviewApproveView(APIView):
 
         _apply_review_decision(
             run, review_status="approved", feedback=feedback,
-            htl_reviewer=current_uid,
+            htl_reviewer=current_uid, changed_by=current_uid,
         )
         return Response(_serialize_review_status_update(run))
 
@@ -1480,7 +1546,7 @@ class RunReviewRejectView(APIView):
 
         _apply_review_decision(
             run, review_status="rejected", feedback=feedback,
-            htl_reviewer=current_uid,
+            htl_reviewer=current_uid, changed_by=current_uid,
         )
         return Response(_serialize_review_status_update(run))
 
@@ -1513,7 +1579,7 @@ class ClaimReviewApproveView(APIView):
 
         _apply_review_decision(
             run, review_status="approved", feedback=feedback,
-            htl_reviewer=current_uid,
+            htl_reviewer=current_uid, changed_by=current_uid,
         )
         return Response(_serialize_review_status_update(run))
 
@@ -1546,7 +1612,7 @@ class ClaimReviewRejectView(APIView):
 
         _apply_review_decision(
             run, review_status="rejected", feedback=feedback,
-            htl_reviewer=current_uid,
+            htl_reviewer=current_uid, changed_by=current_uid,
         )
         return Response(_serialize_review_status_update(run))
 
@@ -1557,7 +1623,9 @@ class RunReviewStatusView(APIView):
     Mark the human audit / review workflow for one claim run (e.g.
     ``{"reviewStatus": "in_progress"}``). Blocked with 409 while another
     reviewer already holds the claim ``in_progress`` — see
-    ``RunReviewReleaseView``.
+    ``RunReviewReleaseView``. Re-opening a completed review
+    (``approved``/``rejected``/``completed`` → ``in_progress``) is limited
+    to the 2nd reviewer who completed it.
     """
 
     def patch(self, request: Request, run_id: str) -> Response:
@@ -1578,6 +1646,9 @@ class RunReviewStatusView(APIView):
         lock_err = _locked_by_other_response(run, current_uid)
         if lock_err is not None:
             return lock_err
+        reeval_err = _reevaluate_forbidden_response(run, current_uid, review_status)
+        if reeval_err is not None:
+            return reeval_err
 
         _apply_review_status(run, review_status, htl_reviewer=current_uid)
         return Response(_serialize_review_status_update(run))
@@ -1612,6 +1683,9 @@ class ClaimReviewStatusView(APIView):
         lock_err = _locked_by_other_response(run, current_uid)
         if lock_err is not None:
             return lock_err
+        reeval_err = _reevaluate_forbidden_response(run, current_uid, review_status)
+        if reeval_err is not None:
+            return reeval_err
 
         _apply_review_status(run, review_status, htl_reviewer=current_uid)
         return Response(_serialize_review_status_update(run))

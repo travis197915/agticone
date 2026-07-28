@@ -300,6 +300,69 @@ class ClaimProcessingEndpointTests(TestCase):
         self.assertIsNotNone(run.reviewed_at)
         self.assertEqual(run.htl_reviewer, "test-user")
 
+    def test_approve_records_feedback_history_and_reevaluate_gate(self):
+        run = self._create_run(claim_id="REEVAL-CLAIM")
+        first = self.client.post(
+            f"/api/claims/REEVAL-CLAIM/review/approve/",
+            {"feedback": "First pass OK"},
+            format="json",
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(
+            RuleExecutionRunFieldChange.objects.filter(
+                run=run, field_name="review_feedback",
+            ).count(),
+            1,
+        )
+
+        # Another reviewer cannot reopen a completed claim.
+        other = APIClient()
+        other.force_authenticate(
+            user=CorebackendUser(
+                id="other-user", email="o@example.com", role="MEMBER", permissions=["*"],
+            ),
+        )
+        blocked = other.patch(
+            "/api/claims/REEVAL-CLAIM/review-status/",
+            {"reviewStatus": "in_progress"},
+            format="json",
+        )
+        self.assertEqual(blocked.status_code, 403)
+
+        # Original 2nd reviewer can re-evaluate.
+        reopen = self.client.patch(
+            "/api/claims/REEVAL-CLAIM/review-status/",
+            {"reviewStatus": "in_progress"},
+            format="json",
+        )
+        self.assertEqual(reopen.status_code, 200)
+        self.assertEqual(reopen.json()["reviewStatus"], "in_progress")
+
+        second = self.client.post(
+            "/api/claims/REEVAL-CLAIM/review/reject/",
+            {"feedback": "Second pass — missing docs"},
+            format="json",
+        )
+        self.assertEqual(second.status_code, 200)
+        feedback_changes = list(
+            RuleExecutionRunFieldChange.objects.filter(
+                run=run, field_name="review_feedback",
+            ).order_by("changed_at")
+        )
+        self.assertEqual(len(feedback_changes), 2)
+        self.assertEqual(feedback_changes[0].new_value, "First pass OK")
+        self.assertEqual(feedback_changes[1].old_value, "First pass OK")
+        self.assertEqual(feedback_changes[1].new_value, "Second pass — missing docs")
+
+        detail = self.client.get(f"/api/execute/runs/{run.id}/")
+        self.assertEqual(detail.status_code, 200)
+        history = detail.json().get("field_history") or detail.json().get("fieldHistory") or []
+        feedback_history = [
+            row for row in history
+            if (row.get("fieldName") or row.get("field_name")) == "review_feedback"
+        ]
+        self.assertGreaterEqual(len(feedback_history), 2)
+
     def test_runs_list_filters_by_review_status(self):
         pending_blank = self._create_run(claim_id="LIST-PENDING-BLANK")
         pending_explicit = self._create_run(claim_id="LIST-PENDING-EXPLICIT")

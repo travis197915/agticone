@@ -25,6 +25,20 @@ def _format_time(ts) -> str:
     return ts.strftime("%I:%M:%S %p")
 
 
+def _format_iso(ts) -> str | None:
+    if ts is None:
+        return None
+    from datetime import timezone as dt_timezone
+    if getattr(ts, "tzinfo", None) is None:
+        ts = ts.replace(tzinfo=dt_timezone.utc)
+    return (
+        ts.astimezone(dt_timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
 def _excel_claim_fields(payload: dict | None) -> dict:
     if not payload:
         return {}
@@ -175,7 +189,7 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
                 "fieldName": change.field_name,
                 "oldValue": change.old_value,
                 "newValue": change.new_value,
-                "changedAt": _format_time(change.changed_at),
+                "changedAt": _format_iso(change.changed_at),
                 "changedBy": change.changed_by,
             }
             for change in run.field_changes.all()[:20]
