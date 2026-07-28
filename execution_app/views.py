@@ -1125,7 +1125,7 @@ class RunListView(APIView):
 class RunDetailView(APIView):
     def get(self, _request: Request, run_id: str) -> Response:
         try:
-            run = (RuleExecutionRun.objects
+            run = (RuleExecutionRun.objects 
                    .prefetch_related("evaluations", "tool_invocations")
                    .get(id=run_id))
         except RuleExecutionRun.DoesNotExist:
@@ -1150,6 +1150,18 @@ class RunDetailView(APIView):
             return Response(
                 {"detail": "at least one field is required"},
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        current_uid = _reviewer_from_request(request)
+        if run.original_auditor and current_uid and str(run.original_auditor).strip() != str(current_uid).strip():
+            return Response(
+                {"detail": "only the original auditor can modify this run"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if run.original_auditor and not current_uid:
+            return Response(
+                {"detail": "authentication required to modify this run"},
+                status=status.HTTP_401_UNAUTHORIZED,
             )
 
         field_aliases = {
