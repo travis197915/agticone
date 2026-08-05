@@ -57,6 +57,9 @@ SOP_Rule-to-Tool_Mapping_Report (1).docx
 graphify-out/
 yaml_explained/
 datadump/
+data-dump-new-folder/
+data-dump-new-folder.zip
+TECHNICAL_README.md
 yaml/
 .mypy_cache/
 sql_backup/

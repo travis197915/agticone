@@ -35,7 +35,8 @@ RUN --mount=type=secret,id=jf-user,env=DOCKER_ER_USER \
 set -eu
 export PIP_INDEX_URL="https://${DOCKER_ER_USER}:${DOCKER_ER_TOKEN}@edgeinternal1uhg.optum.com/artifactory/api/pypi/epl-pypi-vir/simple"
 python -m venv /opt/venv
-/opt/venv/bin/pip install --no-cache-dir --upgrade pip
+# Pin pip>=26.2 for CVE-2026-13346 (path traversal via doubly-encoded URLs).
+/opt/venv/bin/pip install --no-cache-dir --upgrade "pip>=26.2"
 # Strip the "-e ./uhc-*" editable local packages: their source is not present
 # yet at this layer. They are installed from source in the dedicated step below
 # (after their directories are COPYed) so that this slow install layer caches.
@@ -93,6 +94,17 @@ ENV LANG=C.UTF-8 \
     APP_PORT=8000
 
 WORKDIR /app
+
+USER root
+
+# Drop unused wget (CVE-2026-58469/70/71/72) and refresh libnghttp2
+# (CVE-2026-58055). Both ship in the Optum Chainguard/Wolfi golden image and
+# are not required by this application runtime.
+RUN set -eu; \
+    if command -v apk >/dev/null 2>&1; then \
+      apk del --no-cache wget 2>/dev/null || true; \
+      apk upgrade --no-cache libnghttp2 libnghttp2-14 2>/dev/null || true; \
+    fi
 
 # Bring over the virtual environment and the application source, owned by the
 # non-root golden-image user.
