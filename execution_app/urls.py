@@ -7,8 +7,9 @@ from __future__ import annotations
 from django.urls import path
 
 from .views import (BatchDetailView, BatchEventsView, BatchLatestView,
-                     RunBatchAsyncView, RunBatchView, RunDetailView, RunListView,
-                     RunNodesView, RunReviewApproveView, RunReviewRejectView,
+                     ReprocessRunsView, RunBatchAsyncView, RunBatchView,
+                     RunDetailView, RunListView, RunNodesView,
+                     RunReviewApproveView, RunReviewRejectView,
                      RunReviewReleaseView, RunReviewStatusView)
 
 app_name = "execution_app"
@@ -26,6 +27,8 @@ urlpatterns = [
          BatchEventsView.as_view(), name="batch-events"),
     path("runs/",
          RunListView.as_view(), name="run-list"),
+    path("runs/reprocess/",
+         ReprocessRunsView.as_view(), name="runs-reprocess"),
     path("runs/<uuid:run_id>/",
          RunDetailView.as_view(), name="run-detail"),
     path("runs/<uuid:run_id>/review-status/",

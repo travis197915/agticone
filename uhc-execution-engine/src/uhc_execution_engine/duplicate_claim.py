@@ -55,6 +55,39 @@ def _prior_fields(prior: Any) -> dict[str, Any]:
     }
 
 
+def _rules_have_moved(run: Any, workflow_id: str) -> bool:
+    """True when the workflow's bindings no longer match what ``run`` executed.
+
+    Derived rather than stored: ``RuleEvaluation.rule_key`` embeds the SOP id,
+    so a run already records which SOP versions produced it. Compared against
+    the workflow's current bindings, since an approved rollout repoints them at
+    a different ``AuditSop`` row entirely.
+
+    Fails **open** — on any error the guard behaves as it always did and reuses
+    the prior run. A reprocess that wrongly skips is visible and re-runnable; a
+    lookup error that silently forced thousands of full re-runs is not.
+    """
+    try:
+        from execution_app.services.run_versions import (
+            _current_sop_ids_by_workflow, _sop_ids_by_run,
+        )
+
+        ran_on = _sop_ids_by_run([str(run.id)]).get(str(run.id), set())
+        current = _current_sop_ids_by_workflow([workflow_id]).get(
+            str(workflow_id), set()
+        )
+        if not ran_on or not current:
+            return False
+        return ran_on != current
+    except Exception:
+        logger.exception(
+            "duplicate_claim: SOP version comparison failed run=%s workflow=%s "
+            "— treating as unchanged",
+            getattr(run, "id", "?"), workflow_id,
+        )
+        return False
+
+
 def find_prior_clean_run(
     *,
     claim_id: str,
@@ -84,8 +117,24 @@ def find_prior_clean_run(
         for run in qs[:50]:
             if run.status not in _TERMINAL_RUN_STATUSES:
                 continue
-            if claim_audit_status(run) == CLEAN:
-                return run
+            if claim_audit_status(run) != CLEAN:
+                continue
+            # The prior run is only a valid substitute if it used the SAME
+            # rules. Before SOP versioning a workflow's rules were effectively
+            # immutable, so (claim, workflow) was a sufficient identity; once an
+            # approved change set repoints the bindings, the same pair names two
+            # different rule sets. Reusing across that boundary would hand back
+            # the OLD verdict — and `record_skipped_claim` carries the prior
+            # narrative and original auditor with it — labelled as current.
+            if _rules_have_moved(run, workflow_id):
+                logger.info(
+                    "duplicate_claim: prior CLEAN run %s for claim=%s ran on a "
+                    "different SOP version than workflow=%s is on now — not "
+                    "reusing it",
+                    run.id, claim_id, workflow_id,
+                )
+                return None
+            return run
         return None
     except Exception:
         logger.exception(

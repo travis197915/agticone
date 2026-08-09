@@ -565,6 +565,141 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             .get(pk=pk)
         )
 
+    # ── Version preview ─────────────────────────────────────────────────────
+
+    @action(detail=True, methods=["get"], url_path="version-preview")
+    def version_preview(self, request, pk=None):
+        """What this workflow's canvas looks like on one SOP version.
+
+        ``GET /api/builder/workflows/<id>/version-preview/?sop_id=<sop>``
+
+        A *pending* version has no canvas — nothing is bound to it, and nothing
+        will be until its change set is approved. So the answer is a projection:
+        run the rollout planner (the same one approval executes, never a second
+        implementation that could drift) and return an overlay the SPA applies
+        on top of the live graph.
+
+        Response is an overlay, not a graph, so the SPA reuses the canvas it
+        already renders:
+
+        * ``rules[shape_id][rule_key]`` — ``repoint`` (with the text it gains),
+          ``drop``, or ``strand`` for each affected binding
+        * ``unplaced`` — new rules with no node to attach to
+        * ``readonly`` — always true; a projection must never be saved back
+
+        For the version the workflow is already on, the overlay is empty and
+        ``projected`` is false: the live canvas already *is* that version.
+        """
+        from typing import Any
+
+        from agent_tools.models import NodeRuleBinding
+        from rest_framework.exceptions import ValidationError
+        from sop_ingestion.models import AuditSop, ChangeSetStatus, RuleChangeSet
+        from sop_ingestion.services.workflow_rollout import preview_rollout
+
+        wf: Workflow = self.get_object()
+        raw = (request.query_params.get("sop_id") or "").strip()
+        if not raw.isdigit():
+            raise ValidationError({"sop_id": "Query param 'sop_id' is required."})
+        target = get_object_or_404(AuditSop, pk=int(raw))
+
+        bound_sop_ids = set(
+            NodeRuleBinding.objects
+            .filter(shape__workbench__work_area__workflow=wf)
+            .values_list("sop_id", flat=True)
+            .distinct()
+        )
+
+        base = {
+            "workflow_id": str(wf.id),
+            "sop_id": target.id,
+            "version_number": target.version_number,
+            "activation_status": target.activation_status,
+            "is_current": target.is_current,
+            "readonly": True,
+            "change_set": None,
+        }
+
+        if target.id in bound_sop_ids:
+            # The canvas is already on this version — nothing to project, and
+            # it is editable in the normal way.
+            return Response({
+                **base,
+                "projected": False,
+                "readonly": False,
+                "rules": {},
+                "unplaced": [],
+                "report": None,
+            })
+
+        change_set = (
+            RuleChangeSet.objects
+            .filter(workflow=wf, to_sop=target, status=ChangeSetStatus.OPEN)
+            .order_by("-id")
+            .first()
+        )
+        from_sop = change_set.sop if change_set else None
+        if from_sop is None:
+            # No open batch names this version. Fall back to whichever bound SOP
+            # shares its document — that is the version it would replace.
+            from_sop = (
+                AuditSop.objects
+                .filter(id__in=bound_sop_ids, document_id=target.document_id)
+                .order_by("-version_number", "-id")
+                .first()
+                if target.document_id else None
+            )
+        if from_sop is None:
+            return Response({
+                **base,
+                "projected": False,
+                "rules": {},
+                "unplaced": [],
+                "report": None,
+                "detail": "This workflow has no canvas on this SOP's document.",
+            })
+
+        plan = preview_rollout(workflow=wf, from_sop=from_sop, to_sop=target)
+
+        rules: dict[str, dict[str, Any]] = {}
+        for entry in plan.bindings:
+            rules.setdefault(entry.shape_id, {})[entry.rule_key] = {
+                "action": entry.action,
+                "new_rule_key": entry.new_rule_key,
+                "condition": entry.condition,
+                "action_text": entry.action_text,
+                "refreshed": entry.refreshed,
+                "preserved": entry.preserved,
+            }
+
+        # Node labels, so the preview can group by node without the caller
+        # having to join the overlay against a separately-fetched graph.
+        shapes = {
+            str(sh.id): {
+                "label": sh.label or "",
+                "workbench": sh.workbench.name or "",
+                "order": sh.workbench.order,
+            }
+            for sh in Shape.objects
+            .filter(id__in=[b.shape_id for b in plan.bindings])
+            .select_related("workbench")
+        }
+
+        return Response({
+            "shapes": shapes,
+            **base,
+            "projected": True,
+            "from_sop_id": from_sop.id,
+            "from_version_number": from_sop.version_number,
+            "change_set": (
+                {"id": change_set.id, "proposal_count": change_set.proposals.count()}
+                if change_set else None
+            ),
+            "rules": rules,
+            "unplaced": plan.unplaced,
+            "report": plan.report.as_dict(),
+        })
+
     # ── Auto-build progress (polled by the SPA loading screen) ──────────────
 
     @action(detail=True, methods=["get"], url_path="build_status")

@@ -1078,6 +1078,49 @@ def _avg_processing_time_min(qs) -> float:
     return round(avg.total_seconds() / 60.0, 1)
 
 
+class ReprocessRunsView(APIView):
+    """POST /api/execute/runs/reprocess/ — re-run claims on the current rules.
+
+    Body: ``{"run_ids": ["<uuid>", ...]}`` — the runs whose claims to re-run.
+
+    Produces a new ``RuleExecutionRun`` per claim; the originals are kept so the
+    listing can show both and label which rule version each used. This is an
+    ordinary execution — live tool calls, every rule — so it costs a full run
+    per claim.
+    """
+
+    def post(self, request: Request) -> Response:
+        from .services.reprocess import (
+            ReprocessError, dispatch_reprocess, runs_for_reprocess,
+        )
+
+        payload = request.data if isinstance(request.data, dict) else {}
+        raw_ids = payload.get("run_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return Response(
+                {"detail": "run_ids (non-empty array) is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            runs = runs_for_reprocess([str(i) for i in raw_ids])
+            result = dispatch_reprocess(
+                runs=runs,
+                workflow_id=str(runs[0].workflow_id),
+                upload_dir=_execution_upload_dir(),
+                requested_by=str(getattr(request.user, "email", "") or ""),
+            )
+        except ReprocessError as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.exception("reprocess dispatch failed")
+            return Response(
+                {"detail": f"could not queue reprocess: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return Response(result, status=status.HTTP_202_ACCEPTED)
+
+
 class RunListView(APIView):
     """GET /api/execute/runs/ — all processed claims across every batch."""
 
@@ -1108,6 +1151,8 @@ class RunListView(APIView):
         reviewer_names = resolve_reviewer_names(
             [r.htl_reviewer for r in runs] + [r.original_auditor for r in runs]
         )
+        from .services.run_versions import run_version_info
+        version_info = run_version_info(runs)
         return Response({
             "count": total,
             "limit": limit,
@@ -1116,7 +1161,9 @@ class RunListView(APIView):
             "rejected_review_count": qs.filter(review_status="rejected").count(),
             "avg_processing_time_min": _avg_processing_time_min(qs),
             "results": [
-                serialize_run_summary(r, reviewer_names=reviewer_names)
+                serialize_run_summary(
+                    r, reviewer_names=reviewer_names, version_info=version_info,
+                )
                 for r in runs
             ],
         })

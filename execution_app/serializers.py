@@ -50,19 +50,39 @@ def _excel_claim_fields(payload: dict | None) -> dict:
 
 
 def serialize_run_summary(
-    run: RuleExecutionRun, *, reviewer_names: dict[str, str] | None = None,
+    run: RuleExecutionRun,
+    *,
+    reviewer_names: dict[str, str] | None = None,
+    version_info: dict[str, dict] | None = None,
 ) -> dict:
     """Lightweight row for batch detail and the all-runs list.
 
     ``reviewer_names`` lets callers batch-resolve userID -> name once for a
     whole page/batch instead of a query per row; falls back to a per-row
     lookup when omitted.
+
+    ``version_info`` (from ``services.run_versions.run_version_info``) is the
+    same idea for the rule version a run executed against. Omitted rather than
+    derived per row, because a reprocessed claim produces a second row for the
+    same claim id and the version is the only thing that tells them apart —
+    computing that 25 times over would be 25 round trips.
     """
     if reviewer_names is None:
         reviewer_names = resolve_reviewer_names(
             [run.htl_reviewer, run.original_auditor]
         )
+    version = (version_info or {}).get(str(run.id)) or {}
     return {
+        # Which rules produced this row, and whether the workflow has moved on.
+        # ``can_reprocess`` is the button: a re-run would use different rules.
+        "version_label": version.get("version_label", ""),
+        "sop_versions": version.get("sop_versions", []),
+        "is_outdated": version.get("is_outdated", False),
+        # True when the run wrote no evaluations: the label is the version it
+        # was dispatched against, not one it executed.
+        "never_ran": version.get("never_ran", False),
+        "current_version_label": version.get("current_label", ""),
+        "can_reprocess": version.get("is_outdated", False),
         "id": str(run.id),
         "run_id": str(run.id),
         "batch_id": str(run.batch_id) if run.batch_id else "",

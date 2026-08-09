@@ -925,3 +925,206 @@ class SopIRDocument(models.Model):
 
     def __str__(self) -> str:  # pragma: no cover - debug aid
         return f"IR v{self.ir_version} sop={self.sop_id} [{self.validation_status}]"
+
+
+# ── SOP rule changes (propose → review → apply) ──────────────────────────────
+# Two sources, one review surface.
+#
+# ``ingestion`` (the primary path) — a SOP document is re-uploaded or re-linked
+#   into a workflow and ingested. The new ``AuditSop`` version is diffed against
+#   the version that workflow is currently bound to, and each differing rule
+#   becomes a proposal. Approving repoints *that workflow's* NodeRuleBindings to
+#   the new version, so other workflows on the old version are untouched.
+#
+# ``manual`` — a single rule edited directly through the propose endpoint.
+#   Approving hands the batch to ``rule_reconcile.apply()``, which rewrites the
+#   canonical ``AuditDecision`` and therefore reaches every workflow bound to it.
+#
+# Neither path touches the document-level lifecycle: approval never calls
+# ``activate_sop_version``, because "current" is a property of the document
+# while adoption is now a property of each workflow.
+
+
+class ChangeSetStatus(models.TextChoices):
+    OPEN     = "open",     "Open"
+    APPROVED = "approved", "Approved"
+    REJECTED = "rejected", "Rejected"
+    STALE    = "stale",    "Stale"
+
+
+class ChangeSetSource(models.TextChoices):
+    MANUAL    = "manual",    "Manual rule edit"
+    INGESTION = "ingestion", "SOP re-ingestion"
+
+
+class RuleChangeKind(models.TextChoices):
+    MODIFIED = "modified", "Modified"
+    ADDED    = "added",    "Added"
+    REMOVED  = "removed",  "Removed"
+
+
+class RuleChangeSet(models.Model):
+    """A batch of rule changes to one SOP, reviewed as a unit.
+
+    Batching is *implicit*: a change finds-or-creates the author's open batch
+    for that SOP (and, for an ingestion, that workflow), so one upload or one
+    editing session reviews together. Re-uploading the same SOP before review
+    re-bases the open batch rather than queueing a second one.
+    """
+
+    # The version the workflow is currently ON — the "from" side of the diff.
+    sop          = models.ForeignKey(AuditSop, on_delete=models.CASCADE,
+                                     related_name="change_sets")
+    # Pins ``AuditSop.version`` — the RULE-CONTENT counter that
+    # rule_reconcile.apply() bumps. Deliberately NOT ``version_number``, which
+    # tracks ingested document snapshots and moves on a different axis.
+    base_version = models.PositiveIntegerField()
+    status       = models.CharField(max_length=16, choices=ChangeSetStatus.choices,
+                                    default=ChangeSetStatus.OPEN, db_index=True)
+    source       = models.CharField(max_length=16, choices=ChangeSetSource.choices,
+                                    default=ChangeSetSource.MANUAL, db_index=True)
+
+    # ── Ingestion-sourced batches only ───────────────────────────────────────
+    # Which workflow adopts this change. Approval repoints only THIS workflow's
+    # bindings, which is what keeps a SOP update from reaching every workflow
+    # bound to the same document. Null for a manual edit, which has no workflow
+    # scope and rewrites the canonical rule instead.
+    workflow      = models.ForeignKey("builder.Workflow", on_delete=models.CASCADE,
+                                      null=True, blank=True,
+                                      related_name="sop_change_sets")
+    # The newly ingested version — the "to" side of the diff.
+    to_sop        = models.ForeignKey(AuditSop, on_delete=models.CASCADE,
+                                      null=True, blank=True,
+                                      related_name="incoming_change_sets")
+    ingestion_job = models.ForeignKey(IngestionJob, on_delete=models.SET_NULL,
+                                      null=True, blank=True,
+                                      related_name="change_sets")
+
+    created_by   = models.CharField(max_length=128, blank=True, default="")
+    created_at   = models.DateTimeField(auto_now_add=True)
+    updated_at   = models.DateTimeField(auto_now=True)
+
+    reviewed_by  = models.CharField(max_length=128, blank=True, default="")
+    reviewed_at  = models.DateTimeField(null=True, blank=True)
+    review_note  = models.TextField(blank=True, default="")
+    # Manual batches: the ``AuditSop.version`` this batch produced once applied.
+    resulting_version = models.PositiveIntegerField(null=True, blank=True)
+
+    class Meta:
+        ordering    = ["-created_at", "-id"]
+        verbose_name = "Rule Change Set"
+        constraints = [
+            # Two constraints rather than one on (sop, workflow, created_by):
+            # Postgres treats NULLs as distinct, so a single constraint would
+            # silently stop enforcing anything for manual batches.
+            models.UniqueConstraint(
+                fields=["sop", "created_by"],
+                condition=models.Q(status="open", workflow__isnull=True),
+                name="uniq_open_manual_change_set",
+            ),
+            models.UniqueConstraint(
+                fields=["sop", "workflow", "created_by"],
+                condition=models.Q(status="open", workflow__isnull=False),
+                name="uniq_open_ingestion_change_set",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["status", "-created_at"]),
+            models.Index(fields=["sop", "status"]),
+            models.Index(fields=["workflow", "status"]),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover - debug aid
+        return f"changeset#{self.id} sop={self.sop_id} [{self.status}]"
+
+    @property
+    def is_ingestion(self) -> bool:
+        return self.source == ChangeSetSource.INGESTION
+
+    @property
+    def is_stale(self) -> bool:
+        """True when the ground the batch was diffed against has moved.
+
+        For a manual batch that means the SOP's rule version changed under it.
+        For an ingestion batch it means the workflow is no longer on the
+        version this diff was computed from — another rollout landed first —
+        so the "previous" side would render text the workflow never had.
+        """
+        return self.sop.version != self.base_version
+
+
+class RuleChangeProposal(models.Model):
+    """One rule's change inside a change set.
+
+    The two decision FKs are the "from" and "to" sides of the change, and which
+    of them is null is what makes the change a modification, an addition or a
+    removal:
+
+    ============  ===============  ===============
+    change_kind   decision (from)  to_decision
+    ============  ===============  ===============
+    modified      set              set
+    added         **null**         set
+    removed       set              **null**
+    ============  ===============  ===============
+
+    A manual edit only ever produces ``modified``, with ``to_decision`` null
+    because the new text lives in ``proposed_fields`` rather than in a second
+    ``AuditDecision`` row.
+    """
+
+    changeset   = models.ForeignKey(RuleChangeSet, on_delete=models.CASCADE,
+                                    related_name="proposals")
+    # Null when the rule is new in the incoming version.
+    decision    = models.ForeignKey(AuditDecision, on_delete=models.CASCADE,
+                                    null=True, blank=True,
+                                    related_name="change_proposals")
+    # The matching rule in the incoming SOP version. Null for a removal, and
+    # for a manual edit (which has no incoming version).
+    to_decision = models.ForeignKey(AuditDecision, on_delete=models.CASCADE,
+                                    null=True, blank=True,
+                                    related_name="incoming_change_proposals")
+    change_kind = models.CharField(max_length=16, choices=RuleChangeKind.choices,
+                                   default=RuleChangeKind.MODIFIED, db_index=True)
+
+    # Identity, denormalised at propose time. ``subrule_id`` coverage ranges
+    # 26%-100% across SOPs, so ``display_rule_id`` carries a positional
+    # fallback ("Step 5 · Row 3") and is stored rather than re-derived.
+    subrule_id      = models.CharField(max_length=64, blank=True, default="")
+    display_rule_id = models.CharField(max_length=64, blank=True, default="")
+    step_number     = models.PositiveIntegerField(default=0)
+    row_index       = models.PositiveIntegerField(default=0)
+
+    # ``AuditDecision.revision`` when the change was recorded.
+    base_revision   = models.PositiveIntegerField(default=1)
+    # Both restricted to rule_reconcile.RECONCILABLE_FIELDS.
+    previous_fields = models.JSONField(default=dict, blank=True)
+    proposed_fields = models.JSONField(default=dict, blank=True)
+    # Populated by the impact resolver: [{step_number, label}, ...].
+    dependent_steps = models.JSONField(default=list, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering    = ["step_number", "row_index", "id"]
+        verbose_name = "Rule Change Proposal"
+        constraints = [
+            # One proposal per rule per batch, enforced on each side. Both are
+            # partial because Postgres treats NULLs as distinct — an unfiltered
+            # constraint would let every "added" row through unchecked.
+            models.UniqueConstraint(
+                fields=["changeset", "decision"],
+                condition=models.Q(decision__isnull=False),
+                name="uniq_proposal_per_from_rule",
+            ),
+            models.UniqueConstraint(
+                fields=["changeset", "to_decision"],
+                condition=models.Q(to_decision__isnull=False),
+                name="uniq_proposal_per_to_rule",
+            ),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover - debug aid
+        target = self.display_rule_id or self.decision_id or self.to_decision_id
+        return f"{target} [{self.change_kind}] @ changeset#{self.changeset_id}"

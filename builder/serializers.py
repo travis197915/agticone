@@ -120,8 +120,39 @@ class WorkflowSopStatusSerializer(serializers.Serializer):
         return sop.id if sop else None
 
     def get_sop_version(self, obj):
+        """Approval flags, plus the change set that owns this version, if any.
+
+        A version raised by a workflow SOP upload is adopted by approving its
+        *change set* — that is what repoints the canvas. The document-level
+        activate/reject buttons bypass the rollout entirely and would leave the
+        badges saying "current" while the canvas still ran the old version, so
+        the SPA needs to know when to offer "Review changes" instead.
+        """
+        from sop_ingestion.models import ChangeSetStatus, RuleChangeSet
+
         from .sop_compliance import sop_approval_meta
-        return sop_approval_meta(self._primary_sop(obj))
+
+        sop = self._primary_sop(obj)
+        meta = sop_approval_meta(sop)
+        meta["change_set"] = None
+        if sop is None:
+            return meta
+
+        workflow_id = getattr(obj, "workflow_id", None)
+        change_set = (
+            RuleChangeSet.objects
+            .filter(to_sop=sop, status=ChangeSetStatus.OPEN)
+            .filter(**({"workflow_id": workflow_id} if workflow_id else {}))
+            .order_by("-id")
+            .first()
+        )
+        if change_set is not None:
+            meta["change_set"] = {
+                "id": change_set.id,
+                "status": change_set.status,
+                "proposal_count": change_set.proposals.count(),
+            }
+        return meta
 
 
 class WorkflowSerializer(serializers.ModelSerializer):

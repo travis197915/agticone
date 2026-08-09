@@ -106,7 +106,11 @@ def execute_ingestion_job(job_id: str) -> dict:
     # the builder sees the routing-complete projection.
     _maybe_persist_ir(job, final_state)
 
-    _maybe_auto_build_workflow(job)
+    # A re-upload into a workflow that already runs this document is an update,
+    # not a build: it raises a change set and the canvas is left alone until a
+    # reviewer approves. Only a first upload falls through to auto-build.
+    if not _maybe_raise_sop_review(job):
+        _maybe_auto_build_workflow(job)
 
     log.info(
         "Pipeline done  job=%s  processed=%s  errors=%s  llm_calls=%s  tokens_in=%s  tokens_out=%s",
@@ -212,6 +216,27 @@ def _maybe_persist_ir(job, final_state: dict) -> None:
         except Exception as exc:
             log.exception("persist_ir failed for job %s / content_hash %s: %s",
                           job.job_id, entry.get("content_hash"), exc)
+
+
+def _maybe_raise_sop_review(job) -> bool:
+    """Raise a review if this job updated a SOP the workflow already runs.
+
+    Returns True when the caller must NOT auto-build — the workflow is on an
+    earlier version of this document and any change now belongs to a reviewer,
+    not to the pipeline. Best-effort like the other post-ingestion hooks: a
+    failure here is logged and never fails the job, but it deliberately returns
+    True on error so a crash cannot fall through into rebuilding a live canvas.
+    """
+    try:
+        from sop_ingestion.services.ingestion_review import handle_finished_ingestion
+
+        outcome = handle_finished_ingestion(job)
+        if outcome["is_update"]:
+            log.info("sop review job=%s %s", job.job_id, outcome)
+        return bool(outcome["is_update"])
+    except Exception as exc:
+        log.exception("sop review failed for job %s: %s", job.job_id, exc)
+        return True
 
 
 def _maybe_auto_build_workflow(job) -> None:
