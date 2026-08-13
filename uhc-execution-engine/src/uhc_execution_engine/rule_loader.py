@@ -47,6 +47,21 @@ def _split_key(rule_key: str) -> tuple[str, list[str]]:
     return parts[0], parts[1:]
 
 
+def _persisted_rule_context(shape_props: dict, rule_key: str) -> str:
+    """Per-rule auditor context from ``Shape.properties.sop_rules[i].additional_context``.
+
+    The builder UI stores each rule's "Add context" text on the persisted
+    ``sop_rules`` entry (keyed by rule_key). Regular decision rules are hydrated
+    from the AuditDecision tables, which don't carry that field, so we look it up
+    from the shape's persisted rule list here and attach it to the engine rule
+    dict (custom rules already carry it). Empty when none is set — additive.
+    """
+    for r in (shape_props.get("sop_rules") or []):
+        if isinstance(r, dict) and r.get("key") == rule_key:
+            return str(r.get("additional_context") or "").strip()
+    return ""
+
+
 def _workbench_extra_context(workbench) -> str:
     """Auditor-provided free-form context attached to a workbench (SOP column).
 
@@ -272,6 +287,8 @@ def _materialise_custom_rules(workflow_id: str,
         manual_oos = bool(props.get("manual_out_of_scope"))
         manual_oos_keys = set(props.get("manual_oos_rule_keys") or [])
         manual_in_keys = set(props.get("manual_in_scope_rule_keys") or [])
+        manual_na = bool(props.get("manual_not_applicable"))
+        manual_na_keys = set(props.get("manual_na_rule_keys") or [])
 
         sg = shapes_by_id.get(sid)
         if sg is None:
@@ -298,6 +315,11 @@ def _materialise_custom_rules(workflow_id: str,
                     or raw.get("key") in manual_oos_keys
                     or bool(raw.get("manual_out_of_scope"))
                 ),
+            )
+            rd["manual_na"] = (not _forced_in) and (
+                manual_na
+                or raw.get("key") in manual_na_keys
+                or bool(raw.get("manual_not_applicable"))
             )
             if _forced_in:
                 rd["is_out_of_scope"] = False
@@ -428,6 +450,19 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
         rule_dict["manual_oos"] = (not _forced_in) and (
             bool(_shape_props.get("manual_out_of_scope"))
             or rb.rule_key in set(_shape_props.get("manual_oos_rule_keys") or [])
+        )
+        # Manual NOT-APPLICABLE marking (separate scope axis from OOS): whole
+        # node ``Shape.properties.manual_not_applicable`` or per-rule
+        # ``manual_na_rule_keys``. Force-in-scope wins over everything.
+        rule_dict["manual_na"] = (not _forced_in) and (
+            bool(_shape_props.get("manual_not_applicable"))
+            or rb.rule_key in set(_shape_props.get("manual_na_rule_keys") or [])
+        )
+        # Per-rule auditor context set in the builder UI ("Add context"). Custom
+        # rules already carry it; hydrate it here for regular decision rules so
+        # the engine actually injects it into this rule's eval prompt.
+        rule_dict["additional_context"] = _persisted_rule_context(
+            _shape_props, rb.rule_key
         )
         if _forced_in:
             rule_dict["is_out_of_scope"] = False

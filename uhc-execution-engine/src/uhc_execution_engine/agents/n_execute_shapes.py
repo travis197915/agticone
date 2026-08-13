@@ -200,6 +200,36 @@ def _is_choice_ladder(rules: list[dict]) -> bool:
     return False
 
 
+# A "process the claim" keystroke / system-action step (e.g. "press F3 to
+# process", "F4 to finalize / release the claim") is an INSTRUCTION to the
+# processor, not an audit determination — it has no Met/Not-Met to evaluate and
+# should surface as Not Applicable, never as a Met pass or a defect.
+# An explicit F3/F4 keystroke instruction (e.g. "(F3) Process the claim",
+# "press F4 to release"). Deliberately narrow: it requires the F3/F4 token so a
+# substantive audit rule that merely mentions "process the claim per guidelines"
+# is NOT swept up. The keystroke rows are the ones the SOP renders as processor
+# actions with no Met/Not-Met determination.
+_PROCESS_ACTION_RE = re.compile(
+    r"\(?\bf[34]\b\)?", re.IGNORECASE,
+)
+
+
+def _is_process_action(rule: dict) -> bool:
+    """True for an F3/F4 keystroke "process the claim" system-action step.
+
+    Conservative on two axes: (1) the ACTION must contain an explicit F3/F4
+    keystroke token, and (2) the rule must be non-adverse (no EOB codes, no
+    adverse disposition). A genuine "deny then process" finding is never
+    silently skipped."""
+    if rule.get("codes") or rule.get("eob_codes"):
+        return False
+    if (rule.get("decision_type") or "").upper() in _HALT_DECISION_TYPES:
+        return False
+    # Only the action carries the keystroke instruction; the condition may
+    # legitimately mention F-codes in other contexts.
+    return bool(_PROCESS_ACTION_RE.search(str(rule.get("action", ""))))
+
+
 _OON_RE = re.compile(r"\boon\b|out[ -]of[ -]network", re.IGNORECASE)
 
 
@@ -671,6 +701,17 @@ def execute_shapes(state: ExecutionState) -> dict:
                         step_no,
                     )
                     continue
+                # Auditor marked this rule/step NOT APPLICABLE in the builder UI:
+                # a non-scoring routing gate — never a finding, never a halt.
+                # Skipped in place (no LLM) so the rest of the SOP still runs
+                # independently. Purely UI-driven; nothing is hardcoded.
+                if rule.get("manual_na"):
+                    mark_skipped(
+                        [rule],
+                        "not-applicable: manually marked not applicable",
+                        step_no,
+                    )
+                    continue
                 # SOP scoped to other Lines of Business than this claim's: those
                 # rules are not in scope for this LOB — skip with NO LLM call.
                 if not _rule_in_lob_scope(rule):
@@ -678,6 +719,17 @@ def execute_shapes(state: ExecutionState) -> dict:
                         [rule],
                         f"out of scope: rule applies to LOB {rule.get('lob_scope')}, "
                         f"claim is {lob_label or lob_product}",
+                        step_no,
+                    )
+                    continue
+                # F3/F4 "process the claim" keystroke steps are processor
+                # instructions, not audit determinations -> Not Applicable, no
+                # LLM call. Guarded to non-adverse rules by _is_process_action.
+                if _is_process_action(rule):
+                    mark_skipped(
+                        [rule],
+                        "not-applicable: process/action step (system keystroke, "
+                        "no audit determination)",
                         step_no,
                     )
                     continue

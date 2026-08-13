@@ -126,12 +126,26 @@ def extract_bindings_from_properties(shape) -> None:
         for r in raw_rules
         if isinstance(r, dict) and r.get("key") and r.get("manual_in_scope")
     })
+    # Durable per-rule manual NOT-APPLICABLE set. A separate scope axis from OOS:
+    # the auditor marks a rule/step "not applicable" (a non-scoring routing gate)
+    # via ``sop_rules[i].manual_not_applicable``. Persisted as a set of rule_keys
+    # on the shape so it round-trips the binding save and drives both hydration
+    # (badge) and execution (deterministic skip). Nothing hardcoded — purely the
+    # UI toggle state.
+    manual_na_keys = sorted({
+        str(r.get("key"))
+        for r in raw_rules
+        if isinstance(r, dict) and r.get("key") and r.get("manual_not_applicable")
+    })
     changed = False
     if (props.get("manual_oos_rule_keys") or []) != manual_oos_keys:
         props["manual_oos_rule_keys"] = manual_oos_keys
         changed = True
     if (props.get("manual_in_scope_rule_keys") or []) != manual_in_keys:
         props["manual_in_scope_rule_keys"] = manual_in_keys
+        changed = True
+    if (props.get("manual_na_rule_keys") or []) != manual_na_keys:
+        props["manual_na_rule_keys"] = manual_na_keys
         changed = True
     if changed:
         shape.properties = props
@@ -345,6 +359,7 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
         # round-trips, and OR'd into the effective ``is_out_of_scope``.
         manual_keys = set(props.get("manual_oos_rule_keys") or [])
         manual_in_keys = set(props.get("manual_in_scope_rule_keys") or [])
+        manual_na_keys = set(props.get("manual_na_rule_keys") or [])
 
         def _binding_entry(row) -> dict:
             entry = dict(raw_by_key.get(row.rule_key) or {})
@@ -367,6 +382,7 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
                 "ordering":       row.ordering,
                 "manual_out_of_scope": is_manual,
                 "manual_in_scope": forced_in,
+                "manual_not_applicable": row.rule_key in manual_na_keys,
                 "is_out_of_scope": effective_oos,
                 "is_approved":    approval["is_approved"],
                 "approval_issue": approval["approval_issue"],
@@ -394,6 +410,7 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
                 forced_in = key in manual_in_keys
                 entry["manual_out_of_scope"] = is_manual
                 entry["manual_in_scope"] = forced_in
+                entry["manual_not_applicable"] = key in manual_na_keys
                 entry["is_out_of_scope"] = (
                     (bool(entry.get("is_out_of_scope")) or is_manual) and not forced_in
                 )

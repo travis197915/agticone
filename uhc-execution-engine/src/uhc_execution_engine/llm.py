@@ -305,6 +305,21 @@ def _parse_llm_payload(
             if isinstance(v, list):
                 data = v
                 break
+    # The model occasionally wraps the object in an outer key
+    # (e.g. {"result": {...}} / {"evaluation": {...}}). If the required keys
+    # are not present at the top level, unwrap the first nested dict that
+    # carries them — mirrors the list-unwrap above so a well-formed answer
+    # doesn't burn a retry on a schema mismatch.
+    if (
+        expected_type is dict
+        and required_keys
+        and isinstance(data, dict)
+        and not all(k in data for k in required_keys)
+    ):
+        for v in data.values():
+            if isinstance(v, dict) and all(k in v for k in required_keys):
+                data = v
+                break
     if not _validate(data, expected_type, required_keys):
         raise ValueError(
             f"Schema mismatch: expected {expected_type.__name__}"

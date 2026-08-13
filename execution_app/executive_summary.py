@@ -54,17 +54,29 @@ def _collect_steps(run) -> list[dict[str, Any]]:
     summary lines up 1:1 with what the auditor sees on the agents tab.
     """
     from .views import _agent_status_light, _build_summary_rollup
+    from . import trace_builder
 
     nodes, _outer = _build_summary_rollup(run)
     steps: list[dict[str, Any]] = []
     for node in nodes:
-        reasonings = [r for r in node.get("reasonings", []) if r][
-            :_MAX_REASONINGS_PER_STEP
-        ]
+        status = _agent_status_light(node)
+        # A step the auditor marked NOT APPLICABLE is a non-scoring gate — it never
+        # produced a finding and must never surface in the executive summary
+        # (headline / narrative / key findings / per-step line). Drop it entirely
+        # so its reasoning can't be synthesized into a bullet or sentence.
+        if status == trace_builder.NOT_APPLICABLE:
+            continue
+        # Even on a mixed node (some rules evaluated, some marked NOT APPLICABLE),
+        # drop the NA rules' own reasoning lines — a skip reason ("not-applicable:
+        # …") is never a finding and must not seed a summary bullet/sentence.
+        reasonings = [
+            r for r in node.get("reasonings", [])
+            if r and not r.lstrip().lower().startswith("not-applicable")
+        ][:_MAX_REASONINGS_PER_STEP]
         steps.append({
             "shape_id": node["shape_id"],
             "agent_name": node["shape_label"] or node["shape_id"],
-            "status": _agent_status_light(node),
+            "status": status,
             "decisions": list(node.get("matched_decisions") or []),
             "reasonings": reasonings,
         })

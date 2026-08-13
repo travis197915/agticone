@@ -326,6 +326,20 @@ DOMAIN GUIDANCE — PROVIDER SELECTION (apply before deciding `matched`)
    and matched) selects the 1st/2nd choice and is CLEAN — it is NOT a provider-
    selection defect. Only select a deny choice when the derived determination
    (per 1-3 above), not a face-value indicator, genuinely supports it.
+
+5. GROUP-MODEL SET MEMBERSHIP IS "OR". When a choice table is scoped to several
+   group models (e.g. "2A, 2I" or "2A/2I"), the claim's SINGLE group model
+   matching ANY one listed value satisfies membership. Do NOT require the claim
+   to match every listed model (it only ever has one).
+
+6. CONFIRMING A CORRECT OON DENIAL (do not false-negative it). When a group
+   claim is genuinely OON (derived per 1), its group model is 3B, the provider
+   is a group (`PRPR_ENTITY='G'`), the line was denied with an OON
+   provider-selection EOB (`CDML_DISALL_EXCD` in {FOF, FOD, FOE}) and nothing was
+   paid (`total_paid`=0), the deny choice IS correctly selected — set
+   matched=true and CONFIRM the existing denial (network_basis="provider_match").
+   This is a CLEAN confirmation of a correct system action, not a new defect and
+   not a false positive. Mirror the analogous FOE 2A/2I and FOD group-only cases.
 """
 
 
@@ -356,13 +370,19 @@ only by a member/dependent suffix and/or a plan/product prefix, e.g.:
   SBSB_ID 00112854   == image STAS00112854 (prefix + base)
 
 DECIDE `matched` like this:
+0. CHECK EVERY STORED FACETS ID LOCATION, not just SBSB_ID. Compare the image id
+   against ALL subscriber-id fields present in the tool results — `SBSB_ID`,
+   `CLMF_INPUT_SBSB_ID`, `MEME_HEALTH_ID` (the Facets Standard Unique Health ID),
+   and any duplicate `SubscriberID` field. A match against ANY of them is a Met.
 1. Normalize both values — uppercase and strip all non-alphanumerics (and ignore
    leading zeros for purely numeric ids).
-2. If the normalized SBSB_ID equals, or is a contiguous substring of, the
-   normalized image id (or their digit cores contain one another), they are the
-   SAME member -> Subscriber ID is MATCHED (status="Met"). A trailing member
-   suffix and/or a leading plan/product prefix is NOT a discrepancy.
-3. If they do NOT relate by base+suffix/prefix, the image id may still be a valid
+2. If the normalized SBSB_ID (or MEME_HEALTH_ID) equals, or is a contiguous
+   substring of, the normalized image id (or their digit cores contain one
+   another), they are the SAME member -> Subscriber ID is MATCHED (status="Met").
+   A trailing member suffix and/or a leading plan/product prefix is NOT a
+   discrepancy.
+3. If they do NOT relate by base+suffix/prefix to ANY stored location, the image
+   id may still be a valid
    alternate identifier recorded in FACETS under `Transfer Subscriber Family >
    Subscriber > Additional ID` — a field NOT present in these tool results. In
    that case you CANNOT confirm or refute the match from the available data: set
@@ -371,6 +391,137 @@ DECIDE `matched` like this:
    SBSB_ID != image id.
 4. Never treat a Subscriber-ID mismatch as a claim defect on its own — this is a
    verification/reconciliation check, not an adverse determination.
+"""
+
+
+# ── Domain guidance (timely filing) ──────────────────────────────────────────
+# The Timely-Filing SOP (OBH Facets) flattens into ~18 steps whose deterministic
+# intent is lost in the IR: the Step-1 TF0/TF1 gate is a *scope* gate (not a
+# hard stop), "history" must exclude self-adjustments / self-matches / later
+# claims, a within-limit calculation is CLEAN (never a deny), and group/plan
+# names must match on word boundaries (MEDICA != MEDICARE/MEDICAID, GE !=
+# ADVANTAGE). Without this the evaluator (a) stops the whole SOP at Step 1 on
+# non-TF0/TF1 claims, (b) counts a self-adjustment as prior filing history, (c)
+# denies "no history" without comparing days vs the limit, and (d) false-matches
+# group keywords by substring. This block re-injects that intent, scoped to
+# timely-filing rules. Policy guidance only — it never dictates a verdict.
+_TF_SIGNALS = (
+    "timely filing", "tf0", "tf1", "filing limit", "filing deadline",
+    "received date", "received within", "days to file", "submission date",
+    "within the", "beyond the", "365-day", "365 day", "claim history",
+)
+
+_TF_GUIDANCE = """\
+DOMAIN GUIDANCE — TIMELY FILING (apply before deciding `matched`)
+----------------------------------------------------------------
+1. STEP-1 GATE IS SCOPE, NOT A STOP. "Is your claim/line denying for TF1 or
+   TF0?" only decides whether the TF-denial-review branch APPLIES. If the claim
+   is NOT denying for a TF0/TF1 EOB code, set applicable=false for the Step-1
+   gate rows (they are Not Applicable) and CONTINUE evaluating the remaining
+   in-scope timely-filing steps. Do NOT halt the whole SOP at Step 1, and do NOT
+   append TF0/TF1 disclaimer boilerplate to `reasoning`.
+
+2. WHAT COUNTS AS FILING "HISTORY". A prior claim is valid filing history only
+   if it is a genuinely DISTINCT, EARLIER claim for the same member/DOS/provider.
+   EXCLUDE from history: (a) the audited claim matching ITSELF (same base
+   CLCL_ID / claim number); (b) self-adjustment / replacement / void rows of the
+   same claim; (c) candidates whose claim number or received/created date is
+   LATER than the audited claim. If the only "match" is a self-adjustment or a
+   self-match, treat the claim as having NO history.
+
+3. NO-HISTORY IS NOT AUTOMATICALLY LATE. When there is no valid prior history,
+   do NOT conclude untimely or deny on "no history" alone. Compute the elapsed
+   days from the service/received date and compare against the plan's filing
+   limit; conclude untimely ONLY when days > limit.
+
+4. WITHIN-LIMIT IS CLEAN. If the received date is within the filing limit, the
+   claim WAS filed timely — this is a clean, non-adverse finding. A row that
+   establishes "received N days ... WITHIN the L-day limit" must NOT carry a
+   DENY/STOP/REFER/PEND disposition. If such a claim was nonetheless denied for
+   TF0/TF1, the timely-filing calculation is within-limit and the denial is the
+   defect to report — not the calculation.
+
+5. GROUP / PLAN NAME MATCHING (step 4 group tables). Match plan/group keywords on
+   WHOLE-WORD boundaries, never as substrings: "MEDICA" must NOT match inside
+   "MEDICARE" or "MEDICAID"; "GE" must NOT match inside "ADVANTAGE". Consider the
+   group name `GRGR_NAME` in addition to `PLDS_DESC` when identifying the group
+   (e.g. Motion Picture Industry / MPI is carried on GRGR_NAME).
+"""
+
+
+# ── Domain guidance (coverage / covered-benefit) ─────────────────────────────
+# The Access-Covered-Benefit SOP checks the claim's procedure codes against the
+# `cbd_coverage` grid. The grid is keyed by BENEFIT CATEGORY (`descCode` /
+# `descName`, e.g. "Office/Outpatient Visit", "Psychotherapy"), NOT by raw CPT.
+# A naive lookup that expects the CPT to appear literally as a `descCode` finds
+# nothing and reports the code "not found" even when the sub-rule statement
+# already establishes it is Covered. This block tells the evaluator to map the
+# CPT to its benefit category first. Policy guidance only — never a verdict.
+_COVERAGE_SIGNALS = (
+    "covered benefit", "cbd", "coverage", "desccode", "benefit category",
+    "is the code covered", "procedure code covered", "cbd_coverage",
+    "covered benefit document", "access covered benefit",
+)
+
+_COVERAGE_GUIDANCE = """\
+DOMAIN GUIDANCE — COVERAGE / COVERED BENEFIT (apply before deciding `matched`)
+-----------------------------------------------------------------------------
+1. THE COVERAGE GRID IS KEYED BY BENEFIT CATEGORY, NOT CPT. `cbd_coverage` rows
+   carry a `descCode`/`descName` that names a benefit CATEGORY (e.g.
+   "Office/Outpatient Visit", "Psychotherapy", "Behavioral Health"), not the raw
+   CPT/HCPCS on the claim line. Map the claim's procedure code to its benefit
+   category before reading coverage, e.g. E&M office visits 99202-99215 ->
+   Office/Outpatient Visit; psychotherapy 90832-90838 (incl. add-on 90833) ->
+   Psychotherapy / Behavioral Health.
+2. "NOT FOUND" vs "NOT COVERED" vs "COVERED". Only say a code is NOT FOUND when
+   NEITHER the CPT NOR its benefit category appears anywhere in the plan grid.
+   Say NOT COVERED only when the mapped benefit-category row's `covered` = No.
+   Otherwise the code is COVERED. A CPT that simply isn't a literal `descCode` is
+   NOT "not found".
+3. DO NOT CONTRADICT AN ESTABLISHED DETERMINATION. If the rule `statement` /
+   `action` already says a code is Covered (or a prior sub-rule established it),
+   do NOT then describe that same code as "not found" in `reasoning`.
+"""
+
+
+# ── Domain guidance (duplicate claim) ────────────────────────────────────────
+# The Duplicate SOP flattens into a Step 1-8 walk whose deterministic intent is
+# lost: a Box-12A frequency 7/8 (corrected/replacement/void) claim is OUT OF
+# SCOPE for duplicate auditing (route to manual review, not a duplicate defect);
+# "history" must exclude self-adjustments / self-matches (same as timely
+# filing); and when a claim is ALREADY denying as a duplicate via the Facets
+# ultra-blue CDD edit (an EOB on facets_get_line_details `CDML_DISALL_EXCD`), the
+# Step 7/8 "confirm the CDD duplicate" row is a SYSTEM confirmation of an
+# existing system action, NOT a new adverse determination — it is CLEAN. This
+# block re-injects that intent, scoped to duplicate rules. Policy guidance only.
+_DUP_SIGNALS = (
+    "duplicate", "cdd", "corrected claim", "void", "replacement claim",
+    "frequency 7", "frequency 8", "bill type", "box 12a", "resubmission",
+    "cdml_disall_excd", "ultra-blue", "ultra blue",
+)
+
+_DUP_GUIDANCE = """\
+DOMAIN GUIDANCE — DUPLICATE CLAIM (apply before deciding `matched`)
+------------------------------------------------------------------
+1. CORRECTED / VOID (freq 7 or 8) IS OUT OF SCOPE. If the claim's Box-12A
+   submission frequency / bill-type is 7 (replacement/corrected) or 8 (void),
+   the duplicate check cannot be confirmed or ruled out from claim data alone —
+   set status="Inconclusive" (manual review) and route the duplicate branch out
+   of scope. Do NOT deny it as a duplicate and do NOT clear it CLEAN by default.
+
+2. WHAT COUNTS AS DUPLICATE "HISTORY". A history/candidate claim is a real
+   duplicate only if it is a DISTINCT claim (different base CLCL_ID / claim
+   number). EXCLUDE the audited claim matching ITSELF and any self-adjustment /
+   replacement / void row of the same claim. If the only "match" the duplicate
+   tool returns is a self-match or self-adjustment, there is NO duplicate.
+
+3. CDD SYSTEM DENIAL IS NOT A NEW DEFECT. When the claim is already denying as a
+   duplicate through the Facets ultra-blue CDD edit — i.e. `facets_get_line_details`
+   shows the duplicate EOB on the line (`CDML_DISALL_EXCD`) — the Step 7/8 rule
+   is CONFIRMING an existing SYSTEM action, not applying a new denial. Report it
+   with decision_type="SYSTEM" (non-adverse); the audit outcome is CLEAN (the
+   system correctly denied the duplicate). Only a duplicate the auditor must act
+   on (unconfirmed / needs manual dedup) is adverse.
 """
 
 
@@ -465,6 +616,19 @@ def _domain_context(rule: dict[str, Any]) -> str:
     # single, distinctively-worded rule so one hit is enough).
     if any(s in blob for s in _SUBSCRIBER_SIGNALS):
         parts.append(_SUBSCRIBER_GUIDANCE)
+    # Timely filing: the SOP is distinctively worded (TF0/TF1, filing limit,
+    # received/within/beyond). Require >=2 signals so an incidental "received
+    # date" mention on an unrelated rule doesn't pull in the whole block.
+    if sum(1 for s in _TF_SIGNALS if s in blob) >= 2:
+        parts.append(_TF_GUIDANCE)
+    # Duplicate claim: distinctive vocabulary (duplicate / CDD / corrected /
+    # freq 7|8 / CDML_DISALL_EXCD). Require >=2 signals so a stray "duplicate"
+    # mention elsewhere doesn't inject the whole block.
+    if sum(1 for s in _DUP_SIGNALS if s in blob) >= 2:
+        parts.append(_DUP_GUIDANCE)
+    # Coverage / covered-benefit: the check maps claim CPTs against the CBD grid.
+    if sum(1 for s in _COVERAGE_SIGNALS if s in blob) >= 2:
+        parts.append(_COVERAGE_GUIDANCE)
     return ("\n" + "\n".join(parts)) if parts else ""
 
 
@@ -483,6 +647,35 @@ def _workbench_context_section(rule: dict[str, Any]) -> str:
     return (
         "\nSOP CONTEXT (auditor-provided guidance for THIS SOP; use it to "
         "interpret the rule and the claim correctly)\n"
+        "------------------------------------------------------------------"
+        "----------------------------------------\n"
+        f"{ctx}\n"
+    )
+
+
+def _rule_context_section(rule: dict[str, Any]) -> str:
+    """Auditor-authored per-RULE context, injected verbatim for THIS rule only.
+
+    Sourced from ``sop_rules[i].additional_context`` (the "Add context" dialog in
+    the builder UI) and attached by ``rule_loader``. Complements the per-SOP
+    ``sop_extra_context``: this is scoped to a single rule/sub-rule so an auditor
+    can steer one step (e.g. "this step is not applicable unless the claim is a
+    TF1/TF0 denial") without touching the rest of the SOP. Purely additive
+    interpretive guidance — it never dictates the verdict. Empty for rules with
+    no context, so the prompt is unchanged.
+    """
+    ctx = str(rule.get("additional_context") or "").strip()
+    if not ctx:
+        return ""
+    # Avoid double-injection: when the per-rule context was materialized from the
+    # SOP-level context (same text), it is already rendered by
+    # ``_workbench_context_section`` — skip the duplicate here.
+    sop_ctx = str(rule.get("sop_extra_context") or "").strip()
+    if sop_ctx and (ctx == sop_ctx or ctx in sop_ctx):
+        return ""
+    return (
+        "\nRULE CONTEXT (auditor-provided guidance for THIS specific rule; use it "
+        "to decide applicability and matching correctly)\n"
         "------------------------------------------------------------------"
         "----------------------------------------\n"
         f"{ctx}\n"
@@ -585,6 +778,9 @@ def evaluate_one_rule(cfg: EngineConfig, *, rule: dict[str, Any],
     # Auditor-authored per-SOP context from the builder UI (additive, layered on
     # top of any hardcoded domain guidance above).
     sop_context_section = _workbench_context_section(rule)
+    # Auditor-authored per-RULE context ("Add context" in the builder UI). Scoped
+    # to this one rule; additive on top of the SOP-level context above.
+    rule_context_section = _rule_context_section(rule)
     # Verdicts of earlier rules in this SOP (sequential evaluation) so this rule
     # can honor a prioritized choice ladder.
     prior_section = _prior_findings_section(prior_findings)
@@ -610,7 +806,7 @@ section:        {rule.get('section_label', '')}
 decision_type:  {rule.get('decision_type', '')}
 condition:      {rule.get('condition', '')}
 action:         {rule.get('action', '')}
-{mapped_section}{lob_section}{routing_section}{domain_section}{sop_context_section}{prior_section}
+{mapped_section}{lob_section}{routing_section}{domain_section}{sop_context_section}{rule_context_section}{prior_section}
 TOOL RESULTS (already fetched on your behalf; may be empty)
 -----------------------------------------------------------
 {json.dumps(tool_context, default=str, indent=2)}"""
