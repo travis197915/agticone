@@ -127,6 +127,29 @@ class RuleExecutionRun(_UUIDPK):
     total_completion_tokens = models.BigIntegerField(default=0)
     total_cost_usd = models.DecimalField(max_digits=10, decimal_places=4, default=0)
     cost_breakdown = models.JSONField(default=dict, blank=True)
+    # Version snapshot captured at bindings-load time (builder.Workflow.version /
+    # builder.Workbench.version) so a claim record shows exactly which canvas
+    # configuration it ran against, even after later re-ingests move the canvas
+    # forward. Null = run predates this feature. ``workbench_versions`` maps
+    # {"<workbench_id>": {"node_key", "version", "sop_id", "sop_title"}} for
+    # every Workbench actually bound at load time.
+    workflow_version = models.PositiveIntegerField(null=True, blank=True)
+    workbench_versions = models.JSONField(default=dict, blank=True)
+    # The exact, immutable WorkflowVersion snapshot whose Workbench
+    # composition was actually loaded for this run (see
+    # builder.workflow_versioning) — resolved by matching the exact set of
+    # Workbench ids bound at load time against a WorkflowVersion's slots, not
+    # by "whichever is latest" (see n02_load_bindings.py), so a concurrent
+    # ingestion landing mid-run can never cause this to point at a
+    # composition different from what was actually executed. PROTECT: a
+    # WorkflowVersion referenced by any run can never be deleted. Null for
+    # runs that predate this feature, or where no exact match could be
+    # resolved (never guessed) — workflow_version/workbench_versions above
+    # remain the fields for those older/unresolved runs.
+    workflow_version_snapshot = models.ForeignKey(
+        "builder.WorkflowVersion", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="execution_runs",
+    )
 
     class Meta:
         db_table = "execution_rule_run"

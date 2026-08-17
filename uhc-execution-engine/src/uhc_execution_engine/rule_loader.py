@@ -245,7 +245,8 @@ def _materialise_custom_rules(workflow_id: str,
 
     shapes = (
         Shape.objects
-        .filter(workbench__work_area__workflow_id=workflow_id)
+        .filter(workbench__work_area__workflow_id=workflow_id,
+                workbench__is_current=True)
         .select_related("workbench")
         .order_by("workbench__order", "order")
     )
@@ -280,6 +281,7 @@ def _materialise_custom_rules(workflow_id: str,
                 "shape_id":      sid,
                 "shape_label":   shape.label or "",
                 "workbench":     {"name": wb.name or "", "order": wb.order},
+                "workbench_id":  str(wb.id),
                 "shape_order":   shape.order,
                 "rules":         [],
                 "tool_bindings": [],
@@ -322,6 +324,7 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
                     "shape_id":      str,
                     "shape_label":   str,
                     "workbench":     {"name": str, "order": int},
+                    "workbench_id":  str,
                     "shape_order":   int,
                     "rules":         [rule_dict, ...],     # preconditions + decisions on this shape
                     "tool_bindings": [tool_binding_dict, ...],
@@ -337,13 +340,15 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
 
     rule_bindings = list(
         NodeRuleBinding.objects
-        .filter(shape__workbench__work_area__workflow_id=workflow_id)
+        .filter(shape__workbench__work_area__workflow_id=workflow_id,
+                shape__workbench__is_current=True)
         .select_related("sop", "shape", "shape__workbench")
         .order_by("shape__workbench__order", "shape__order", "ordering", "created_at")
     )
     tool_bindings = list(
         NodeToolBinding.objects
-        .filter(shape__workbench__work_area__workflow_id=workflow_id)
+        .filter(shape__workbench__work_area__workflow_id=workflow_id,
+                shape__workbench__is_current=True)
         .select_related("tool", "shape", "rule_binding")
         .order_by("shape__workbench__order", "shape__order", "ordering", "created_at")
     )
@@ -448,6 +453,7 @@ def load_workflow_bindings(workflow_id: str) -> dict[str, Any]:
                 "shape_id":      shape_id_str,
                 "shape_label":   shape.label or "",
                 "workbench":     {"name": workbench.name or "", "order": workbench.order},
+                "workbench_id":  str(workbench.id),
                 "shape_order":   shape.order,
                 "rules":         [],
                 "tool_bindings": [],

@@ -37,6 +37,7 @@ from .models import (
     ShapeDefinition,
     Workbench,
     Workflow,
+    WorkflowVersion,
 )
 
 
@@ -89,6 +90,7 @@ from .serializers import (
     ShapeDefinitionSerializer,
     WorkflowGraphSerializer,
     WorkflowSerializer,
+    WorkflowVersionSerializer,
 )
 from .services import WorkflowGraphWriter
 from .attachments import attach_to_workflow
@@ -266,6 +268,37 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             context["oos_keys"] = None
         return Response(WorkflowGraphSerializer(workflow, context=context).data)
 
+    # ── /versions — historical composition snapshots (read-only) ───────────
+
+    @action(detail=True, methods=["get"], url_path="versions")
+    def versions(self, request, pk=None):
+        """``GET /api/builder/workflows/<id>/versions/`` — every
+        WorkflowVersion snapshot for this workflow, newest first.
+
+        Read exclusively from WorkflowVersion/WorkflowVersionWorkbench — see
+        builder.workflow_versioning. Historical only; the live canvas is
+        always ``GET .../graph``.
+        """
+        workflow = self.get_object()
+        qs = (
+            WorkflowVersion.objects
+            .filter(workflow=workflow)
+            .order_by("-version_number")
+            .prefetch_related("slots")
+        )
+        return Response(WorkflowVersionSerializer(qs, many=True).data)
+
+    @action(detail=True, methods=["get"], url_path=r"versions/(?P<version_number>\d+)")
+    def version_detail(self, request, pk=None, version_number=None):
+        """``GET /api/builder/workflows/<id>/versions/<version_number>/`` —
+        one historical composition snapshot in detail."""
+        workflow = self.get_object()
+        snapshot = get_object_or_404(
+            WorkflowVersion.objects.prefetch_related("slots"),
+            workflow=workflow, version_number=int(version_number),
+        )
+        return Response(WorkflowVersionSerializer(snapshot).data)
+
     # ── /sop-order — reorder SOP workbench columns ──────────────────────────
 
     @action(detail=True, methods=["get", "put"], url_path="sop-order")
@@ -291,7 +324,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
     def _sop_order_payload(workflow) -> list[dict]:
         benches = (
             Workbench.objects
-            .filter(work_area__workflow=workflow)
+            .filter(work_area__workflow=workflow, is_current=True)
             .order_by("work_area__order", "order", "created_at")
         )
         out: list[dict] = []
@@ -306,6 +339,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
                 "order":        wb.order,
                 "shape_count":  wb.shapes.count(),
                 "extra_context": cfg.get("extra_context") or "",
+                "version":      wb.version,
             })
         return out
 
@@ -321,7 +355,8 @@ class WorkflowViewSet(viewsets.ModelViewSet):
 
         benches = {
             str(wb.id): wb
-            for wb in Workbench.objects.filter(work_area__workflow=workflow)
+            for wb in Workbench.objects.filter(
+                work_area__workflow=workflow, is_current=True)
         }
         unknown = [wb_id for wb_id in requested if wb_id not in benches]
         if unknown:
@@ -436,7 +471,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         """SOP columns (workbenches) of a workflow, excluding the control bench."""
         return list(
             Workbench.objects
-            .filter(work_area__workflow=workflow)
+            .filter(work_area__workflow=workflow, is_current=True)
             .exclude(node_key=self._CONTROL_NODE_KEY)
             .order_by("work_area__order", "order", "created_at")
         )
@@ -557,10 +592,19 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             )
         except Exception:
             pass
+        # Superseded Workbenches (is_current=False) are kept in the DB for
+        # history/claim traceability (see builder.workbench_versioning) but
+        # must not appear on the live canvas — filtered out here rather than
+        # via the `__` shorthand so the filter applies mid-chain.
+        workbenches_qs = (
+            Workbench.objects.filter(is_current=True)
+            .order_by("order")
+            .prefetch_related(Prefetch("shapes", queryset=shapes_qs))
+        )
         return (
             Workflow.objects
             .prefetch_related(
-                Prefetch("work_areas__workbenches__shapes", queryset=shapes_qs),
+                Prefetch("work_areas__workbenches", queryset=workbenches_qs),
             )
             .get(pk=pk)
         )
@@ -1719,6 +1763,27 @@ class WorkbenchViewSet(viewsets.ModelViewSet):
         from .serializers import _NestedWorkbenchSerializer
         return _NestedWorkbenchSerializer
 
+    @staticmethod
+    def _reject_if_historical(wb: Workbench) -> None:
+        """A superseded (``is_current=False``) Workbench is frozen history —
+        it may be referenced by a WorkflowVersion snapshot, so no field on it
+        is editable through this API, not just version/config/node_key
+        (those are already write-once at the model layer regardless)."""
+        if not wb.is_current:
+            raise drf_serializers.ValidationError(
+                "This Workbench is a superseded historical version "
+                "(is_current=False) and cannot be edited. Edit the current "
+                "version of this SOP instead."
+            )
+
+    def update(self, request, *args, **kwargs):
+        self._reject_if_historical(self.get_object())
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        self._reject_if_historical(self.get_object())
+        return super().partial_update(request, *args, **kwargs)
+
     @action(detail=True, methods=["get", "put", "patch"], url_path="context")
     def context(self, request, pk=None):
         """GET/PUT the per-SOP **extra context** for one workbench.
@@ -1731,6 +1796,7 @@ class WorkbenchViewSet(viewsets.ModelViewSet):
         """
         wb = self.get_object()
         if request.method in ("PUT", "PATCH"):
+            self._reject_if_historical(wb)
             text = request.data.get("extra_context", "")
             if not isinstance(text, str):
                 raise drf_serializers.ValidationError(

@@ -26,6 +26,8 @@ from .models import (
     WorkArea,
     Workbench,
     Workflow,
+    WorkflowVersion,
+    WorkflowVersionWorkbench,
 )
 
 
@@ -198,14 +200,14 @@ class WorkflowSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "slug", "description", "is_active",
             "metadata", "owner_id", "owner_email",
-            "created_at", "updated_at",
+            "created_at", "updated_at", "version",
             # write-only
             "sop_urls", "runtime_agents", "auto_build_from_sop",
             # read-only
             "sops", "attached_agents",
         ]
         read_only_fields = ["id", "slug", "owner_id", "owner_email",
-                            "created_at", "updated_at"]
+                            "created_at", "updated_at", "version"]
 
     def get_sops(self, obj: Workflow):
         jobs = obj.ingestion_jobs.all().order_by("-created_at")
@@ -268,6 +270,20 @@ class _NestedWorkbenchSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(required=False)
     client_id = serializers.CharField(required=False, write_only=True, allow_null=True)
     shapes = _NestedShapeSerializer(many=True, required=False)
+    # Content version of this Workbench slot (see builder.workbench_versioning).
+    # Read-only: bumped only by sync_workflow_from_job on a real content change,
+    # never by a canvas save.
+    version = serializers.IntegerField(read_only=True)
+    is_current = serializers.BooleanField(read_only=True)
+    # Write-once at the model layer (Workbench.save() raises on any attempt
+    # to change these post-creation — see builder.models.Workbench) — also
+    # declared read_only here so a client PATCH/PUT through WorkbenchViewSet
+    # gets a clean "field ignored" instead of a 500 from that model guard.
+    # WorkflowGraphWriter (builder/services.py, used by PUT .../graph) bypasses
+    # serializers entirely for the raw-dict bulk save path; the model guard is
+    # what protects that path.
+    config = serializers.JSONField(read_only=True)
+    node_key = serializers.CharField(read_only=True)
 
     class Meta:
         model = Workbench
@@ -275,6 +291,7 @@ class _NestedWorkbenchSerializer(serializers.ModelSerializer):
             "id", "client_id",
             "name", "description", "node_key", "kind", "config", "order",
             "position_x", "position_y", "width", "height", "style",
+            "version", "is_current",
             "shapes",
         ]
 
@@ -325,12 +342,15 @@ class WorkflowGraphSerializer(serializers.ModelSerializer):
     sops            = serializers.SerializerMethodField(read_only=True)
     attached_agents = serializers.SerializerMethodField(read_only=True)
     sop_compliance  = serializers.SerializerMethodField(read_only=True)
+    # Bumped whenever any Workbench under this workflow gets a content version
+    # bump — see builder.sop_autobuild.sync_workflow_from_job.
+    version         = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = Workflow
         fields = [
             "id", "name", "slug", "description", "is_active",
-            "metadata", "created_at", "updated_at",
+            "metadata", "created_at", "updated_at", "version",
             "work_areas", "connections",
             "sops", "attached_agents", "sop_compliance",
         ]
@@ -365,3 +385,30 @@ class WorkflowGraphSerializer(serializers.ModelSerializer):
             }
             for a in agents
         ]
+
+
+# ── Workflow version history (read-only) ──────────────────────────────────
+# Historical composition snapshots — see builder.workflow_versioning. Every
+# field here is read directly off WorkflowVersionWorkbench, never re-derived
+# from live Workbench/AuditSop state (that table's columns are the
+# authoritative record of what a given workflow version actually was).
+
+
+class WorkflowVersionWorkbenchSerializer(serializers.ModelSerializer):
+    workbench_id = serializers.UUIDField(source="workbench.id", read_only=True)
+
+    class Meta:
+        model = WorkflowVersionWorkbench
+        fields = [
+            "node_key", "order", "sop_title", "audit_sop_id",
+            "sop_version_number", "workbench_id", "workbench_version",
+        ]
+
+
+class WorkflowVersionSerializer(serializers.ModelSerializer):
+    sops = WorkflowVersionWorkbenchSerializer(source="slots", many=True, read_only=True)
+    workflow_version = serializers.IntegerField(source="version_number", read_only=True)
+
+    class Meta:
+        model = WorkflowVersion
+        fields = ["workflow_version", "created_at", "reason", "sops"]

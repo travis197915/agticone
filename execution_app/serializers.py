@@ -175,6 +175,14 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
     htl_reviewer = serializers.SerializerMethodField()
     original_auditor = serializers.SerializerMethodField()
     field_history = serializers.SerializerMethodField()
+    # The exact historical WorkflowVersion snapshot this run executed
+    # against (builder.workflow_versioning) — null for runs that predate
+    # this feature or where no exact composition match could be resolved.
+    # workflow_version/workbench_versions above are kept for backward
+    # compatibility; this nested object is the authoritative, queryable
+    # historical record ("Workflow v4: SOP A doc v3/canvas v3, SOP B doc
+    # v2/canvas v2").
+    workflow_version_snapshot = serializers.SerializerMethodField()
 
     class Meta:
         model = RuleExecutionRun
@@ -184,7 +192,15 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
                   "claim_lob", "error_message", "review_status", "review_feedback",
                   "auditor_status", "review_started_at", "reviewed_at",
                   "htl_reviewer", "original_auditor", "field_history",
+                  "workflow_version", "workbench_versions",
+                  "workflow_version_snapshot",
                   "evaluations", "tool_invocations"]
+
+    def get_workflow_version_snapshot(self, run: RuleExecutionRun):
+        if run.workflow_version_snapshot_id is None:
+            return None
+        from builder.serializers import WorkflowVersionSerializer
+        return WorkflowVersionSerializer(run.workflow_version_snapshot).data
 
     def _reviewer_names(self, run: RuleExecutionRun) -> dict[str, str]:
         cached = getattr(self, "_reviewer_names_cache", None)

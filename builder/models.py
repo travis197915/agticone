@@ -60,6 +60,11 @@ class Workflow(_UUIDPK, _Timestamps):
     # system lives in a different service.
     owner_id = models.CharField(max_length=64, blank=True, default="")
     owner_email = models.EmailField(blank=True, default="")
+    # Bumped whenever any Workbench under this workflow gets a content version
+    # bump (see builder.sop_autobuild.sync_workflow_from_job). Independent of
+    # AuditSop.version_number — lets a claim run record "which configuration of
+    # this workflow" it executed against.
+    version = models.PositiveIntegerField(default=1)
 
     class Meta:
         db_table = "builder_workflow"
@@ -89,17 +94,73 @@ class WorkArea(_UUIDPK, _Timestamps):
         indexes = [models.Index(fields=["workflow", "order"])]
 
 
+class WorkbenchImmutableFieldError(ValueError):
+    """Raised when code tries to change version/node_key, or one of
+    config's identity sub-keys, on an existing Workbench row after creation.
+
+    These are write-once by design (see builder.workflow_versioning): every
+    legitimate content change creates a brand-new Workbench row instead, so a
+    historical WorkflowVersionWorkbench snapshot can safely hold a plain FK
+    to a Workbench row and trust it never changes underneath it. This
+    exception is the enforcement of that invariant — see WorkbenchQuerySet.update()
+    and Workbench.save() below, which are the two places a violation is caught
+    (queryset bulk update and instance save respectively; neither alone would
+    catch every path, which is why both exist).
+    """
+
+
+# Only these config sub-keys carry version/identity meaning (read by
+# builder.workbench_versioning.find_matching_workbench/content_unchanged and
+# by the WorkflowVersionWorkbench snapshot). Other keys — notably
+# 'extra_context', edited in place via WorkbenchViewSet.context — are
+# ordinary mutable data and are deliberately NOT protected.
+_WORKBENCH_CONFIG_IDENTITY_KEYS = ("sop_id", "sop_title", "content_hash",
+                                   "source_url", "yaml_ref")
+
+
+class WorkbenchQuerySet(models.QuerySet):
+    _PROTECTED_FIELDS = frozenset({"version", "node_key"})
+
+    def update(self, **kwargs):
+        touched = self._PROTECTED_FIELDS & set(kwargs)
+        if touched:
+            raise WorkbenchImmutableFieldError(
+                f"Workbench.{', '.join(sorted(touched))} cannot be changed via "
+                "a bulk update() — these fields are write-once once a row is "
+                "created. Create a new Workbench row for the new content "
+                "instead (see builder.workflow_versioning)."
+            )
+        if "config" in kwargs:
+            raise WorkbenchImmutableFieldError(
+                "Workbench.config cannot be changed via a bulk update() — "
+                "its identity sub-keys "
+                f"({', '.join(_WORKBENCH_CONFIG_IDENTITY_KEYS)}) are write-once. "
+                "Update via a model instance (Workbench.save() enforces the "
+                "same rule per sub-key) or create a new Workbench row."
+            )
+        return super().update(**kwargs)
+
+
 class Workbench(_UUIDPK, _Timestamps):
+    _PROTECTED_FIELDS = ("version", "node_key")
+
     work_area = models.ForeignKey(
         WorkArea, on_delete=models.CASCADE, related_name="workbenches",
     )
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True, default="")
-    # Stable per-workflow handle — lets edges reference fresh shapes by key.
+    # Stable per-workflow handle — lets edges reference fresh shapes by key,
+    # and identifies the "slot" a Workbench belongs to across content versions
+    # (see builder.workbench_versioning). Old and new versions of the same slot
+    # legitimately share this value, so it is intentionally not unique.
+    # Write-once (see Workbench.save()/WorkbenchQuerySet.update() below).
     node_key = models.CharField(max_length=128, blank=True, default="", db_index=True)
     # Free-form classification (e.g. "Eligibility", "Adjudication") — drives
     # filtering / sub-palette decisions in the UI.
     kind = models.CharField(max_length=64, blank=True, default="")
+    # Identity sub-keys (_WORKBENCH_CONFIG_IDENTITY_KEYS) are write-once (see
+    # Workbench.save()/WorkbenchQuerySet.update() below); other keys (e.g.
+    # 'extra_context') remain freely mutable in place.
     config = models.JSONField(default=dict, blank=True)
     order = models.PositiveIntegerField(default=0)
     position_x = models.FloatField(default=0)
@@ -107,6 +168,19 @@ class Workbench(_UUIDPK, _Timestamps):
     width = models.FloatField(default=160)
     height = models.FloatField(default=80)
     style = models.JSONField(default=dict, blank=True)
+    # Content version of the SOP bound to this Workbench slot. Bumped only when
+    # the ingested SOP content actually changes (see
+    # builder.workbench_versioning.content_unchanged); an unchanged re-ingest
+    # leaves this untouched. Independent of AuditSop.version_number. A content
+    # change always creates a NEW Workbench row (never bumped on the existing
+    # row) — write-once (see Workbench.save()/WorkbenchQuerySet.update() below).
+    version = models.PositiveIntegerField(default=1)
+    # False once a new version of this slot has been appended — the row (and
+    # its Shapes/NodeRuleBindings) is preserved for history/claim traceability
+    # rather than deleted, but is excluded from the live canvas and execution.
+    is_current = models.BooleanField(default=True, db_index=True)
+
+    objects = WorkbenchQuerySet.as_manager()
 
     class Meta:
         db_table = "builder_workbench"
@@ -114,6 +188,128 @@ class Workbench(_UUIDPK, _Timestamps):
         indexes = [
             models.Index(fields=["work_area", "order"]),
             models.Index(fields=["kind"]),
+            models.Index(fields=["node_key", "is_current"]),
+        ]
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        instance._loaded_protected = {
+            f: getattr(instance, f) for f in cls._PROTECTED_FIELDS
+            if f in field_names
+        }
+        if "config" in field_names:
+            cfg = instance.config or {}
+            instance._loaded_config_identity = {
+                k: cfg.get(k) for k in _WORKBENCH_CONFIG_IDENTITY_KEYS
+            }
+        return instance
+
+    def save(self, *args, **kwargs):
+        loaded = getattr(self, "_loaded_protected", None)
+        if loaded is not None:
+            for field, prior_value in loaded.items():
+                if getattr(self, field) != prior_value:
+                    raise WorkbenchImmutableFieldError(
+                        f"Workbench.{field} is write-once and cannot be "
+                        f"changed after creation (pk={self.pk}). Create a "
+                        "new Workbench row for the new content instead."
+                    )
+        loaded_config = getattr(self, "_loaded_config_identity", None)
+        if loaded_config is not None:
+            cfg = self.config or {}
+            current = {k: cfg.get(k) for k in _WORKBENCH_CONFIG_IDENTITY_KEYS}
+            if current != loaded_config:
+                raise WorkbenchImmutableFieldError(
+                    "Workbench.config's identity sub-keys "
+                    f"({', '.join(_WORKBENCH_CONFIG_IDENTITY_KEYS)}) are "
+                    f"write-once and cannot be changed after creation "
+                    f"(pk={self.pk}). Create a new Workbench row for the "
+                    "new content instead."
+                )
+        super().save(*args, **kwargs)
+        self._loaded_protected = {
+            f: getattr(self, f) for f in self._PROTECTED_FIELDS
+        }
+        cfg = self.config or {}
+        self._loaded_config_identity = {
+            k: cfg.get(k) for k in _WORKBENCH_CONFIG_IDENTITY_KEYS
+        }
+
+
+class WorkflowVersion(_UUIDPK, _Timestamps):
+    """One immutable, timestamped snapshot of a Workflow's SOP composition.
+
+    Created exclusively by builder.workflow_versioning.snapshot_workflow_version
+    — never client-writable. ``version_number`` mirrors Workflow.version at the
+    moment this snapshot was taken; the two stay in lockstep by construction
+    (both written in the same transaction, in that one function). See
+    ``slots`` (WorkflowVersionWorkbench) for the actual per-SOP composition —
+    this row alone doesn't describe what was in the workflow.
+    """
+    workflow = models.ForeignKey(
+        Workflow, on_delete=models.CASCADE, related_name="versions",
+    )
+    version_number = models.PositiveIntegerField()
+    # Short breadcrumb for what triggered this snapshot — human-readable audit
+    # context, not machine-authoritative. E.g. "initial_build",
+    # "sop_sync:changed:SOP A", "rollout_approved".
+    reason = models.CharField(max_length=64, blank=True, default="")
+
+    class Meta:
+        db_table = "builder_workflow_version"
+        ordering = ["workflow", "version_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["workflow", "version_number"],
+                name="uniq_workflow_version_number",
+            ),
+        ]
+
+
+class WorkflowVersionWorkbench(_UUIDPK):
+    """One SOP slot's frozen state within a WorkflowVersion snapshot.
+
+    Every field here is written once, at snapshot-creation time, and is the
+    AUTHORITATIVE source for historical display — never re-derived from live
+    Workbench/AuditSop state when rendering history (order in particular is
+    expected to diverge from the live Workbench.order over time via ordinary
+    canvas reordering, which does not itself create a new WorkflowVersion).
+    """
+    workflow_version = models.ForeignKey(
+        WorkflowVersion, on_delete=models.CASCADE, related_name="slots",
+    )
+    # PROTECT — a Workbench row referenced by any historical snapshot can
+    # never be deleted. Combined with Workbench's write-once fields, this row
+    # stays truthful forever once created.
+    workbench = models.ForeignKey(
+        Workbench, on_delete=models.PROTECT, related_name="version_snapshots",
+    )
+    node_key = models.CharField(max_length=128, blank=True, default="")
+    order = models.PositiveIntegerField(default=0)
+    # Frozen copy of Workbench.version at snapshot time. Defense-in-depth
+    # alongside the write-once guarantee above, and lets the version-history
+    # API read this table alone without joining into Workbench.
+    workbench_version = models.PositiveIntegerField()
+    # Best-effort resolved AuditSop identity at snapshot time — independent
+    # axis from workbench_version, never merged with it. Null when no
+    # resolvable AuditSop was found (e.g. a hand-built Workbench with no
+    # ingestion provenance).
+    audit_sop_id = models.PositiveIntegerField(null=True, blank=True)
+    sop_title = models.CharField(max_length=255, blank=True, default="")
+    sop_version_number = models.PositiveIntegerField(null=True, blank=True)
+
+    class Meta:
+        db_table = "builder_workflow_version_workbench"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["workflow_version", "workbench"],
+                name="uniq_wfv_workbench",
+            ),
+            models.UniqueConstraint(
+                fields=["workflow_version", "node_key"],
+                name="uniq_wfv_node_key",
+            ),
         ]
 
 

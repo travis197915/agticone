@@ -805,6 +805,83 @@ def _reject_reviewed_version(sop, reviewer: str, note: str) -> str:
         return f"rejection_failed: {exc}"
 
 
+def _version_workbench_for_rollout(workflow, from_sop, to_sop) -> None:
+    """Give the rollout path the same Workbench-version behaviour
+    ``sync_workflow_from_job`` uses: a real content change gets a brand-new,
+    immutable ``Workbench`` row (never a mutation of the existing one).
+
+    Previously this mutated the matched Workbench's ``version``/``config`` in
+    place (``Workbench.objects.filter(pk=wb.pk).update(...)``). That is no
+    longer possible — those fields are write-once on the model (see
+    ``builder.models.Workbench.save``/``WorkbenchQuerySet.update``) precisely
+    because a historical ``WorkflowVersionWorkbench`` snapshot can point at a
+    Workbench row by FK and needs to trust it never changes underneath it.
+
+    Sequencing: the "did anything actually change" question can only be
+    answered by ``plan_rollout`` (via the read-only ``preview_rollout``), and
+    that has to run *before* any Workbench mutation — a preview computed
+    against the ``preserved``-only case must never trigger a new row. Once a
+    real change is confirmed, the old Workbench row is cloned into a new one
+    (same ``node_key``/``order``/``work_area``, ``version + 1``, refreshed
+    ``config``); every live ``Shape`` is re-parented onto the new row (a
+    single bulk update — ``Shape.workbench`` is the *only* FK to Workbench in
+    the schema, and ``NodeRuleBinding``/``NodeToolBinding``/``ShapeConnection``
+    all key off ``Shape``, not ``Workbench``, directly, so re-parenting Shapes
+    is sufficient — nothing else needs to move); the old row is retired
+    (``is_current=False``) and never written to again. ``roll_workflow_forward``
+    then runs unmodified, against the shapes now owned by the new row.
+
+    Best-effort: a workflow with no matching Workbench (e.g. a hand-built
+    canvas with no ``builder.sop_autobuild`` provenance) is logged and
+    skipped rather than failing the approval.
+    """
+    if workflow is None:
+        return
+
+    from .workflow_rollout import preview_rollout
+
+    plan = preview_rollout(workflow=workflow, from_sop=from_sop, to_sop=to_sop)
+    if not (plan.report.repointed or plan.report.refreshed or plan.report.dropped):
+        return  # preserved-only — matches sync_workflow_from_job's no-op rule
+
+    from builder.models import Shape, Workbench
+    from builder.workbench_versioning import find_matching_workbench
+
+    with transaction.atomic():
+        old = find_matching_workbench(workflow, to_sop)
+        if old is None:
+            logger.warning(
+                "rollout version bump: no matching Workbench for workflow=%s "
+                "sop=%s — skipping version bump", workflow.id, to_sop.id,
+            )
+            return
+        old = Workbench.objects.select_for_update().get(pk=old.pk)
+        new = Workbench.objects.create(
+            work_area=old.work_area,
+            name=old.name, description=old.description,
+            node_key=old.node_key, kind=old.kind, order=old.order,
+            position_x=old.position_x, position_y=old.position_y,
+            width=old.width, height=old.height, style=dict(old.style or {}),
+            version=old.version + 1,
+            config={
+                **(old.config or {}),
+                "sop_id": to_sop.id,
+                "sop_title": to_sop.title,
+                "source_url": to_sop.url,
+                "content_hash": to_sop.content_hash or "",
+            },
+            is_current=True,
+        )
+        Shape.objects.filter(workbench=old).update(workbench=new)
+        old.is_current = False
+        old.save(update_fields=["is_current", "updated_at"])
+        logger.info(
+            "rollout: workbench=%s (v%s) retired, workbench=%s (v%s) now live "
+            "for workflow=%s sop=%s (%s)", old.id, old.version, new.id,
+            new.version, workflow.id, to_sop.id, plan.report.as_dict(),
+        )
+
+
 def _approve_ingestion(change_set: RuleChangeSet, reviewer: str) -> dict[str, Any]:
     """Approve a re-ingestion batch by rolling one workflow onto the new SOP.
 
@@ -827,11 +904,22 @@ def _approve_ingestion(change_set: RuleChangeSet, reviewer: str) -> dict[str, An
             "missing its workflow or target SOP."
         )
 
+    # Must run BEFORE roll_workflow_forward — it decides whether a new,
+    # immutable Workbench row is needed at all, and if so, re-parents the
+    # live Shapes onto it so the repoint below mutates bindings that belong
+    # to the new (not-yet-snapshotted) row rather than one that may already
+    # be referenced by an earlier WorkflowVersion.
+    _version_workbench_for_rollout(change_set.workflow, change_set.sop, change_set.to_sop)
+
     report = roll_workflow_forward(
         workflow=change_set.workflow,
         from_sop=change_set.sop,
         to_sop=change_set.to_sop,
     )
+
+    from builder.workflow_versioning import snapshot_workflow_version
+
+    snapshot_workflow_version(change_set.workflow, reason="rollout_approved")
 
     # Approval is what adopts the version. Ingestion only parked it at
     # ``pending_review`` — until this point the workflow was still executing

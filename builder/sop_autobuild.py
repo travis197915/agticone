@@ -34,7 +34,9 @@ from django.utils.text import slugify
 
 from builder.bindings_sync import extract_bindings_from_properties
 from builder.models import (Shape, ShapeConnection, ShapeDefinition, WorkArea,
-                            Workbench)
+                            Workbench, Workflow)
+from builder.workbench_versioning import content_unchanged, find_matching_workbench
+from builder.workflow_versioning import snapshot_workflow_version
 from sop_ingestion.models import (AuditDecision, AuditPrecondition, AuditSop,
                                   AuditStep)
 from uhc_execution_engine.rule_loader import (_hydrate_decision,
@@ -205,8 +207,14 @@ def _precondition_rules(sop: AuditSop) -> list[dict]:
 
 
 def build_workflow_from_sop(workflow, sop: AuditSop, *, area: WorkArea,
-                            col: int) -> dict:
+                            col: int, version: int = 1,
+                            node_key: str | None = None) -> dict:
     """Build one Workbench (+ shapes + rule bindings) for a single SOP.
+
+    ``version`` is the content version this Workbench represents (see
+    ``builder.workbench_versioning``) — callers appending a new version of an
+    existing slot pass ``old.version + 1`` and ``node_key=old.node_key`` so the
+    two rows are recognisable as the same slot's history.
 
     Returns a stats dict and the (first_shape, last_shape) endpoints so the
     caller can chain SOP->SOP.
@@ -226,7 +234,8 @@ def build_workflow_from_sop(workflow, sop: AuditSop, *, area: WorkArea,
         name=(f"{col + 1}. {title}"
               + (f"  ·  {source_ref}" if source_ref else ""))[:255],
         order=col,
-        node_key=slugify(title)[:128],
+        node_key=node_key or slugify(title)[:128],
+        version=version,
         kind="SOP",
         description=_workbench_description(sop, source_ref, steps),
         config={
@@ -237,6 +246,9 @@ def build_workflow_from_sop(workflow, sop: AuditSop, *, area: WorkArea,
             "purpose": sop.purpose or "",
             "step_count": len(steps),
             "does": title,
+            # Comparison point for workbench_versioning.content_unchanged() —
+            # lets a later re-ingest tell whether this slot's content changed.
+            "content_hash": getattr(sop, "content_hash", "") or "",
         },
         position_x=col * _COL_W,
         position_y=0,
@@ -407,18 +419,13 @@ def _reuse_existing_sops_for_job(job) -> list:
     return list(best_by_url.values())
 
 
-def build_workflow_for_job(workflow, job) -> dict:
-    """Build the full canvas from EVERY SOP ingested for this workflow.
+def _resolve_all_sops(workflow, job) -> list[AuditSop]:
+    """Every SOP a from-scratch build for this workflow should include.
 
     A workflow can accumulate N SOPs over time (the SOPs panel "+" attaches
-    more ingestion jobs), so the rebuild spans ALL of the workflow's jobs —
-    one workbench column per SOP, in job-creation order — not just the job
-    that triggered this call. Re-ingesting the same URL replaces its column
-    (latest job wins) instead of duplicating it.
-
-    Idempotent-ish: clears any existing WorkAreas on the workflow first so a
-    re-run produces a clean graph. Returns aggregate stats and writes a
-    ``needs_tools`` prompt list onto ``workflow.metadata``.
+    more ingestion jobs), so this spans ALL of the workflow's jobs — one SOP
+    per source URL (fall back to title), latest ingestion wins — not just the
+    job that triggered this call.
     """
     all_sops = list(
         AuditSop.objects.filter(job__workflow=workflow)
@@ -450,13 +457,23 @@ def build_workflow_for_job(workflow, job) -> dict:
                 job.job_id, getattr(workflow, "id", "?"),
                 getattr(job, "seed_url", ""),
             )
-            return {"shapes": 0, "rules": 0, "sops": 0}
+            return []
         log.warning(
             "auto-build: job %s wrote no AuditSop (UNCHANGED re-ingest); REUSING "
             "existing AuditSop(s) %s for workflow %s.",
             job.job_id, [s.id for s in sops], getattr(workflow, "id", "?"),
         )
+    return sops
 
+
+def _full_build(workflow, sops: list[AuditSop]) -> dict:
+    """Build the full canvas from scratch given a resolved SOP list.
+
+    Destructive: clears any existing WorkAreas first. Only safe to call when
+    the workflow has no canvas yet to preserve as history — see
+    ``sync_workflow_from_job`` for the incremental, history-preserving path
+    used once a workflow already has one.
+    """
     with transaction.atomic():
         workflow.work_areas.all().delete()  # clean rebuild
         area = WorkArea.objects.create(
@@ -494,6 +511,16 @@ def build_workflow_for_job(workflow, job) -> dict:
         workflow.metadata = meta
         workflow.save(update_fields=["metadata", "updated_at"])
 
+        # First-ever snapshot for this workflow — lands on "Workflow v1"
+        # (Workflow.version is never incremented for the initial build; see
+        # builder.workflow_versioning.snapshot_workflow_version).
+        snapshot_workflow_version(workflow, reason="initial_build")
+
+    _log_fidelity(workflow, sops, total)
+    return total
+
+
+def _log_fidelity(workflow, sops: list[AuditSop], total: dict) -> None:
     # Full-fidelity check (logged, non-fatal). Precondition llm_rules only
     # count when the SOP has no Step 0 — otherwise Step 0's decision rows ARE
     # the canonical precondition rules (see build_workflow_from_sop).
@@ -514,4 +541,146 @@ def build_workflow_for_job(workflow, job) -> dict:
         "auto-build done wf=%s sops=%d shapes=%d rules=%d (expected %d)",
         workflow.id, total["sops"], total["shapes"], total["rules"],
         expected_rules)
+
+
+def build_workflow_for_job(workflow, job) -> dict:
+    """Build the full canvas from EVERY SOP ingested for this workflow.
+
+    Always a full, destructive rebuild (clears and recreates every WorkArea).
+    Kept for existing direct callers (CLI / tests) that want that original
+    semantics. The post-ingestion hook uses ``sync_workflow_from_job`` instead,
+    which preserves history and only touches the SOP(s) that actually changed.
+    """
+    sops = _resolve_all_sops(workflow, job)
+    if not sops:
+        return {"shapes": 0, "rules": 0, "sops": 0}
+    return _full_build(workflow, sops)
+
+
+def _mark_build_complete(workflow) -> None:
+    """Flip ``metadata.auto_build_complete`` back to True after a sync pass.
+
+    ``build_status`` (builder/views.py) gates its ``phase`` entirely on this
+    flag, and every re-ingestion dispatch resets it to False before the job
+    starts (see ``WorkflowViewSet.attach``). ``_full_build`` sets it back to
+    True for a workflow's very first build, but the incremental path here
+    used to return without ever setting it back — so any workflow that
+    already had a canvas (which is effectively all of them, since the SPA
+    seeds an empty WorkArea at creation time) stayed on the "building" phase
+    forever even after the sync succeeded. Re-read metadata from the DB
+    rather than using the possibly-stale in-memory ``workflow.metadata``.
+    """
+    workflow.refresh_from_db(fields=["metadata"])
+    meta = dict(workflow.metadata or {})
+    if not meta.get("auto_build_complete"):
+        meta["auto_build_complete"] = True
+        workflow.metadata = meta
+        workflow.save(update_fields=["metadata", "updated_at"])
+
+
+def _current_work_area(workflow) -> WorkArea | None:
+    return workflow.work_areas.order_by("order").first()
+
+
+def _next_column(area: WorkArea) -> int:
+    max_order = (
+        Workbench.objects.filter(work_area=area, is_current=True)
+        .aggregate(models.Max("order"))["order__max"])
+    return 0 if max_order is None else max_order + 1
+
+
+def _sync_one_sop(workflow, sop: AuditSop) -> dict:
+    """Reconcile one freshly-ingested SOP against the workflow's current
+    Workbenches: no-op if unchanged, append a new version if its slot's
+    content changed, or add a new column if it matches no existing slot.
+
+    Does NOT snapshot a WorkflowVersion itself, and no longer bumps
+    Workflow.version directly — sync_workflow_from_job calls
+    snapshot_workflow_version once after every SOP in a job has been synced,
+    so one ingestion job produces one coherent WorkflowVersion (and one
+    Workflow.version increment) rather than one per SOP. See
+    builder.workflow_versioning.
+    """
+    match = find_matching_workbench(workflow, sop)
+    if match is not None and content_unchanged(match, sop):
+        return {"shapes": 0, "rules": 0, "sops": 0, "versions_bumped": 0}
+
+    with transaction.atomic():
+        if match is not None:
+            old = Workbench.objects.select_for_update().get(pk=match.pk)
+            st = build_workflow_from_sop(
+                workflow, sop, area=old.work_area, col=old.order,
+                version=old.version + 1, node_key=old.node_key)
+            old.is_current = False
+            old.save(update_fields=["is_current", "updated_at"])
+        else:
+            area = _current_work_area(workflow)
+            st = build_workflow_from_sop(
+                workflow, sop, area=area, col=_next_column(area))
+
+    return {
+        "shapes": st["shapes"], "rules": st["rules"], "sops": 1,
+        # A new SOP being added counts as a real composition change too
+        # (previously this branch reported 0 and Workflow.version never
+        # bumped for a new SOP — fixed here).
+        "versions_bumped": 1,
+    }
+
+
+def sync_workflow_from_job(workflow, job) -> dict:
+    """Incremental, history-preserving replacement for
+    ``build_workflow_for_job``.
+
+    On a workflow's first-ever build there is no history to preserve, so this
+    delegates straight to ``_full_build`` (identical to the old behaviour).
+    On every later call, only the SOP(s) this particular ``job`` ingested are
+    reconciled against the workflow's existing current Workbenches — an
+    unrelated Workbench for a different SOP is never touched, deleted, or
+    rebuilt. See ``builder.workbench_versioning`` for the slot-matching and
+    change-detection rules.
+    """
+    if workflow.work_areas.count() == 0:
+        sops = _resolve_all_sops(workflow, job)
+        if not sops:
+            return {"shapes": 0, "rules": 0, "sops": 0}
+        return _full_build(workflow, sops)
+
+    job_sops = list(AuditSop.objects.filter(job=job).order_by("crawl_depth", "id"))
+    if not job_sops:
+        # UNCHANGED re-ingest short-circuit (see _resolve_all_sops) — nothing
+        # new was written, so there is nothing to reconcile.
+        log.info(
+            "auto-build sync: job %s wrote no AuditSop rows for workflow %s; "
+            "nothing to sync.", job.job_id, workflow.id,
+        )
+        _mark_build_complete(workflow)
+        return {"shapes": 0, "rules": 0, "sops": 0, "versions_bumped": 0}
+
+    total = {"shapes": 0, "rules": 0, "sops": 0, "versions_bumped": 0}
+    changed_titles: list[str] = []
+    for sop in job_sops:
+        st = _sync_one_sop(workflow, sop)
+        for key in total:
+            total[key] += st[key]
+        if st["sops"]:
+            changed_titles.append(sop.title or f"sop:{sop.id}")
+
+    # One snapshot for the whole job, not one per SOP — a job that changes
+    # both A and B produces a single new WorkflowVersion = A(new)+B(new),
+    # matching the product's "one ingestion event = one coherent workflow
+    # milestone" model. Each SOP's own Workbench build above still runs in
+    # its own transaction (_sync_one_sop, unchanged), so a failure partway
+    # through a multi-doc job still durably keeps whichever SOPs already
+    # synced — only the final snapshot call is consolidated.
+    if total["versions_bumped"]:
+        reason = ("sop_sync:" + ",".join(changed_titles))[:64]
+        snapshot_workflow_version(workflow, reason=reason)
+
+    _mark_build_complete(workflow)
+
+    log.info(
+        "auto-build sync done wf=%s job=%s sops_touched=%d shapes=%d rules=%d "
+        "versions_bumped=%d", workflow.id, job.job_id, total["sops"],
+        total["shapes"], total["rules"], total["versions_bumped"],
+    )
     return total

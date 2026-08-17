@@ -24,6 +24,14 @@ class ExecutionState(TypedDict, total=False):
     shapes: list[dict[str, Any]]                  # per-Shape groupings (rules + tools)
     tools_by_rule_key: dict[str, list[dict[str, Any]]]
     tools_by_shape: dict[str, list[dict[str, Any]]]
+    workflow_version: Optional[int]               # builder.Workflow.version at load time
+    workbench_versions: dict[str, dict[str, Any]] # {workbench_id: {node_key, version, sop_id, sop_title, sop_version_number}}
+    # The builder.WorkflowVersion whose slot set exactly equals the Workbench
+    # ids actually bound above — not "whichever is latest for this workflow"
+    # (see n02_load_bindings.load_bindings). None when no exact match exists
+    # (pre-migration workflow, or a genuine unresolved edge case) — never
+    # guessed.
+    workflow_version_id: Optional[str]
 
     # Persistent per-claim context loaded at pipeline start (see memory.py).
     # Empty dict when memory is disabled or this claim has no prior runs.

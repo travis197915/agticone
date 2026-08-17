@@ -257,9 +257,9 @@ def _maybe_auto_build_workflow(job) -> None:
     if not (workflow.metadata or {}).get("auto_build_canvas"):
         return
     try:
-        from builder.sop_autobuild import build_workflow_for_job
+        from builder.sop_autobuild import sync_workflow_from_job
 
-        stats = build_workflow_for_job(workflow, job)
+        stats = sync_workflow_from_job(workflow, job)
         log.info("auto-build workflow=%s stats=%s", workflow.id, stats)
     except Exception as exc:
         log.exception("auto-build failed for job %s / workflow %s: %s",

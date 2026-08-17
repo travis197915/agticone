@@ -231,7 +231,7 @@ def _mark_build_terminal(workflow, change_set_ids: list[int]) -> None:
 
     ``WorkflowViewSet.attach`` clears ``auto_build_complete`` on every upload so
     the progress screen replays, and ``build_status`` reports ``building`` until
-    something sets it back. Normally ``build_workflow_for_job`` does. On the
+    something sets it back. Normally ``sync_workflow_from_job`` does. On the
     review path nothing builds — the canvas deliberately stays on the old
     version — so without this the SPA sits on "Building canvas…" forever.
 

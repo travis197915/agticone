@@ -131,6 +131,9 @@ def _persist(state: ExecutionState) -> None:
                 claim_lob=state.get("claim_lob") or {},
                 original_auditor=state.get("original_auditor") or "",
                 auditor_status=state.get("auditor_status") or "",
+                workflow_version=state.get("workflow_version"),
+                workbench_versions=state.get("workbench_versions") or {},
+                workflow_version_snapshot_id=state.get("workflow_version_id"),
             ),
         )
 

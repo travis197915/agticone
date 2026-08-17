@@ -31,9 +31,10 @@ def load_bindings(state: ExecutionState) -> dict:
     # Business it audits; a claim whose LOB is not in that set is out of scope.
     execution_mode = "linear"
     supported_lob: list[str] = []
+    workflow_version: int | None = None
     try:
         from builder.models import Workflow
-        wf = Workflow.objects.filter(id=state["workflow_id"]).only("metadata").first()
+        wf = Workflow.objects.filter(id=state["workflow_id"]).only("metadata", "version").first()
         if wf:
             meta = wf.metadata or {}
             execution_mode = str(meta.get("execution_mode") or "linear").lower()
@@ -41,6 +42,7 @@ def load_bindings(state: ExecutionState) -> dict:
             if isinstance(raw_lob, str):
                 raw_lob = [raw_lob]
             supported_lob = [str(x).strip() for x in raw_lob if str(x).strip()]
+            workflow_version = wf.version
     except Exception:
         execution_mode = "linear"
     if execution_mode not in {"linear", "parallel"}:
@@ -75,6 +77,54 @@ def load_bindings(state: ExecutionState) -> dict:
     shapes = loaded["shapes"]
     shapes_with_rules = sum(1 for s in shapes if s.get("rules"))
     n_tools = len(loaded["all_tool_bindings"])
+
+    # Version snapshot — records exactly which Workbench content versions were
+    # actually bound for this run, so RuleExecutionRun stays accurate even
+    # after a later re-ingest appends a new version and moves the canvas
+    # forward (see builder.workbench_versioning).
+    workbench_versions: dict[str, dict] = {}
+    workbench_ids = {s["workbench_id"] for s in shapes if s.get("workbench_id")}
+    workflow_version_id: str | None = None
+    if workbench_ids:
+        from builder.models import Workbench, WorkflowVersion
+
+        for wb in Workbench.objects.filter(id__in=workbench_ids, is_current=True):
+            cfg = wb.config or {}
+            workbench_versions[str(wb.id)] = {
+                "node_key": wb.node_key,
+                "version": wb.version,
+                "sop_id": cfg.get("sop_id"),
+                "sop_title": cfg.get("sop_title"),
+            }
+
+        # Resolve the WorkflowVersion whose slot set EXACTLY equals the
+        # Workbench ids actually bound above — deliberately NOT "whichever
+        # is latest for this workflow", which could point at a composition
+        # different from what was actually loaded if a concurrent ingestion
+        # lands mid-request. Because a superseded Workbench row is never
+        # mutated (see builder.models.Workbench), a given set of bound
+        # Workbench ids can match at most one WorkflowVersion's slot set, so
+        # an exact match is unambiguous when one exists, and None (never
+        # guessed) when it doesn't — e.g. a pre-migration workflow with no
+        # snapshot history yet. Plain Python set-comparison over this
+        # workflow's (typically small) version history rather than a
+        # filter+annotate(Count()) query, to sidestep the well-known Django
+        # gotcha where a preceding filter() on a related field collapses the
+        # join a subsequent Count() on that same relation would need.
+        for wfv in (
+            WorkflowVersion.objects
+            .filter(workflow_id=state["workflow_id"])
+            .order_by("-version_number")
+            .prefetch_related("slots")
+        ):
+            slots = list(wfv.slots.all())
+            if {str(s.workbench_id) for s in slots} == workbench_ids:
+                workflow_version_id = str(wfv.id)
+                for s in slots:
+                    key = str(s.workbench_id)
+                    if key in workbench_versions:
+                        workbench_versions[key]["sop_version_number"] = s.sop_version_number
+                break
 
     # Pre-execution breadcrumb. INFO so it shows for every claim — this is
     # the single most useful line when diagnosing "the engine ran but did
@@ -126,5 +176,8 @@ def load_bindings(state: ExecutionState) -> dict:
         "claim": claim,
         "claim_lob": claim_lob,
         "lob_out_of_scope": lob_out_of_scope,
+        "workflow_version": workflow_version,
+        "workbench_versions": workbench_versions,
+        "workflow_version_id": workflow_version_id,
         "stages": stages,
     }
