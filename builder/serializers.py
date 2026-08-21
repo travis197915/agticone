@@ -27,6 +27,7 @@ from .models import (
     Workbench,
     Workflow,
     WorkflowVersion,
+    WorkflowVersionRule,
     WorkflowVersionWorkbench,
 )
 
@@ -405,10 +406,24 @@ class WorkflowVersionWorkbenchSerializer(serializers.ModelSerializer):
         ]
 
 
+class WorkflowVersionRuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = WorkflowVersionRule
+        fields = [
+            "shape_id", "shape_label", "workbench_id", "node_key",
+            "rule_key", "is_custom", "condition", "action",
+            "decision_type", "codes", "subrule_id",
+            "sop_id", "sop_title", "sop_version_number",
+            "orphaned_from_rule_key", "orphaned_from_sop_id", "orphaned_reason",
+            "ordering",
+        ]
+
+
 class WorkflowVersionSerializer(serializers.ModelSerializer):
     sops = WorkflowVersionWorkbenchSerializer(source="slots", many=True, read_only=True)
+    rules = WorkflowVersionRuleSerializer(many=True, read_only=True)
     workflow_version = serializers.IntegerField(source="version_number", read_only=True)
 
     class Meta:
         model = WorkflowVersion
-        fields = ["workflow_version", "created_at", "reason", "sops"]
+        fields = ["workflow_version", "created_at", "reason", "sops", "rules"]

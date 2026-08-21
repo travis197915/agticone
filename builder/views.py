@@ -284,7 +284,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             WorkflowVersion.objects
             .filter(workflow=workflow)
             .order_by("-version_number")
-            .prefetch_related("slots")
+            .prefetch_related("slots", "rules")
         )
         return Response(WorkflowVersionSerializer(qs, many=True).data)
 
@@ -294,10 +294,91 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         one historical composition snapshot in detail."""
         workflow = self.get_object()
         snapshot = get_object_or_404(
-            WorkflowVersion.objects.prefetch_related("slots"),
+            WorkflowVersion.objects.prefetch_related("slots", "rules"),
             workflow=workflow, version_number=int(version_number),
         )
         return Response(WorkflowVersionSerializer(snapshot).data)
+
+    # ── /rule-changes/propose — pending canvas rule add/edit/delete ────────
+
+    @action(detail=True, methods=["post"], url_path="rule-changes/propose")
+    def propose_rule_change(self, request, pk=None):
+        """``POST /api/builder/workflows/<id>/rule-changes/propose/``
+
+        Body: ``{"shape_id", "rule_key", "kind": "add"|"edit"|"delete",
+        "fields": {...}, "is_custom": bool}``.
+
+        Records the add/edit/delete as a pending ``RuleChangeSet``
+        (``source=canvas``) — the canonical rule content on the Shape is
+        untouched until the batch is reviewed and approved via the same
+        ``/api/ingest/rule-changesets/<id>/approve/`` endpoint SOP-ingestion
+        changes use (see ``sop_ingestion.rule_change_views``).
+        """
+        from sop_ingestion.models import RuleChangeKind
+        from sop_ingestion.services.rule_changes import NoEffectiveChange, RuleChangeError
+
+        from .canvas_rule_changes import propose_canvas_rule_change
+
+        workflow = self.get_object()
+        payload = request.data if isinstance(request.data, dict) else {}
+
+        shape_id = str(payload.get("shape_id") or "").strip()
+        rule_key = str(payload.get("rule_key") or "").strip()
+        kind_raw = str(payload.get("kind") or "").strip().lower()
+        fields = payload.get("fields")
+        kind_map = {
+            "add": RuleChangeKind.ADDED, "added": RuleChangeKind.ADDED,
+            "edit": RuleChangeKind.MODIFIED, "modified": RuleChangeKind.MODIFIED,
+            "delete": RuleChangeKind.REMOVED, "removed": RuleChangeKind.REMOVED,
+        }
+        kind = kind_map.get(kind_raw)
+
+        if not shape_id or not rule_key or kind is None:
+            return Response(
+                {"error": "missing_fields",
+                 "detail": "Body must include 'shape_id', 'rule_key', and a "
+                           "'kind' of add|edit|delete."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if kind != RuleChangeKind.REMOVED and not isinstance(fields, dict):
+            return Response(
+                {"error": "missing_fields",
+                 "detail": "Body must include a 'fields' object for add/edit."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        shape = get_object_or_404(Shape.objects.filter(
+            workbench__work_area__workflow=workflow,
+        ), pk=shape_id)
+
+        user = getattr(request, "user", None)
+        author = str(getattr(user, "email", "") or getattr(user, "id", "") or "").strip()
+
+        try:
+            proposal = propose_canvas_rule_change(
+                workflow=workflow, shape=shape, rule_key=rule_key, kind=kind,
+                fields=fields or {}, is_custom=bool(payload.get("is_custom")),
+                author=author,
+            )
+        except (NoEffectiveChange, RuleChangeError) as exc:
+            code = (status.HTTP_400_BAD_REQUEST if isinstance(exc, NoEffectiveChange)
+                    else status.HTTP_409_CONFLICT)
+            return Response({"error": getattr(exc, "code", "rule_change_error"),
+                             "detail": str(exc)}, status=code)
+
+        change_set = proposal.changeset
+        return Response(
+            {
+                "changeset_id": change_set.id,
+                "proposal_id": proposal.id,
+                "status": change_set.status,
+                "rule_key": proposal.rule_key,
+                "fields_changed": sorted((proposal.proposed_fields or {}).keys()),
+                "from_version": change_set.base_version,
+                "to_version": change_set.base_version + 1,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
     # ── /sop-order — reorder SOP workbench columns ──────────────────────────
 
@@ -743,6 +824,110 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             "unplaced": plan.unplaced,
             "report": plan.report.as_dict(),
         })
+
+    @action(detail=True, methods=["post"], url_path="version-adopt")
+    def version_adopt(self, request, pk=None):
+        """Create a reviewable rollout batch onto the document's current
+        active SOP version.
+
+        ``POST /api/builder/workflows/<id>/version-adopt/?sop_id=<target>``
+
+        The on-demand counterpart to an ingestion-triggered rollout. A real
+        re-ingestion only ever creates a ``RuleChangeSet`` for the one
+        workflow named on that job (``build_change_set_from_ingestion``,
+        called from ``sop_ingestion.services.rule_changes``); a workflow
+        activated directly via ``POST /api/ingest/sops/<id>/activate/``, or
+        one bound to the same document but not named on that job, never gets
+        one — its bindings stay pointed at the old, now-superseded
+        ``AuditSop`` row indefinitely, with no path forward. This action
+        calls the exact same ``build_change_set_from_ingestion`` with
+        ``job=None`` to produce that missing batch on demand.
+
+        Never mutates any ``NodeRuleBinding`` directly — it only creates the
+        same reviewable ``RuleChangeSet``/``RuleChangeProposal`` rows a real
+        re-ingestion would (``version_preview`` above already renders them
+        once they exist), so approval still goes through the normal
+        ``approve_change_set`` → ``roll_workflow_forward`` +
+        ``snapshot_workflow_version`` path, unchanged.
+        """
+        from agent_tools.models import NodeRuleBinding
+        from sop_ingestion.models import (AuditSop, ChangeSetStatus,
+                                          RuleChangeSet)
+        from sop_ingestion.services.rule_changes import \
+            build_change_set_from_ingestion
+
+        from .sop_compliance import sop_approval_meta
+
+        wf: Workflow = self.get_object()
+        raw = (request.query_params.get("sop_id") or "").strip()
+        if not raw.isdigit():
+            raise drf_serializers.ValidationError(
+                {"sop_id": "Query param 'sop_id' is required."}
+            )
+        target = get_object_or_404(AuditSop, pk=int(raw))
+
+        meta = sop_approval_meta(target)
+        if not meta["is_approved"]:
+            raise drf_serializers.ValidationError({
+                "sop_id": target.id,
+                "detail": (
+                    f"SOP {target.id} is not the document's current approved "
+                    f"version ({meta['approval_issue']}) — nothing to adopt."
+                ),
+            })
+
+        bound_sop_ids = set(
+            NodeRuleBinding.objects
+            .filter(shape__workbench__work_area__workflow=wf)
+            .values_list("sop_id", flat=True)
+            .distinct()
+        )
+        if target.id in bound_sop_ids:
+            return Response({
+                "change_set_id": None,
+                "detail": "This workflow is already on this version.",
+            })
+
+        # Same from_sop resolution as version_preview above, on purpose — one
+        # lookup, reused, not reimplemented.
+        change_set = (
+            RuleChangeSet.objects
+            .filter(workflow=wf, to_sop=target, status=ChangeSetStatus.OPEN)
+            .order_by("-id")
+            .first()
+        )
+        from_sop = change_set.sop if change_set else None
+        if from_sop is None:
+            from_sop = (
+                AuditSop.objects
+                .filter(id__in=bound_sop_ids, document_id=target.document_id)
+                .order_by("-version_number", "-id")
+                .first()
+                if target.document_id else None
+            )
+        if from_sop is None:
+            return Response({
+                "change_set_id": None,
+                "detail": "This workflow has no canvas on this SOP's document.",
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        user = getattr(request, "user", None)
+        author = str(getattr(user, "email", "") or getattr(user, "id", "") or "").strip()
+
+        change_set = build_change_set_from_ingestion(
+            workflow=wf, from_sop=from_sop, to_sop=target, job=None, author=author,
+        )
+        if change_set is None:
+            return Response({
+                "change_set_id": None,
+                "detail": "No differences between versions — nothing to adopt.",
+            })
+        return Response({
+            "change_set_id": change_set.id,
+            "from_sop_id": from_sop.id,
+            "to_sop_id": target.id,
+            "proposal_count": change_set.proposals.count(),
+        }, status=status.HTTP_201_CREATED)
 
     # ── Auto-build progress (polled by the SPA loading screen) ──────────────
 
@@ -1783,6 +1968,18 @@ class WorkbenchViewSet(viewsets.ModelViewSet):
     def partial_update(self, request, *args, **kwargs):
         self._reject_if_historical(self.get_object())
         return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        wb = self.get_object()
+        self._reject_if_historical(wb)
+        if wb.version_snapshots.exists():
+            raise drf_serializers.ValidationError(
+                "This Workbench is referenced by a WorkflowVersion snapshot "
+                "and cannot be deleted — doing so would raise a database "
+                "integrity error. Remove its shapes/rules via the graph "
+                "editor instead of deleting the Workbench directly."
+            )
+        return super().destroy(request, *args, **kwargs)
 
     @action(detail=True, methods=["get", "put", "patch"], url_path="context")
     def context(self, request, pk=None):

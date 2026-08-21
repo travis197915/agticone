@@ -61,7 +61,14 @@ RunVersion = dict[str, Any]
 
 
 def _sop_ids_by_run(run_ids: list[str]) -> dict[str, set[int]]:
-    """``{run_id: {sop_id, …}}`` from the rule_keys each run wrote."""
+    """``{run_id: {sop_id, …}}`` from the rule_keys each run wrote.
+
+    Only recognizes ``step:``/``pre:`` (SOP-derived) rule_keys — a run whose
+    matched rules are entirely ``custom:{uuid}`` (no SOP at all) legitimately
+    has no entry here. That's fine for this function's own purpose (the
+    SOP-id-set fallback comparison), but callers must NOT use "absent here"
+    as a proxy for "never executed" — see :func:`_evaluated_run_ids`.
+    """
     from execution_app.models import RuleEvaluation
 
     if not run_ids:
@@ -84,6 +91,28 @@ def _sop_ids_by_run(run_ids: list[str]) -> dict[str, set[int]]:
     return dict(out)
 
 
+def _evaluated_run_ids(run_ids: list[str]) -> set[str]:
+    """Run ids that wrote at least one ``RuleEvaluation`` row, of ANY
+    rule_key shape — SOP-derived (``step:``/``pre:``) or custom
+    (``custom:{uuid}``). This is the correct "did it ever run" check.
+
+    Deliberately separate from :func:`_sop_ids_by_run`, which only recognizes
+    SOP-derived keys: a claim run entirely on custom rules would otherwise be
+    mislabeled ``never_ran`` (no SOP-shaped rule_key to find) even though it
+    executed and produced a verdict — exactly the kind of custom-rule blind
+    spot this module exists to close.
+    """
+    from execution_app.models import RuleEvaluation
+
+    if not run_ids:
+        return set()
+    return set(
+        str(rid) for rid in
+        RuleEvaluation.objects.filter(run_id__in=run_ids)
+        .values_list("run_id", flat=True).distinct()
+    )
+
+
 def _current_sop_ids_by_workflow(workflow_ids: Iterable[Any]) -> dict[str, set[int]]:
     """``{workflow_id: {sop_id, …}}`` the canvas is bound to right now."""
     from agent_tools.models import NodeRuleBinding
@@ -104,6 +133,20 @@ def _current_sop_ids_by_workflow(workflow_ids: Iterable[Any]) -> dict[str, set[i
     return dict(out)
 
 
+def _current_workflow_versions(workflow_ids: Iterable[Any]) -> dict[str, int]:
+    """``{workflow_id: Workflow.version}`` for every workflow_id given."""
+    from builder.models import Workflow
+
+    workflow_ids = [w for w in workflow_ids if w]
+    if not workflow_ids:
+        return {}
+    return {
+        str(wid): version
+        for wid, version in Workflow.objects.filter(id__in=workflow_ids)
+        .values_list("id", "version")
+    }
+
+
 def run_version_info(runs: list) -> dict[str, RunVersion]:
     """``{run_id: {...}}`` describing the rule version each run executed.
 
@@ -121,6 +164,24 @@ def run_version_info(runs: list) -> dict[str, RunVersion]:
     version. Reporting nothing left the row blank and unreadable beside the run
     it displaced, so it is labelled with the dispatched version and flagged, and
     a *failed* one still offers reprocess because there "reprocess" means retry.
+
+    **Primary mechanism — ``RuleExecutionRun.workflow_version`` vs. the
+    workflow's current ``Workflow.version``.** Both counters are bumped by
+    every execution-affecting change (SOP rollout, canvas rule-content
+    approval, a brand-new node's rules, or a tool add/edit/delete — see
+    ``builder.workflow_versioning.snapshot_workflow_version`` and
+    ``builder.services.WorkflowGraphWriter.save``), so a plain integer
+    compare uniformly covers all of them — not just SOP changes.
+
+    This only fires when the run has a **reliably captured**
+    ``workflow_version`` (``is not None``). A run predates the field, or
+    failed before ``n02_load_bindings`` ran long enough to capture it, has no
+    trustworthy value to compare — it is **never** marked outdated by this
+    comparison, no matter how far ``Workflow.version`` has moved since, and
+    instead falls back to the SOP-id-set comparison below (kept alive
+    unchanged, exactly as it worked before this mechanism existed) so it
+    still gets a best-effort label instead of a false "stale" or a silent
+    "up to date".
     """
     from sop_ingestion.models import AuditSop
 
@@ -129,7 +190,9 @@ def run_version_info(runs: list) -> dict[str, RunVersion]:
 
     run_ids = [str(r.id) for r in runs]
     by_run = _sop_ids_by_run(run_ids)
+    evaluated_run_ids = _evaluated_run_ids(run_ids)
     by_workflow = _current_sop_ids_by_workflow({r.workflow_id for r in runs})
+    current_workflow_versions = _current_workflow_versions({r.workflow_id for r in runs})
 
     every_sop_id = {s for ids in by_run.values() for s in ids}
     every_sop_id |= {s for ids in by_workflow.values() for s in ids}
@@ -157,18 +220,41 @@ def run_version_info(runs: list) -> dict[str, RunVersion]:
         # unreadable next to the run it was meant to supersede. Label it with
         # the dispatched version and flag that it never ran, so the UI can say
         # "attempted" rather than implying those rules produced a verdict.
-        never_ran = not ran_on
-        described = current if never_ran else ran_on
+        #
+        # Checked against ALL evaluations the run wrote (any rule_key shape),
+        # not just the SOP-recognized ``ran_on`` set above — a run whose
+        # matched rules are entirely custom (``custom:{uuid}``, no SOP at
+        # all) legitimately has an empty ``ran_on`` but DID execute, and must
+        # not be reported as never having run.
+        never_ran = run_id not in evaluated_run_ids
 
-        if never_ran:
-            # Reprocess here means retry, which is exactly what a failed run
-            # wants — otherwise the only way back is the older row it displaced.
-            outdated = status in _FAILED_STATUSES and bool(current)
+        run_workflow_version = getattr(run, "workflow_version", None)
+        current_workflow_version = current_workflow_versions.get(str(run.workflow_id))
+        has_reliable_version = (
+            run_workflow_version is not None and current_workflow_version is not None
+        )
+
+        if has_reliable_version:
+            if never_ran:
+                # Reprocess here means retry — same semantics as the fallback
+                # path below, just no longer gated on the SOP-id detail set.
+                outdated = status in _FAILED_STATUSES
+            else:
+                outdated = run_workflow_version < current_workflow_version
+            version_label = f"v{run_workflow_version}"
+            current_label = f"v{current_workflow_version}" if outdated else ""
+            described = current if never_ran else ran_on
         else:
-            outdated = bool(current) and ran_on != current
+            described = current if never_ran else ran_on
+            if never_ran:
+                outdated = status in _FAILED_STATUSES and bool(current)
+            else:
+                outdated = bool(current) and ran_on != current
+            version_label = _label(described)
+            current_label = _label(current) if outdated else ""
 
         info[run_id] = {
-            "version_label": _label(described),
+            "version_label": version_label,
             "sop_versions": sorted(
                 (
                     {
@@ -182,6 +268,6 @@ def run_version_info(runs: list) -> dict[str, RunVersion]:
             ),
             "is_outdated": outdated,
             "never_ran": never_ran,
-            "current_label": _label(current) if outdated else "",
+            "current_label": current_label,
         }
     return info

@@ -35,10 +35,12 @@ leaves alone any binding a human has since edited (reported as ``preserved``).
 from __future__ import annotations
 
 import logging
+import uuid as uuid_lib
 from dataclasses import dataclass, field
 from typing import Any
 
 from django.db import transaction
+from django.utils import timezone
 
 from ..models import AuditDecision, AuditPrecondition, AuditSop
 from .sop_rule_diff import RuleDelta, diff_sop_versions
@@ -64,7 +66,14 @@ class RolloutReport:
     preserved: int = 0
     dropped: int = 0
     stranded: int = 0
+    # A binding whose condition/action had been hand-edited, whose source
+    # decision the new version removed. Never silently dropped — converted to
+    # a workflow-only custom rule on the same shape instead (see
+    # ``_orphan_binding_to_custom_rule``), so the auditor's customization
+    # survives and is flagged for review rather than lost.
+    orphaned: int = 0
     unplaced: list[dict[str, Any]] = field(default_factory=list)
+    orphaned_rules: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -73,8 +82,10 @@ class RolloutReport:
             "preserved": self.preserved,
             "dropped": self.dropped,
             "stranded": self.stranded,
+            "orphaned": self.orphaned,
             "unplaced": self.unplaced,
             "unplaced_count": len(self.unplaced),
+            "orphaned_rules": self.orphaned_rules,
         }
 
 
@@ -154,10 +165,14 @@ class BindingPlan:
     action_text: str = ""
     refreshed: bool = False
     preserved: bool = False
+    # Non-overridable fields carried forward from the old decision, used only
+    # by the ORPHAN outcome to build the replacement custom-rule dict.
+    orphan_meta: dict[str, Any] = field(default_factory=dict)
 
     REPOINT = "repoint"
     DROP = "drop"
     STRAND = "strand"
+    ORPHAN = "orphan"
 
 
 @dataclass
@@ -304,8 +319,39 @@ def plan_rollout(
 
         new_decision = replacement[binding.rule_key]
         if new_decision is None:
-            entry.action = BindingPlan.DROP
-            plan.report.dropped += 1
+            old_decision = previous[binding.rule_key]
+            # A binding copied at attach time and never touched matches the
+            # old decision's hydrated text exactly — safe to drop, same as
+            # today. One that diverges was hand-edited: the source rule is
+            # gone, but the auditor's customization is not ours to discard.
+            edited = (
+                not _same_text(binding.condition, _hydrated_condition(old_decision))
+                or not _same_text(binding.action, _hydrated_action(old_decision))
+            )
+            if edited:
+                entry.action = BindingPlan.ORPHAN
+                entry.condition = binding.condition
+                entry.action_text = binding.action
+                entry.orphan_meta = {
+                    "decision_type": old_decision.decision_type or "",
+                    "subrule_id": old_decision.subrule_id or "",
+                    "codes": list(old_decision.all_codes or []),
+                    "step_number": old_decision.step.step_number,
+                    "row_index": old_decision.row_index,
+                }
+                plan.report.orphaned += 1
+                plan.report.orphaned_rules.append({
+                    "rule_key": binding.rule_key,
+                    "shape_id": entry.shape_id,
+                    "step_number": old_decision.step.step_number,
+                    "row_index": old_decision.row_index,
+                    "subrule_id": old_decision.subrule_id or "",
+                    "condition": binding.condition,
+                    "action": binding.action,
+                })
+            else:
+                entry.action = BindingPlan.DROP
+                plan.report.dropped += 1
             plan.bindings.append(entry)
             continue
 
@@ -407,6 +453,11 @@ def roll_workflow_forward(
         use_embeddings=use_embeddings,
     )
     by_id = {str(b.id): b for b in bindings}
+    # One Shape can carry several of this rollout's bindings, so fetch/mutate
+    # each touched shape once (not once per binding) and save once at the
+    # end — see _sync_shape_rule_entry.
+    shapes_cache: dict[str, Any] = {}
+    dirty_shape_ids: set[str] = set()
 
     for entry in plan.bindings:
         binding = by_id.get(entry.binding_id)
@@ -417,7 +468,11 @@ def roll_workflow_forward(
         if entry.action == BindingPlan.DROP:
             binding.delete()
             continue
+        if entry.action == BindingPlan.ORPHAN:
+            _orphan_binding_to_custom_rule(binding, entry)
+            continue
 
+        old_rule_key = binding.rule_key
         binding.sop = to_sop
         binding.rule_key = entry.new_rule_key or binding.rule_key
         updates = ["sop", "rule_key", "updated_at"]
@@ -429,12 +484,113 @@ def roll_workflow_forward(
             updates.append("action")
         binding.save(update_fields=updates)
 
+        _sync_shape_rule_entry(
+            shapes_cache, dirty_shape_ids, entry.shape_id, old_rule_key, binding,
+        )
+
+    for shape_id in dirty_shape_ids:
+        shape = shapes_cache[shape_id]
+        shape.save(update_fields=["properties", "updated_at"])
+
     logger.info(
         "rollout: workflow=%s sop %s->%s %s",
         getattr(workflow, "id", None), from_sop.id, to_sop.id,
         plan.report.as_dict(),
     )
     return plan.report
+
+
+def _sync_shape_rule_entry(
+    shapes_cache: dict[str, Any],
+    dirty_shape_ids: set[str],
+    shape_id: str,
+    old_rule_key: str,
+    binding,
+) -> None:
+    """Keep one Shape.properties.sop_rules[] entry in step with its binding
+    after a repoint.
+
+    ``NodeRuleBinding`` is the source of truth the engine executes, but the
+    canvas keeps a second copy of the same rule in the shape's raw JSON — the
+    only place organizational fields NodeRuleBinding doesn't have (sop_title,
+    decision_type, codes, subrule_id, manual scope toggles, ...) live. Left
+    untouched after a repoint, that copy still carries the OLD
+    key/sop_id/condition/action, and anything that reads shape.properties raw
+    (``approve_canvas_change_set``, ``WorkflowGraphWriter``) then silently
+    disagrees with the binding table — the exact failure this closes.
+
+    Only the four fields the binding is authoritative for are patched, and
+    only by copying whatever the rollout already decided onto the binding
+    (refreshed to the new text, or preserved because an auditor hand-edited
+    it — that decision already happened in ``roll_workflow_forward``'s caller
+    and is reflected in ``binding.condition``/``binding.action`` by the time
+    this runs). Every other field on the entry — organizational metadata, an
+    auditor's manual scope toggle — is left exactly as it was.
+    """
+    from builder.models import Shape
+
+    shape_id = str(shape_id)
+    shape = shapes_cache.get(shape_id)
+    if shape is None:
+        shape = Shape.objects.select_for_update().filter(pk=shape_id).first()
+        if shape is None:  # pragma: no cover - defensive
+            return
+        shapes_cache[shape_id] = shape
+
+    props = shape.properties
+    rules = props.get("sop_rules") if isinstance(props, dict) else None
+    if not isinstance(rules, list):
+        return
+    for rule in rules:
+        if isinstance(rule, dict) and rule.get("key") == old_rule_key:
+            rule["key"] = binding.rule_key
+            rule["sop_id"] = binding.sop_id
+            rule["condition"] = binding.condition
+            rule["action"] = binding.action
+            dirty_shape_ids.add(shape_id)
+            break
+
+
+def _orphan_binding_to_custom_rule(binding, entry: "BindingPlan") -> None:
+    """Convert a hand-edited binding whose source decision was removed into a
+    workflow-only custom rule on the same shape, then delete the binding.
+
+    There is nothing left in the new document to repoint to, but the
+    auditor's edited text is not ours to discard — it is preserved verbatim
+    as a ``custom:`` rule (never a ``NodeRuleBinding``, since it has no SOP
+    to point at), tagged with provenance so the UI can flag it for review
+    instead of rendering identically to a deliberately-authored custom rule.
+    """
+    from builder.models import Shape
+
+    shape = Shape.objects.select_for_update().get(pk=binding.shape_id)
+    props = dict(shape.properties or {})
+    rules = list(props.get("sop_rules") or [])
+    meta = entry.orphan_meta or {}
+    rules.append({
+        "key": f"custom:{uuid_lib.uuid4()}",
+        "sop_id": 0,
+        "sop_title": "Custom",
+        "is_custom": True,
+        "condition": entry.condition,
+        "action": entry.action_text,
+        "decision_type": meta.get("decision_type", ""),
+        "subrule_id": meta.get("subrule_id", ""),
+        "codes": meta.get("codes", []),
+        "orphaned_from_rule_key": entry.rule_key,
+        "orphaned_from_sop_id": binding.sop_id,
+        "orphaned_reason": "sop_rule_removed_in_new_version",
+        "orphaned_at": timezone.now().isoformat(),
+    })
+    props["sop_rules"] = rules
+    shape.properties = props
+    shape.save(update_fields=["properties", "updated_at"])
+    binding.delete()
+    logger.info(
+        "rollout: orphaned binding %s (shape=%s) converted to custom rule — "
+        "source decision removed in new SOP version",
+        entry.rule_key, entry.shape_id,
+    )
 
 
 def _rolled_precondition(binding, to_sop: AuditSop, pre_pairs):

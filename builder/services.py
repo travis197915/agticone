@@ -20,7 +20,11 @@ from typing import Any
 from django.db import transaction
 from rest_framework import serializers as drf_serializers
 
-from .bindings_sync import extract_bindings_from_properties
+from .bindings_sync import (
+    extract_bindings_from_properties,
+    workflow_rule_fingerprint,
+    workflow_tool_fingerprint,
+)
 from .models import (
     Shape,
     ShapeConnection,
@@ -29,6 +33,7 @@ from .models import (
     Workbench,
     Workflow,
 )
+from .workflow_versioning import snapshot_workflow_version
 
 
 def _as_uuid(value: Any) -> uuid.UUID | None:
@@ -68,16 +73,85 @@ class WorkflowGraphWriter:
 
     @transaction.atomic
     def save(self, payload: dict) -> Workflow:
-        # Workflow-level patches
+        # Workflow-level patches — restricted to update_fields so this can
+        # never clobber OTHER fields (notably `version`, which
+        # snapshot_workflow_version may bump concurrently, e.g. via a canvas
+        # rule-change approval landing between when this Workflow instance
+        # was fetched and this save call) with a stale in-memory value. An
+        # unconditional wf.save() would silently write back whatever
+        # `version` this instance happened to hold at fetch time.
         wf = self.workflow
-        if "name" in payload:        wf.name = payload["name"]
-        if "description" in payload: wf.description = payload["description"]
-        if "is_active" in payload:   wf.is_active = bool(payload["is_active"])
-        if "metadata" in payload:    wf.metadata = payload["metadata"] or {}
-        wf.save()
+        touched: list[str] = []
+        if "name" in payload:
+            wf.name = payload["name"]; touched.append("name")
+        if "description" in payload:
+            wf.description = payload["description"]; touched.append("description")
+        if "is_active" in payload:
+            wf.is_active = bool(payload["is_active"]); touched.append("is_active")
+        if "metadata" in payload:
+            wf.metadata = payload["metadata"] or {}; touched.append("metadata")
+        if touched:
+            wf.save(update_fields=[*touched, "updated_at"])
 
         if payload.get("work_areas") is not None:
+            # Rule-content changes (add/edit/delete of an SOP-derived or
+            # custom rule) must go through the pending-review flow —
+            # builder.canvas_rule_changes.propose_canvas_rule_change /
+            # approve_canvas_change_set — not this bulk graph save. Those
+            # endpoints never mutate Shape.properties.sop_rules until
+            # approved, so a well-behaved frontend save never carries a rule
+            # diff here. This fingerprint check is a defensive backstop, not
+            # the normal trigger: if one *is* detected, reject the save
+            # instead of silently applying or silently versioning it, so a
+            # rule edit can never bypass review. Structural-only changes
+            # (position, connections, labels, tool_calls) are unaffected and
+            # keep autosaving immediately.
+            #
+            # Exempt from this check: rules that live entirely on a shape
+            # that did not exist before this save at all (a brand-new node
+            # dragged onto the canvas and saved with its rules already
+            # attached, or a brand-new SOP autobuild/attach). There is no
+            # "previous state" to review a new shape's rules against, so
+            # only a diff touching an ALREADY-EXISTING shape's rule set
+            # (add/edit/delete) counts as something that must be proposed.
+            #
+            # Tool bindings (tool_calls[]) are a separate axis entirely and
+            # are NEVER gated by review (auto-live, by design) — but a tool
+            # add/edit/delete still changes what a claim will execute, so it
+            # must still bump Workflow.version so reprocess detection
+            # (execution_app.services.run_versions) sees it. Same treatment
+            # for a brand-new shape's initial rules: exempt from review, but
+            # not exempt from versioning — "exempt from review" and "exempt
+            # from versioning" are different questions.
+            before_fp = workflow_rule_fingerprint(wf)
+            before_shape_ids = {t[0] for t in before_fp}
+            before_tool_fp = workflow_tool_fingerprint(wf)
             self._sync_work_areas(payload["work_areas"])
+            after_fp = workflow_rule_fingerprint(wf)
+            after_fp_on_existing_shapes = {t for t in after_fp if t[0] in before_shape_ids}
+            after_tool_fp = workflow_tool_fingerprint(wf)
+            if before_fp != after_fp_on_existing_shapes:
+                raise drf_serializers.ValidationError({
+                    "work_areas": (
+                        "This save changes rule content on an existing node "
+                        "(an SOP-derived or custom rule was added, edited, or "
+                        "removed). Rule changes on an existing node must go "
+                        "through POST /workflows/<id>/rule-changes/propose/ "
+                        "and be approved, not saved directly via the graph "
+                        "endpoint."
+                    ),
+                })
+
+            new_shape_rules = after_fp - after_fp_on_existing_shapes
+            tools_changed = before_tool_fp != after_tool_fp
+            if new_shape_rules or tools_changed:
+                if new_shape_rules and tools_changed:
+                    reason = "new_node_rules+tool_change"
+                elif new_shape_rules:
+                    reason = "new_node_rules"
+                else:
+                    reason = "tool_change"
+                snapshot_workflow_version(wf, reason=reason, force=True)
 
         if payload.get("connections") is not None:
             self._sync_connections(payload["connections"])
@@ -89,6 +163,20 @@ class WorkflowGraphWriter:
     def _sync_work_areas(self, areas: list[dict]) -> None:
         existing = {wa.id: wa for wa in self.workflow.work_areas.all()}
         by_name = {wa.name: wa for wa in existing.values()}
+        # A WorkArea that owns any snapshot-protected Workbench (see
+        # _sync_workbenches below) must never be a stale-DELETE candidate —
+        # deleting it would CASCADE into that Workbench and hit the same
+        # WorkflowVersionWorkbench.workbench PROTECT FK, just one level up.
+        # WorkArea has no is_current concept of its own, so this is the only
+        # guard needed here. Kept separate from `existing` above so a
+        # protected WorkArea that IS present in the payload is still matched
+        # by id/name and updated normally — only the stale/delete computation
+        # below excludes it.
+        protected_ids = set(
+            self.workflow.work_areas
+            .filter(workbenches__version_snapshots__isnull=False)
+            .values_list("id", flat=True)
+        )
         keep: set[uuid.UUID] = set()
 
         for i, area_data in enumerate(areas):
@@ -111,15 +199,31 @@ class WorkflowGraphWriter:
             keep.add(area.id)
             self._sync_workbenches(area, area_data.get("workbenches") or [])
 
-        stale = [wa_id for wa_id in existing if wa_id not in keep]
+        stale = [wa_id for wa_id in existing if wa_id not in keep and wa_id not in protected_ids]
         if stale:
             WorkArea.objects.filter(id__in=stale).delete()
 
     # ── workbenches ──────────────────────────────────────────────────────────
 
     def _sync_workbenches(self, area: WorkArea, benches: list[dict]) -> None:
-        existing = {wb.id: wb for wb in area.workbenches.all()}
+        # Retired (is_current=False) rows are permanent, immutable history —
+        # see builder.models.Workbench / sop_ingestion.services.workflow_rollout
+        # ._version_workbench_for_rollout. The frontend canvas only ever knows
+        # about the current workbench per node_key, so a retired one is never
+        # part of the incoming payload; excluding it from `existing`/`by_key`
+        # keeps it out of both matching AND the stale/delete computation below.
+        existing = {wb.id: wb for wb in area.workbenches.filter(is_current=True)}
         by_key = {wb.node_key: wb for wb in existing.values() if wb.node_key}
+        # A currently-live Workbench that's ALSO already snapshot-protected
+        # (WorkflowVersionWorkbench.workbench, PROTECT) must never be treated
+        # as stale either — e.g. an empty column the frontend structurally can
+        # never re-send once a rule-edit snapshot has captured the workflow's
+        # composition (buildGraphPayload derives workbenches purely from
+        # shape groupings, so a zero-shape Workbench can never appear in any
+        # save payload). Kept separate from `existing` so it's still matched
+        # normally by id/node_key if a future payload DOES reference it —
+        # only the stale/delete computation below excludes it.
+        protected_ids = {wb.id for wb in existing.values() if wb.version_snapshots.exists()}
         keep: set[uuid.UUID] = set()
 
         for i, bench_data in enumerate(benches):
@@ -143,7 +247,7 @@ class WorkflowGraphWriter:
             keep.add(wb.id)
             self._sync_shapes(wb, bench_data.get("shapes") or [], bench_data.get("client_id"))
 
-        stale = [wb_id for wb_id in existing if wb_id not in keep]
+        stale = [wb_id for wb_id in existing if wb_id not in keep and wb_id not in protected_ids]
         if stale:
             Workbench.objects.filter(id__in=stale).delete()
 

@@ -318,3 +318,325 @@ class RolloutWorkbenchVersioningTests(TestCase):
 
         shape.refresh_from_db()
         self.assertEqual(shape.workbench_id, new.id)  # re-parented, not cloned
+
+    def test_bump_when_only_orphaned(self):
+        """A rollout that only orphans hand-edited rules (no repoint/refresh/
+        drop) still counts as a real content change — the shape's properties
+        gained a new custom rule, so the canvas moved even though no binding
+        was repointed onto the new SOP."""
+        from unittest.mock import MagicMock, patch
+
+        from sop_ingestion.services.rule_changes import _version_workbench_for_rollout
+        from sop_ingestion.services.workflow_rollout import RolloutPlan, RolloutReport
+
+        wf = _workflow()
+        area = WorkArea.objects.create(workflow=wf, name="Claim Audit", order=0)
+        _bench(area, node_key="a", order=0, sop_id=1, content_hash="a1")
+
+        to_sop = MagicMock(id=2, title="SOP A", url="https://example.com/a",
+                            canonical_url="", content_hash="a2")
+        fake_plan = RolloutPlan(report=RolloutReport(orphaned=1))
+        with patch(
+            "sop_ingestion.services.workflow_rollout.preview_rollout",
+            return_value=fake_plan,
+        ):
+            _version_workbench_for_rollout(wf, from_sop=MagicMock(), to_sop=to_sop)
+
+        self.assertEqual(Workbench.objects.filter(work_area=area).count(), 2)
+
+
+def _rule_sop() -> "AuditSop":
+    from sop_ingestion.models import ActivationStatus, AuditSop, IngestionJob
+
+    job = IngestionJob.objects.create(seed_url="https://example.com/rule-sop.html")
+    return AuditSop.objects.create(
+        job=job, url="https://example.com/rule-sop.html",
+        content_hash="rule-sop-hash", title="Rule Test SOP",
+        is_current=True, activation_status=ActivationStatus.ACTIVE, version_number=1,
+    )
+
+
+class GraphSaveRuleChangeGuardTests(TestCase):
+    """builder.services.WorkflowGraphWriter.save() must REJECT a rule-content
+    change (add/edit/delete of an SOP-derived or custom rule) to a shape that
+    already existed before the save — that must go through
+    builder.canvas_rule_changes' propose/approve flow instead (see
+    CanvasRuleChangeReviewTests below). A brand-new shape's initial rules
+    (nothing existed before this save to review against) and pure
+    structural/ordering-only changes on an existing shape are exempt and
+    still autosave immediately, exactly as before this feature.
+    """
+
+    def setUp(self):
+        from builder.services import WorkflowGraphWriter
+
+        self.sop = _rule_sop()
+        self.wf = _workflow()
+        self.area = WorkArea.objects.create(workflow=self.wf, name="Area", order=0)
+        self.wb = _bench(
+            self.area, node_key="n1", order=0, sop_id=self.sop.id, content_hash="h1",
+        )
+        self.shape = _shape_for(self.wb)
+        self.writer_cls = WorkflowGraphWriter
+
+    def _payload(self, rules: list[dict], *, shape_id=None, label: str = "S") -> dict:
+        return {
+            "work_areas": [{
+                "id": str(self.area.id), "name": "Area", "order": 0,
+                "workbenches": [{
+                    "id": str(self.wb.id), "name": "Node 1", "node_key": "n1",
+                    "kind": "SOP", "order": 0,
+                    "shapes": [{
+                        "id": str(shape_id or self.shape.id), "definition_slug": "test-rect",
+                        "label": label, "order": 0,
+                        "properties": {"sop_rules": rules, "tool_calls": []},
+                    }],
+                }],
+            }],
+        }
+
+    def _set_existing_rules(self, rules: list[dict]) -> None:
+        """Establish 'pre-existing, already-saved' rule state the same way
+        the real system always does — via extract_bindings_from_properties,
+        so the NodeRuleBinding rows exist before the save under test. Without
+        this, a rule's FIRST-ever binding creation (unbound raw JSON →
+        bound NodeRuleBinding) would itself look like a content change to
+        workflow_rule_fingerprint (sop_version_number appears for the first
+        time), which never happens in production — every real write path
+        (sop_autobuild, WorkflowGraphWriter, canvas_rule_changes) binds in
+        the same operation that sets properties.
+        """
+        from builder.bindings_sync import extract_bindings_from_properties
+
+        self.shape.properties = {"sop_rules": rules, "tool_calls": []}
+        self.shape.save(update_fields=["properties"])
+        extract_bindings_from_properties(self.shape)
+
+    def test_new_shape_with_rules_is_exempt(self):
+        from rest_framework.exceptions import ValidationError
+
+        new_shape_id = uuid.uuid4()
+        rules = [{"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+                   "condition": "age < 18", "action": "DENY"}]
+        try:
+            self.writer_cls(self.wf).save(self._payload(rules, shape_id=new_shape_id))
+        except ValidationError:
+            self.fail("a brand-new shape's initial rules must not be gated")
+        self.assertEqual(WorkflowVersion.objects.filter(workflow=self.wf).count(), 0)
+
+    def test_adding_a_rule_to_an_existing_shape_is_rejected(self):
+        from rest_framework.exceptions import ValidationError
+
+        rules = [{"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+                   "condition": "age < 18", "action": "DENY"}]
+        with self.assertRaises(ValidationError):
+            self.writer_cls(self.wf).save(self._payload(rules))
+
+    def test_editing_an_existing_rule_is_rejected(self):
+        from rest_framework.exceptions import ValidationError
+
+        rule = {"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+                 "condition": "age < 18", "action": "DENY"}
+        self._set_existing_rules([rule])
+
+        edited = {**rule, "condition": "age < 21"}
+        with self.assertRaises(ValidationError):
+            self.writer_cls(self.wf).save(self._payload([edited]))
+
+    def test_deleting_an_existing_rule_is_rejected(self):
+        from rest_framework.exceptions import ValidationError
+
+        rule = {"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+                 "condition": "age < 18", "action": "DENY"}
+        self._set_existing_rules([rule])
+
+        with self.assertRaises(ValidationError):
+            self.writer_cls(self.wf).save(self._payload([]))
+
+    def test_ordering_only_shift_on_existing_shape_is_allowed(self):
+        from rest_framework.exceptions import ValidationError
+
+        rule_a = {"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+                   "condition": "age < 18", "action": "DENY"}
+        rule_b = {"key": "custom:bbbb", "sop_id": 0, "is_custom": True,
+                   "condition": "amount > 10000", "action": "REFER"}
+        self._set_existing_rules([rule_a, rule_b])
+
+        try:
+            self.writer_cls(self.wf).save(self._payload([rule_b, rule_a]))
+        except ValidationError:
+            self.fail("a pure reorder of existing rules must not be gated")
+
+    def test_noop_save_on_existing_shape_is_allowed(self):
+        from rest_framework.exceptions import ValidationError
+
+        rule = {"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+                 "condition": "age < 18", "action": "DENY"}
+        self._set_existing_rules([rule])
+
+        try:
+            self.writer_cls(self.wf).save(self._payload([rule]))
+        except ValidationError:
+            self.fail("an identical rule set must not be gated")
+
+    def test_structural_only_change_on_existing_shape_is_allowed(self):
+        rule = {"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+                 "condition": "age < 18", "action": "DENY"}
+        self._set_existing_rules([rule])
+
+        self.writer_cls(self.wf).save(self._payload([rule], label="Renamed"))
+        self.shape.refresh_from_db()
+        self.assertEqual(self.shape.label, "Renamed")
+
+
+class CanvasRuleChangeReviewTests(TestCase):
+    """builder.canvas_rule_changes, dispatched from
+    sop_ingestion.services.rule_changes.approve_change_set /
+    change_set_payload for ChangeSetSource.CANVAS batches:
+
+    * propose never touches Shape.properties or NodeRuleBinding.
+    * approve applies every proposal in the batch, THEN creates exactly one
+      WorkflowVersion/WorkflowVersionRule snapshot reflecting the complete
+      post-change rule state.
+    * reject leaves live rule state AND version history untouched.
+    """
+
+    def setUp(self):
+        self.sop = _rule_sop()
+        self.wf = _workflow()
+        self.area = WorkArea.objects.create(workflow=self.wf, name="Area", order=0)
+        self.wb = _bench(
+            self.area, node_key="n1", order=0, sop_id=self.sop.id, content_hash="h1",
+        )
+        self.shape = _shape_for(self.wb)
+        self.rule_key = f"step:{self.sop.id}:1:0"
+        self.shape.properties = {
+            "sop_rules": [{"key": self.rule_key, "sop_id": self.sop.id,
+                            "condition": "age < 18", "action": "DENY"}],
+            "tool_calls": [],
+        }
+        self.shape.save(update_fields=["properties"])
+        from builder.bindings_sync import extract_bindings_from_properties
+        extract_bindings_from_properties(self.shape)
+
+    def _propose(self, *, kind, fields, rule_key=None, is_custom=False, author="a@x.com"):
+        from builder.canvas_rule_changes import propose_canvas_rule_change
+
+        return propose_canvas_rule_change(
+            workflow=self.wf, shape=self.shape, rule_key=rule_key or self.rule_key,
+            kind=kind, fields=fields, is_custom=is_custom, author=author,
+        )
+
+    def test_propose_edit_does_not_touch_shape_or_bindings(self):
+        from sop_ingestion.models import RuleChangeKind
+
+        before_props = dict(self.shape.properties)
+        self._propose(kind=RuleChangeKind.MODIFIED, fields={"condition": "age < 21"})
+
+        self.shape.refresh_from_db()
+        self.assertEqual(self.shape.properties, before_props)
+        self.assertEqual(WorkflowVersion.objects.filter(workflow=self.wf).count(), 0)
+
+    def test_approve_applies_change_and_creates_exactly_one_version(self):
+        from sop_ingestion.models import ChangeSetStatus, RuleChangeKind
+        from sop_ingestion.services.rule_changes import approve_change_set
+
+        proposal = self._propose(kind=RuleChangeKind.MODIFIED, fields={"condition": "age < 21"})
+        change_set = proposal.changeset
+
+        result = approve_change_set(
+            change_set, proposal_ids=[proposal.id], reviewer="reviewer@x.com",
+        )
+
+        self.shape.refresh_from_db()
+        rules = self.shape.properties["sop_rules"]
+        self.assertEqual(rules[0]["condition"], "age < 21")
+
+        self.assertEqual(WorkflowVersion.objects.filter(workflow=self.wf).count(), 1)
+        v1 = WorkflowVersion.objects.get(workflow=self.wf)
+        row = v1.rules.get(rule_key=self.rule_key)
+        self.assertEqual(row.condition, "age < 21")
+
+        change_set.refresh_from_db()
+        self.assertEqual(change_set.status, ChangeSetStatus.APPROVED)
+        self.assertEqual(result["resulting_version"], change_set.resulting_version)
+
+    def test_reject_leaves_shape_and_versions_untouched(self):
+        from sop_ingestion.models import ChangeSetStatus, RuleChangeKind
+        from sop_ingestion.services.rule_changes import reject_change_set
+
+        before_props = dict(self.shape.properties)
+        proposal = self._propose(kind=RuleChangeKind.MODIFIED, fields={"condition": "age < 21"})
+        change_set = proposal.changeset
+
+        reject_change_set(change_set, reviewer="reviewer@x.com", note="not needed")
+
+        self.shape.refresh_from_db()
+        self.assertEqual(self.shape.properties, before_props)
+        self.assertEqual(WorkflowVersion.objects.filter(workflow=self.wf).count(), 0)
+        change_set.refresh_from_db()
+        self.assertEqual(change_set.status, ChangeSetStatus.REJECTED)
+
+    def test_custom_rule_add_then_delete_each_require_separate_approval(self):
+        from sop_ingestion.models import RuleChangeKind
+        from sop_ingestion.services.rule_changes import approve_change_set
+
+        add_proposal = self._propose(
+            kind=RuleChangeKind.ADDED, rule_key="custom:zzzz", is_custom=True,
+            fields={"condition": "amount > 10000", "action": "REFER"},
+        )
+        approve_change_set(
+            add_proposal.changeset, proposal_ids=[add_proposal.id], reviewer="r@x.com",
+        )
+        self.shape.refresh_from_db()
+        keys = {r["key"] for r in self.shape.properties["sop_rules"]}
+        self.assertIn("custom:zzzz", keys)
+        self.assertEqual(WorkflowVersion.objects.filter(workflow=self.wf).count(), 1)
+
+        del_proposal = self._propose(kind=RuleChangeKind.REMOVED, rule_key="custom:zzzz", fields={})
+        approve_change_set(
+            del_proposal.changeset, proposal_ids=[del_proposal.id], reviewer="r@x.com",
+        )
+        self.shape.refresh_from_db()
+        keys = {r["key"] for r in self.shape.properties["sop_rules"]}
+        self.assertNotIn("custom:zzzz", keys)
+        self.assertEqual(WorkflowVersion.objects.filter(workflow=self.wf).count(), 2)
+
+    def test_noop_edit_raises_no_effective_change(self):
+        from sop_ingestion.models import RuleChangeKind
+        from sop_ingestion.services.rule_changes import NoEffectiveChange
+
+        with self.assertRaises(NoEffectiveChange):
+            self._propose(kind=RuleChangeKind.MODIFIED, fields={"condition": "age < 18"})
+
+    def test_stale_batch_rejected_at_approve(self):
+        from sop_ingestion.models import ChangeSetSource, RuleChangeKind
+        from sop_ingestion.services.rule_changes import ChangeSetStale, approve_change_set
+
+        proposal = self._propose(kind=RuleChangeKind.MODIFIED, fields={"condition": "age < 21"})
+        change_set = proposal.changeset
+        self.assertEqual(change_set.source, ChangeSetSource.CANVAS)
+
+        # Simulate another author's canvas edit landing (bumps Workflow.version)
+        # in between propose and approve. force=True bumps unconditionally,
+        # regardless of composition, without needing to fake an (immutable)
+        # Workbench.version.
+        from builder.workflow_versioning import snapshot_workflow_version
+        snapshot_workflow_version(self.wf, reason="rule_edit", force=True)
+
+        with self.assertRaises(ChangeSetStale):
+            approve_change_set(change_set, proposal_ids=[proposal.id], reviewer="r@x.com")
+
+    def test_historical_rule_rows_survive_shape_deletion(self):
+        from builder.models import Shape, WorkflowVersionRule
+        from sop_ingestion.models import RuleChangeKind
+        from sop_ingestion.services.rule_changes import approve_change_set
+
+        proposal = self._propose(kind=RuleChangeKind.MODIFIED, fields={"condition": "age < 21"})
+        approve_change_set(proposal.changeset, proposal_ids=[proposal.id], reviewer="r@x.com")
+        v1 = WorkflowVersion.objects.get(workflow=self.wf)
+        row_id = v1.rules.get(rule_key=self.rule_key).id
+
+        Shape.objects.filter(pk=self.shape.pk).delete()
+
+        self.assertTrue(WorkflowVersionRule.objects.filter(pk=row_id).exists())

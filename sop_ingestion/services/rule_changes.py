@@ -438,6 +438,11 @@ def change_set_payload(
     workflow_names: list[str] | None = None,
 ) -> dict[str, Any]:
     """Serialise a change set for the bell (summary) or the modal (detail)."""
+    if change_set.source == ChangeSetSource.CANVAS:
+        from builder.canvas_rule_changes import canvas_change_set_payload
+
+        return canvas_change_set_payload(change_set, include_proposals=include_proposals)
+
     sop = change_set.sop
     proposals = list(
         change_set.proposals.select_related(
@@ -696,6 +701,10 @@ def approve_change_set(
 
     if change_set.source == ChangeSetSource.INGESTION:
         return _approve_ingestion(change_set, reviewer)
+    if change_set.source == ChangeSetSource.CANVAS:
+        from builder.canvas_rule_changes import approve_canvas_change_set
+
+        return approve_canvas_change_set(change_set, proposals=proposals, reviewer=reviewer)
 
     sop = change_set.sop
     accepted = [
@@ -841,7 +850,8 @@ def _version_workbench_for_rollout(workflow, from_sop, to_sop) -> None:
     from .workflow_rollout import preview_rollout
 
     plan = preview_rollout(workflow=workflow, from_sop=from_sop, to_sop=to_sop)
-    if not (plan.report.repointed or plan.report.refreshed or plan.report.dropped):
+    if not (plan.report.repointed or plan.report.refreshed or plan.report.dropped
+            or plan.report.orphaned):
         return  # preserved-only — matches sync_workflow_from_job's no-op rule
 
     from builder.models import Shape, Workbench

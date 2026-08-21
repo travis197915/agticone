@@ -183,6 +183,18 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
     # historical record ("Workflow v4: SOP A doc v3/canvas v3, SOP B doc
     # v2/canvas v2").
     workflow_version_snapshot = serializers.SerializerMethodField()
+    # Whether the workflow has moved on since this run executed, and what a
+    # reprocess would use instead — same computation and field names as the
+    # runs list (serialize_run_summary/run_version_info), so the claim detail
+    # page and the list use one consistent shape. Not derived from
+    # workflow_version_snapshot above (a display-only historical pointer);
+    # this is the live "is a re-run different" answer.
+    version_label = serializers.SerializerMethodField()
+    sop_versions = serializers.SerializerMethodField()
+    is_outdated = serializers.SerializerMethodField()
+    never_ran = serializers.SerializerMethodField()
+    current_version_label = serializers.SerializerMethodField()
+    can_reprocess = serializers.SerializerMethodField()
 
     class Meta:
         model = RuleExecutionRun
@@ -194,6 +206,8 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
                   "htl_reviewer", "original_auditor", "field_history",
                   "workflow_version", "workbench_versions",
                   "workflow_version_snapshot",
+                  "version_label", "sop_versions", "is_outdated", "never_ran",
+                  "current_version_label", "can_reprocess",
                   "evaluations", "tool_invocations"]
 
     def get_workflow_version_snapshot(self, run: RuleExecutionRun):
@@ -201,6 +215,34 @@ class RuleExecutionRunSerializer(serializers.ModelSerializer):
             return None
         from builder.serializers import WorkflowVersionSerializer
         return WorkflowVersionSerializer(run.workflow_version_snapshot).data
+
+    def _version_info(self, run: RuleExecutionRun) -> dict:
+        cached = getattr(self, "_version_info_cache", None)
+        if cached is None:
+            from .services.run_versions import run_version_info
+            cached = run_version_info([run]).get(str(run.id)) or {}
+            self._version_info_cache = cached
+        return cached
+
+    def get_version_label(self, run: RuleExecutionRun) -> str:
+        return self._version_info(run).get("version_label", "")
+
+    def get_sop_versions(self, run: RuleExecutionRun) -> list:
+        return self._version_info(run).get("sop_versions", [])
+
+    def get_is_outdated(self, run: RuleExecutionRun) -> bool:
+        return self._version_info(run).get("is_outdated", False)
+
+    def get_never_ran(self, run: RuleExecutionRun) -> bool:
+        return self._version_info(run).get("never_ran", False)
+
+    def get_current_version_label(self, run: RuleExecutionRun) -> str:
+        return self._version_info(run).get("current_label", "")
+
+    def get_can_reprocess(self, run: RuleExecutionRun) -> bool:
+        # Same rule as the list: a reprocess is offered exactly when a re-run
+        # would use different rules.
+        return self._version_info(run).get("is_outdated", False)
 
     def _reviewer_names(self, run: RuleExecutionRun) -> dict[str, str]:
         cached = getattr(self, "_reviewer_names_cache", None)
@@ -249,6 +291,9 @@ class BatchExecutionRunSerializer(serializers.ModelSerializer):
         reviewer_names = resolve_reviewer_names(
             [r.htl_reviewer for r in runs] + [r.original_auditor for r in runs]
         )
+        from .services.run_versions import run_version_info
+        version_info = run_version_info(runs)
         return [
-            serialize_run_summary(r, reviewer_names=reviewer_names) for r in runs
+            serialize_run_summary(r, reviewer_names=reviewer_names, version_info=version_info)
+            for r in runs
         ]

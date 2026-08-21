@@ -955,6 +955,7 @@ class ChangeSetStatus(models.TextChoices):
 class ChangeSetSource(models.TextChoices):
     MANUAL    = "manual",    "Manual rule edit"
     INGESTION = "ingestion", "SOP re-ingestion"
+    CANVAS    = "canvas",    "Workflow canvas rule edit"
 
 
 class RuleChangeKind(models.TextChoices):
@@ -973,11 +974,20 @@ class RuleChangeSet(models.Model):
     """
 
     # The version the workflow is currently ON — the "from" side of the diff.
+    # Null for a CANVAS batch that only touches custom rules (no AuditSop to
+    # pin at all) — populated when available (an SOP-derived rule edit on the
+    # canvas) purely for display context.
     sop          = models.ForeignKey(AuditSop, on_delete=models.CASCADE,
+                                     null=True, blank=True,
                                      related_name="change_sets")
-    # Pins ``AuditSop.version`` — the RULE-CONTENT counter that
-    # rule_reconcile.apply() bumps. Deliberately NOT ``version_number``, which
-    # tracks ingested document snapshots and moves on a different axis.
+    # Pins the "ground truth" counter this batch was diffed against, so a
+    # later approve can detect drift. For MANUAL/INGESTION this is
+    # ``AuditSop.version`` (the rule-content counter ``rule_reconcile.apply()``
+    # bumps — deliberately NOT ``version_number``, which tracks ingested
+    # document snapshots on a different axis). For CANVAS it is
+    # ``builder.Workflow.version`` instead, since a canvas batch's ground
+    # truth is the workflow's own rule set, not any one SOP's — see
+    # ``is_stale`` below.
     base_version = models.PositiveIntegerField()
     status       = models.CharField(max_length=16, choices=ChangeSetStatus.choices,
                                     default=ChangeSetStatus.OPEN, db_index=True)
@@ -1024,8 +1034,18 @@ class RuleChangeSet(models.Model):
             ),
             models.UniqueConstraint(
                 fields=["sop", "workflow", "created_by"],
-                condition=models.Q(status="open", workflow__isnull=False),
+                condition=models.Q(status="open", workflow__isnull=False,
+                                    source="ingestion"),
                 name="uniq_open_ingestion_change_set",
+            ),
+            # A canvas batch is scoped by (workflow, author) only — not by
+            # sop — since one editing session can touch rules bound to
+            # different SOPs (or none, for custom rules) across the same
+            # workflow, and all of it must review together.
+            models.UniqueConstraint(
+                fields=["workflow", "created_by"],
+                condition=models.Q(status="open", source="canvas"),
+                name="uniq_open_canvas_change_set",
             ),
         ]
         indexes = [
@@ -1049,7 +1069,13 @@ class RuleChangeSet(models.Model):
         For an ingestion batch it means the workflow is no longer on the
         version this diff was computed from — another rollout landed first —
         so the "previous" side would render text the workflow never had.
+        For a canvas batch, the ground truth is the workflow's own rule set
+        (``Workflow.version``, bumped only by ``snapshot_workflow_version``)
+        rather than any single SOP's — a canvas batch may have no ``sop`` at
+        all (custom-rule-only edits).
         """
+        if self.source == ChangeSetSource.CANVAS:
+            return self.workflow.version != self.base_version
         return self.sop.version != self.base_version
 
 
@@ -1095,13 +1121,29 @@ class RuleChangeProposal(models.Model):
     step_number     = models.PositiveIntegerField(default=0)
     row_index       = models.PositiveIntegerField(default=0)
 
-    # ``AuditDecision.revision`` when the change was recorded.
+    # ``AuditDecision.revision`` when the change was recorded. Unused (stays
+    # default) for a CANVAS proposal, which has no AuditDecision to version.
     base_revision   = models.PositiveIntegerField(default=1)
-    # Both restricted to rule_reconcile.RECONCILABLE_FIELDS.
+    # Both restricted to rule_reconcile.RECONCILABLE_FIELDS for MANUAL/
+    # INGESTION, or to builder.services.canvas_rule_changes.CANVAS_RULE_FIELDS
+    # for CANVAS.
     previous_fields = models.JSONField(default=dict, blank=True)
     proposed_fields = models.JSONField(default=dict, blank=True)
     # Populated by the impact resolver: [{step_number, label}, ...].
     dependent_steps = models.JSONField(default=list, blank=True)
+
+    # ── CANVAS-sourced proposals only ────────────────────────────────────────
+    # Identify a builder.Shape + rule_key target instead of an AuditDecision —
+    # custom rules and canvas-level SOP-derived rule edits have no
+    # AuditDecision row to point at. Plain (non-FK) fields on purpose: if the
+    # Shape is later deleted by an unrelated structural save, this proposal
+    # should fail cleanly at approve time (see approve_canvas_change_set)
+    # rather than participate in a cascade or block the deletion.
+    shape_id     = models.UUIDField(null=True, blank=True)
+    workbench_id = models.UUIDField(null=True, blank=True)
+    node_key     = models.CharField(max_length=128, blank=True, default="")
+    rule_key     = models.CharField(max_length=255, blank=True, default="")
+    is_custom    = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -1122,6 +1164,12 @@ class RuleChangeProposal(models.Model):
                 fields=["changeset", "to_decision"],
                 condition=models.Q(to_decision__isnull=False),
                 name="uniq_proposal_per_to_rule",
+            ),
+            # Same reasoning, for a CANVAS proposal's Shape+rule_key identity.
+            models.UniqueConstraint(
+                fields=["changeset", "shape_id", "rule_key"],
+                condition=models.Q(shape_id__isnull=False),
+                name="uniq_proposal_per_canvas_rule",
             ),
         ]
 

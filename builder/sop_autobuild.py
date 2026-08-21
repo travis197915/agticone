@@ -34,7 +34,7 @@ from django.utils.text import slugify
 
 from builder.bindings_sync import extract_bindings_from_properties
 from builder.models import (Shape, ShapeConnection, ShapeDefinition, WorkArea,
-                            Workbench, Workflow)
+                            Workbench, Workflow, WorkflowVersion)
 from builder.workbench_versioning import content_unchanged, find_matching_workbench
 from builder.workflow_versioning import snapshot_workflow_version
 from sop_ingestion.models import (AuditDecision, AuditPrecondition, AuditSop,
@@ -472,9 +472,18 @@ def _full_build(workflow, sops: list[AuditSop]) -> dict:
     Destructive: clears any existing WorkAreas first. Only safe to call when
     the workflow has no canvas yet to preserve as history — see
     ``sync_workflow_from_job`` for the incremental, history-preserving path
-    used once a workflow already has one.
+    used once a workflow already has one. Enforced below: once any
+    WorkflowVersion snapshot exists, some live Workbench may be referenced by
+    a WorkflowVersionWorkbench (PROTECT), and this teardown would raise a raw
+    ProtectedError instead of the clear error a caller can act on.
     """
     with transaction.atomic():
+        if WorkflowVersion.objects.filter(workflow=workflow).exists():
+            raise ValueError(
+                f"_full_build refused: workflow {workflow.id} already has "
+                "version history — use sync_workflow_from_job's incremental "
+                "path instead of a destructive full rebuild."
+            )
         workflow.work_areas.all().delete()  # clean rebuild
         area = WorkArea.objects.create(
             workflow=workflow, name="Claim Audit", order=0,

@@ -9,21 +9,22 @@ from ..state import ExecutionState
 
 logger = logging.getLogger(__name__)
 
+_MAX_LOAD_ATTEMPTS = 3
 
-def load_bindings(state: ExecutionState) -> dict:
-    t0 = time.time()
-    stages = list(state.get("stages") or [])
-    if state.get("status") == "FAILED":
-        return {}
 
-    try:
-        loaded = load_workflow_bindings(state["workflow_id"])
-    except Exception as exc:
-        stages.append({"node": "load_bindings", "status": "FAIL",
-                       "ms": int((time.time() - t0) * 1000),
-                       "msg": str(exc)})
-        return {"status": "FAILED", "error_message": f"load_bindings: {exc}",
-                "stages": stages}
+def _current_workflow_version(workflow_id: str) -> int | None:
+    from builder.models import Workflow
+    return Workflow.objects.filter(id=workflow_id).values_list("version", flat=True).first()
+
+
+def _load_bindings_snapshot(workflow_id: str) -> dict:
+    """One consistent-as-possible read of everything a claim run needs to know
+    about the workflow's current configuration: rule bindings, tool bindings,
+    execution-mode metadata, and the version label. Wrapped by
+    :func:`load_bindings` in a before/after ``Workflow.version`` stability
+    check — see that function's retry loop for why a single call here is not
+    on its own guaranteed consistent."""
+    loaded = load_workflow_bindings(workflow_id)
 
     # Workflow-level execution mode drives whether SOPs short-circuit on the
     # first defect (linear) or all run and the verdict is fused (parallel).
@@ -34,7 +35,7 @@ def load_bindings(state: ExecutionState) -> dict:
     workflow_version: int | None = None
     try:
         from builder.models import Workflow
-        wf = Workflow.objects.filter(id=state["workflow_id"]).only("metadata", "version").first()
+        wf = Workflow.objects.filter(id=workflow_id).only("metadata", "version").first()
         if wf:
             meta = wf.metadata or {}
             execution_mode = str(meta.get("execution_mode") or "linear").lower()
@@ -48,35 +49,7 @@ def load_bindings(state: ExecutionState) -> dict:
     if execution_mode not in {"linear", "parallel"}:
         execution_mode = "linear"
 
-    # ── Identify the claim's Line of Business (SOW deliverable) ──────────────
-    # Derived from the already-fetched claim payload (no extra API call) and
-    # surfaced on the claim so every downstream rule-eval prompt sees it.
-    from ..lob import determine_claim_lob
-    claim = dict(state.get("claim") or {})
-    claim_lob = determine_claim_lob(claim, state.get("raw_fetch") or {})
-    claim["line_of_business"] = claim_lob["label"]
-    # Surface the derived Coverage/Benefit (CBD) path "<Payer> > <LOB>" so the
-    # coverage rule-eval prompt reasons over the real plan path (e.g.
-    # "Avmed > Commercial") instead of the legacy Medicare stub. Only set when
-    # the payer is confidently derivable (never fabricate a path).
-    if claim_lob.get("cbd_path"):
-        claim["cbd_coverage_path"] = claim_lob["cbd_path"]
-    lob_out_of_scope = bool(
-        supported_lob
-        and claim_lob["product"] not in supported_lob
-        and claim_lob["label"] not in supported_lob
-    )
-    logger.info(
-        "load_bindings claim=%s lob=%s out_of_scope=%s (supported=%s)",
-        state.get("claim_id") or "-", claim_lob["label"], lob_out_of_scope,
-        supported_lob or "all",
-    )
-
-    pre = loaded["preconditions"]
-    dec = loaded["decisions"]
     shapes = loaded["shapes"]
-    shapes_with_rules = sum(1 for s in shapes if s.get("rules"))
-    n_tools = len(loaded["all_tool_bindings"])
 
     # Version snapshot — records exactly which Workbench content versions were
     # actually bound for this run, so RuleExecutionRun stays accurate even
@@ -113,7 +86,7 @@ def load_bindings(state: ExecutionState) -> dict:
         # join a subsequent Count() on that same relation would need.
         for wfv in (
             WorkflowVersion.objects
-            .filter(workflow_id=state["workflow_id"])
+            .filter(workflow_id=workflow_id)
             .order_by("-version_number")
             .prefetch_related("slots")
         ):
@@ -125,6 +98,99 @@ def load_bindings(state: ExecutionState) -> dict:
                     if key in workbench_versions:
                         workbench_versions[key]["sop_version_number"] = s.sop_version_number
                 break
+
+    return {
+        "loaded": loaded,
+        "execution_mode": execution_mode,
+        "supported_lob": supported_lob,
+        "workflow_version": workflow_version,
+        "workbench_versions": workbench_versions,
+        "workflow_version_id": workflow_version_id,
+    }
+
+
+def load_bindings(state: ExecutionState) -> dict:
+    t0 = time.time()
+    stages = list(state.get("stages") or [])
+    if state.get("status") == "FAILED":
+        return {}
+
+    workflow_id = state["workflow_id"]
+
+    # A claim must execute against ONE consistent configuration: the rule
+    # bindings, the tool bindings, and the recorded workflow_version/
+    # workflow_version_id must all describe the same moment in time. Under
+    # Postgres's default READ COMMITTED isolation, each statement inside
+    # _load_bindings_snapshot gets its own fresh snapshot — an approval
+    # (SOP rollout, canvas rule-change, or the tool/new-node auto-versioning
+    # in WorkflowGraphWriter.save) committing in the middle of that sequence
+    # can otherwise produce a run whose bindings are self-consistently from
+    # one side of the commit but whose recorded workflow_version is from the
+    # other. Bracket the whole read with a before/after Workflow.version
+    # check and retry the entire snapshot (bounded) if it moved, rather than
+    # locking the Workflow row for every claim start (which would serialize
+    # claim throughput behind every approval for no correctness gain).
+    try:
+        snapshot = None
+        for attempt in range(1, _MAX_LOAD_ATTEMPTS + 1):
+            v_before = _current_workflow_version(workflow_id)
+            snapshot = _load_bindings_snapshot(workflow_id)
+            v_after = _current_workflow_version(workflow_id)
+            if v_before == v_after:
+                break
+            logger.warning(
+                "load_bindings workflow=%s version changed mid-load (%s -> %s) "
+                "on attempt %d/%d — retrying for a consistent read",
+                workflow_id, v_before, v_after, attempt, _MAX_LOAD_ATTEMPTS,
+            )
+        else:
+            logger.warning(
+                "load_bindings workflow=%s did not stabilize after %d attempts; "
+                "proceeding with the last read (best effort)",
+                workflow_id, _MAX_LOAD_ATTEMPTS,
+            )
+        loaded = snapshot["loaded"]
+        execution_mode = snapshot["execution_mode"]
+        supported_lob = snapshot["supported_lob"]
+        workflow_version = snapshot["workflow_version"]
+        workbench_versions = snapshot["workbench_versions"]
+        workflow_version_id = snapshot["workflow_version_id"]
+    except Exception as exc:
+        stages.append({"node": "load_bindings", "status": "FAIL",
+                       "ms": int((time.time() - t0) * 1000),
+                       "msg": str(exc)})
+        return {"status": "FAILED", "error_message": f"load_bindings: {exc}",
+                "stages": stages}
+
+    # ── Identify the claim's Line of Business (SOW deliverable) ──────────────
+    # Derived from the already-fetched claim payload (no extra API call) and
+    # surfaced on the claim so every downstream rule-eval prompt sees it.
+    from ..lob import determine_claim_lob
+    claim = dict(state.get("claim") or {})
+    claim_lob = determine_claim_lob(claim, state.get("raw_fetch") or {})
+    claim["line_of_business"] = claim_lob["label"]
+    # Surface the derived Coverage/Benefit (CBD) path "<Payer> > <LOB>" so the
+    # coverage rule-eval prompt reasons over the real plan path (e.g.
+    # "Avmed > Commercial") instead of the legacy Medicare stub. Only set when
+    # the payer is confidently derivable (never fabricate a path).
+    if claim_lob.get("cbd_path"):
+        claim["cbd_coverage_path"] = claim_lob["cbd_path"]
+    lob_out_of_scope = bool(
+        supported_lob
+        and claim_lob["product"] not in supported_lob
+        and claim_lob["label"] not in supported_lob
+    )
+    logger.info(
+        "load_bindings claim=%s lob=%s out_of_scope=%s (supported=%s)",
+        state.get("claim_id") or "-", claim_lob["label"], lob_out_of_scope,
+        supported_lob or "all",
+    )
+
+    pre = loaded["preconditions"]
+    dec = loaded["decisions"]
+    shapes = loaded["shapes"]
+    shapes_with_rules = sum(1 for s in shapes if s.get("rules"))
+    n_tools = len(loaded["all_tool_bindings"])
 
     # Pre-execution breadcrumb. INFO so it shows for every claim — this is
     # the single most useful line when diagnosing "the engine ran but did

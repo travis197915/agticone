@@ -313,6 +313,97 @@ class WorkflowVersionWorkbench(_UUIDPK):
         ]
 
 
+class WorkflowVersionRule(_UUIDPK):
+    """One rule's frozen configuration within a WorkflowVersion snapshot.
+
+    Sibling of WorkflowVersionWorkbench (which snapshots *composition* — which
+    Workbench/SOP occupies each slot) — this table snapshots *content*: every
+    NodeRuleBinding override and every custom (``custom:{uuid}``) rule attached
+    to any Shape in the workflow at the moment this version was created. Written
+    once, at snapshot-creation time, by builder.workflow_versioning — never
+    updated afterward. ``shape_id``/``workbench_id`` are plain fields, not FKs:
+    Shape rows are mutated/deleted in place by WorkflowGraphWriter, so a
+    historical row must survive a shape's later deletion without cascading
+    (same "independent axis" reasoning as WorkflowVersionWorkbench.audit_sop_id).
+    """
+    workflow_version = models.ForeignKey(
+        WorkflowVersion, on_delete=models.CASCADE, related_name="rules",
+    )
+    shape_id = models.UUIDField()
+    # TextField, not CharField — mirrors Shape.label (some SOP step text runs
+    # well past 255 chars; see builder.models.Shape.label's own comment).
+    shape_label = models.TextField(blank=True, default="")
+    workbench_id = models.UUIDField()
+    node_key = models.CharField(max_length=128, blank=True, default="")
+    rule_key = models.CharField(max_length=255, db_index=True)
+    is_custom = models.BooleanField(default=False)
+    condition = models.TextField(blank=True, default="")
+    action = models.TextField(blank=True, default="")
+    decision_type = models.CharField(max_length=64, blank=True, default="")
+    codes = models.JSONField(default=list, blank=True)
+    subrule_id = models.CharField(max_length=64, blank=True, default="")
+    # Not a FK — same reasoning as WorkflowVersionWorkbench.audit_sop_id.
+    sop_id = models.PositiveIntegerField(null=True, blank=True)
+    # TextField, not CharField — mirrors AuditSop.title (also unbounded).
+    sop_title = models.TextField(blank=True, default="")
+    sop_version_number = models.PositiveIntegerField(null=True, blank=True)
+    references_json = models.JSONField(default=list, blank=True)
+    excluded_by_json = models.JSONField(default=list, blank=True)
+    html_reference_json = models.JSONField(default=dict, blank=True)
+    # Provenance when this rule started life as a manually-edited SOP-derived
+    # rule whose source AuditDecision was later removed by a SOP rollout — see
+    # sop_ingestion.services.workflow_rollout._orphan_binding_to_custom_rule.
+    orphaned_from_rule_key = models.CharField(max_length=255, blank=True, default="")
+    orphaned_from_sop_id = models.PositiveIntegerField(null=True, blank=True)
+    orphaned_reason = models.CharField(max_length=64, blank=True, default="")
+    ordering = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = "builder_workflow_version_rule"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["workflow_version", "shape_id", "rule_key"],
+                name="uniq_wfv_rule",
+            ),
+        ]
+
+
+class WorkflowVersionTool(_UUIDPK):
+    """One tool binding's frozen configuration within a WorkflowVersion snapshot.
+
+    Sibling of WorkflowVersionRule (rules) — this table snapshots the *tool*
+    axis so a WorkflowVersion is the complete executable configuration, not
+    rules-only. Written once, at snapshot-creation time, by
+    builder.workflow_versioning — never updated afterward.
+
+    ``shape_id``/``workbench_id`` are plain fields, not FKs — same
+    survives-shape-deletion reasoning as WorkflowVersionRule. ``tool_id`` is
+    also plain, not a FK — same cross-app reasoning as
+    WorkflowVersionWorkbench.audit_sop_id (agent_tools.Tool lives in a
+    different app; this table never imports agent_tools.models at class
+    definition time).
+    """
+    workflow_version = models.ForeignKey(
+        WorkflowVersion, on_delete=models.CASCADE, related_name="tool_bindings",
+    )
+    shape_id = models.UUIDField()
+    workbench_id = models.UUIDField()
+    node_key = models.CharField(max_length=128, blank=True, default="")
+    # Not a FK — see class docstring.
+    tool_id = models.UUIDField(null=True, blank=True)
+    tool_name = models.CharField(max_length=255, blank=True, default="")
+    # The rule this tool binding is scoped to, as a stable rule_key string
+    # (not the NodeToolBinding.rule_binding FK) — same non-FK,
+    # survives-mutation reasoning as WorkflowVersionRule.rule_key. Blank when
+    # the tool binding isn't scoped to a specific rule (tools_by_shape).
+    rule_key = models.CharField(max_length=255, blank=True, default="")
+    args_template = models.JSONField(default=dict, blank=True)
+    ordering = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = "builder_workflow_version_tool"
+
+
 class Shape(_UUIDPK, _Timestamps):
     """
     One placed flow-chart shape on the canvas.

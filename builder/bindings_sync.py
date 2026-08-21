@@ -144,6 +144,7 @@ def extract_bindings_from_properties(shape) -> None:
     # ── Rule bindings: upsert to preserve IDs referenced by execution history ─
     rule_binding_by_key: dict[str, Any] = {}
     incoming_rule_keys: set[str] = set()
+    existing_by_key = {row.rule_key: row for row in NodeRuleBinding.objects.filter(shape=shape)}
 
     for idx, rule in enumerate(raw_rules):
         if not isinstance(rule, dict):
@@ -155,20 +156,46 @@ def extract_bindings_from_properties(shape) -> None:
         sop = _resolve_sop(sop_id) if sop_id else None
         if sop is None:
             continue
+        defaults = dict(
+            sop=sop,
+            condition=rule.get("condition", "") or "",
+            action=rule.get("action", "") or "",
+            references_json=list(rule.get("references") or []),
+            excluded_by_json=list(rule.get("excluded_by") or []),
+            html_reference_json=rule.get("html_reference") or {},
+            ordering=idx,
+        )
+        existing = existing_by_key.get(rule_key)
+        # A binding that already exists with these exact values (aside from
+        # `ordering`) is a no-op write as far as the rule ITSELF is concerned
+        # — nothing about its condition/action/SOP changed this save. Skip
+        # both the approval gate and the upsert for it, so a stale/superseded
+        # SOP on a DIFFERENT, untouched rule elsewhere on this shape (or
+        # canvas) can't block saving an edit to THIS rule. `ordering` is
+        # compared separately below: inserting or removing a SIBLING rule
+        # shifts every later rule's array position without the auditor
+        # touching them, and that alone must not re-trigger the gate either
+        # — only an actual content change (or a brand-new binding) does. The
+        # gate still fires for any rule that's genuinely new or actually
+        # changed this save — see require_approved_sop below.
+        content_unchanged = existing is not None and all(
+            getattr(existing, field) == value
+            for field, value in defaults.items()
+            if field != "ordering"
+        )
+        if content_unchanged:
+            if existing.ordering != idx:
+                existing.ordering = idx
+                existing.save(update_fields=["ordering", "updated_at"])
+            incoming_rule_keys.add(rule_key)
+            rule_binding_by_key[rule_key] = existing
+            continue
         require_approved_sop(sop, context="save rule bindings")
         try:
             row, _ = NodeRuleBinding.objects.update_or_create(
                 shape=shape,
                 rule_key=rule_key,
-                defaults=dict(
-                    sop=sop,
-                    condition=rule.get("condition", "") or "",
-                    action=rule.get("action", "") or "",
-                    references_json=list(rule.get("references") or []),
-                    excluded_by_json=list(rule.get("excluded_by") or []),
-                    html_reference_json=rule.get("html_reference") or {},
-                    ordering=idx,
-                ),
+                defaults=defaults,
             )
         except Exception as exc:
             logger.warning(
@@ -211,15 +238,23 @@ def extract_bindings_from_properties(shape) -> None:
             rule_binding = NodeRuleBinding.objects.filter(
                 id=rule_binding_id, shape=shape,
             ).first()
-        if rule_binding is None:
-            picked_rule_key = tool_call.get("rule_key") or tool_call.get("for_rule_key")
-            if picked_rule_key:
-                rule_binding = rule_binding_by_key.get(picked_rule_key)
+        picked_rule_key = tool_call.get("rule_key") or tool_call.get("for_rule_key")
+        if rule_binding is None and picked_rule_key:
+            rule_binding = rule_binding_by_key.get(picked_rule_key)
+        args_template = dict(
+            tool_call.get("args_template") or tool_call.get("argsTemplate") or {}
+        )
+        # A custom rule (no SOP) never resolves a NodeRuleBinding, so the
+        # rule_binding FK stays NULL for it — but the intended link is not
+        # discarded: stash it in a reserved args_template key (same pattern
+        # as ``_lob_scope`` in rule_loader.py) so hydrate_properties_with_
+        # bindings can surface it as ``rule_key`` again on read.
+        if rule_binding is None and picked_rule_key and picked_rule_key.startswith("custom:"):
+            args_template["_custom_rule_key"] = picked_rule_key
         try:
             NodeToolBinding.objects.create(
                 shape=shape, tool=tool,
-                args_template=tool_call.get("args_template")
-                    or tool_call.get("argsTemplate") or {},
+                args_template=args_template,
                 rule_binding=rule_binding,
                 ordering=idx,
             )
@@ -338,6 +373,15 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
             r["key"]: r for r in raw_rules if r.get("key")
         }
         bound_by_key = {row.rule_key: row for row in rule_rows}
+        # A rollout (roll_workflow_forward) repoints a binding's rule_key in
+        # place — same row, same id, new key — without touching the shape's
+        # raw properties JSON. Until the next graph save, the raw entry still
+        # carries the OLD key, which no longer appears in bound_by_key. Match
+        # by the binding's stable id as a fallback so a rolled-forward rule
+        # (edited or not) re-associates with its binding instead of being
+        # misfiled as custom and rendered a second time via the "defensive"
+        # pass below.
+        bound_by_id = {str(row.id): row for row in rule_rows}
         if oos_keys is None:
             oos_keys = _rule_keys_out_of_scope(list(bound_by_key))
         # Auditor's per-rule manual OOS toggles (rules / sub-rules / sub-sub-
@@ -372,6 +416,7 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
                 "approval_issue": approval["approval_issue"],
                 "activation_status": approval["activation_status"],
                 "current_sop_id": approval["current_sop_id"],
+                "sop_version_number": approval["version_number"],
             })
             return entry
 
@@ -381,10 +426,10 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
         # the SOP rules the auditor interleaved them with.
         for raw in raw_rules:
             key = raw.get("key") or ""
-            row = bound_by_key.get(key)
+            row = bound_by_key.get(key) or bound_by_id.get(str(raw.get("id") or ""))
             if row is not None:
                 merged.append(_binding_entry(row))
-                seen_bound.add(key)
+                seen_bound.add(row.rule_key)
             else:
                 # Unbound rule = custom (no SOP). Keep it exactly as authored,
                 # but still honor a manual OOS toggle on it.
@@ -449,8 +494,177 @@ def hydrate_properties_with_bindings(shape, oos_keys: set[str] | None = None) ->
             "args_template":   row.args_template or {},
             "endpoint_id":     row.tool.endpoint_id,
             "rule_binding_id": str(row.rule_binding_id) if row.rule_binding_id else None,
-            "rule_key":        row.rule_binding.rule_key if row.rule_binding else None,
+            # A real NodeRuleBinding link always wins; otherwise fall back to
+            # the reserved custom-rule key stashed at write time (see
+            # extract_bindings_from_properties) so a tool attached to a
+            # custom rule keeps that association across save/reload.
+            "rule_key":        (
+                row.rule_binding.rule_key if row.rule_binding
+                else (row.args_template or {}).get("_custom_rule_key")
+            ),
             "ordering":        row.ordering,
         } for row in tool_rows]
 
     return props
+
+
+# ── Rule-content versioning support ──────────────────────────────────────────
+# Used by builder.workflow_versioning.snapshot_workflow_version to materialize
+# WorkflowVersionRule rows, and by builder.services.WorkflowGraphWriter to
+# detect whether a graph save actually changed any rule's configuration (as
+# opposed to an incidental node move or a pure ordering shift).
+
+
+def list_workflow_rules(workflow) -> list[dict[str, Any]]:
+    """Every rule on every current-Workbench shape in ``workflow``, fully
+    hydrated (condition/action/decision_type/codes/etc.) and tagged with its
+    shape/workbench identity.
+
+    Reuses :func:`hydrate_properties_with_bindings` so this is guaranteed to
+    describe the exact same rule the SPA would see on a GET — no separate
+    AuditDecision-resolution logic to keep in sync.
+    """
+    from .models import Shape
+
+    shapes = (
+        Shape.objects
+        .filter(workbench__work_area__workflow=workflow, workbench__is_current=True)
+        .select_related("workbench")
+    )
+    out: list[dict[str, Any]] = []
+    for shape in shapes:
+        props = hydrate_properties_with_bindings(shape)
+        for rule in props.get("sop_rules") or []:
+            if not isinstance(rule, dict):
+                continue
+            key = rule.get("key") or ""
+            if not key:
+                continue
+            out.append({
+                "shape_id": shape.id,
+                "shape_label": shape.label or "",
+                "workbench_id": shape.workbench_id,
+                "node_key": shape.workbench.node_key or "",
+                "rule_key": key,
+                "is_custom": bool(rule.get("is_custom")) or key.startswith("custom:"),
+                "condition": rule.get("condition", "") or "",
+                "action": rule.get("action", "") or "",
+                "decision_type": rule.get("decision_type", "") or "",
+                "codes": list(rule.get("codes") or []),
+                "subrule_id": rule.get("subrule_id", "") or "",
+                "sop_id": rule.get("sop_id") or None,
+                "sop_title": rule.get("sop_title", "") or "",
+                "sop_version_number": rule.get("sop_version_number"),
+                "references_json": list(rule.get("references") or []),
+                "excluded_by_json": list(rule.get("excluded_by") or []),
+                "html_reference_json": rule.get("html_reference") or {},
+                "orphaned_from_rule_key": rule.get("orphaned_from_rule_key", "") or "",
+                "orphaned_from_sop_id": rule.get("orphaned_from_sop_id"),
+                "orphaned_reason": rule.get("orphaned_reason", "") or "",
+                "ordering": rule.get("ordering", 0) or 0,
+            })
+    return out
+
+
+# Fields compared to decide "did this rule's configuration actually change" —
+# deliberately excludes `ordering` (a pure reorder caused by a sibling
+# insert/delete must not look like an edit) and `html_reference_json` (UI-only
+# jump-to-source bookkeeping; execution never reads it).
+_RULE_FINGERPRINT_SCALAR_FIELDS = (
+    "is_custom", "condition", "action", "decision_type", "subrule_id",
+    "sop_id", "sop_version_number",
+    "orphaned_from_rule_key", "orphaned_from_sop_id", "orphaned_reason",
+)
+
+
+def workflow_rule_fingerprint(workflow) -> frozenset:
+    """A hashable snapshot of every execution/configuration-meaningful rule
+    field across the whole workflow. Two calls comparing equal means nothing
+    about the rule set (add/edit/delete, SOP-derived or custom) changed
+    between them — used to decide whether a graph save should create a new
+    WorkflowVersion."""
+    fp = set()
+    for rule in list_workflow_rules(workflow):
+        fp.add((
+            str(rule["shape_id"]), rule["rule_key"],
+            *(rule[f] for f in _RULE_FINGERPRINT_SCALAR_FIELDS),
+            tuple(rule["codes"]),
+            tuple(rule["references_json"]),
+            tuple(rule["excluded_by_json"]),
+        ))
+    return frozenset(fp)
+
+
+# ── Tool-binding versioning support ──────────────────────────────────────────
+# Sibling of the rule-fingerprint pair above: used by
+# builder.workflow_versioning.snapshot_workflow_version to materialize
+# WorkflowVersionTool rows, and by builder.services.WorkflowGraphWriter to
+# detect a tool add/edit/delete so it can be auto-versioned (tool changes stay
+# auto-live — no review gate — but must still bump Workflow.version so
+# reprocess detection sees them; see execution_app.services.run_versions).
+
+
+def list_workflow_tools(workflow) -> list[dict[str, Any]]:
+    """Every tool binding on every current-Workbench shape in ``workflow``,
+    tagged with its shape/workbench identity. Mirrors :func:`list_workflow_rules`
+    — reuses :func:`hydrate_properties_with_bindings` so this describes the
+    exact same tool_calls the SPA would see on a GET."""
+    from .models import Shape
+
+    shapes = (
+        Shape.objects
+        .filter(workbench__work_area__workflow=workflow, workbench__is_current=True)
+        .select_related("workbench")
+    )
+    out: list[dict[str, Any]] = []
+    for shape in shapes:
+        props = hydrate_properties_with_bindings(shape)
+        for tool_call in props.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_id = tool_call.get("tool_id")
+            if not tool_id:
+                continue
+            out.append({
+                "shape_id": shape.id,
+                "shape_label": shape.label or "",
+                "workbench_id": shape.workbench_id,
+                "node_key": shape.workbench.node_key or "",
+                "tool_id": tool_id,
+                "tool_name": tool_call.get("name", "") or "",
+                "rule_key": tool_call.get("rule_key") or "",
+                "args_template": tool_call.get("args_template") or {},
+                "ordering": tool_call.get("ordering", 0) or 0,
+            })
+    return out
+
+
+def _jsonable_fingerprint_value(value: Any) -> Any:
+    """Recursively convert dict/list into hashable tuples for a fingerprint set."""
+    if isinstance(value, dict):
+        return tuple(sorted(
+            (k, _jsonable_fingerprint_value(v)) for k, v in value.items()
+        ))
+    if isinstance(value, (list, tuple)):
+        return tuple(_jsonable_fingerprint_value(v) for v in value)
+    return value
+
+
+def workflow_tool_fingerprint(workflow) -> frozenset:
+    """A hashable snapshot of every execution-meaningful tool-binding field
+    across the whole workflow. Two calls comparing equal means no tool
+    binding (add/edit/delete) changed between them — used to decide whether a
+    graph save should auto-version the workflow's tool configuration.
+
+    Deliberately excludes ``ordering`` (a pure reorder is not a content
+    change — same reasoning as ``_RULE_FINGERPRINT_SCALAR_FIELDS``), even
+    though ``ordering`` is still captured on ``WorkflowVersionTool`` for
+    audit-trail parity with ``WorkflowVersionRule.ordering``.
+    """
+    fp = set()
+    for tool in list_workflow_tools(workflow):
+        fp.add((
+            str(tool["shape_id"]), str(tool["tool_id"]), tool["rule_key"],
+            _jsonable_fingerprint_value(tool["args_template"]),
+        ))
+    return frozenset(fp)
