@@ -126,11 +126,33 @@ class WorkflowGraphWriter:
             before_fp = workflow_rule_fingerprint(wf)
             before_shape_ids = {t[0] for t in before_fp}
             before_tool_fp = workflow_tool_fingerprint(wf)
+            # All shape ids, independent of rule/tool content — used only to
+            # detect "a shape that existed is now gone" for versioning below.
+            # A rule-less/decorative shape never appears in before_fp/after_fp
+            # at all, so that comparison alone can't see it disappear.
+            before_all_shape_ids = {
+                str(sid) for sid in Shape.objects.filter(
+                    workbench__work_area__workflow=wf
+                ).values_list("id", flat=True)
+            }
             self._sync_work_areas(payload["work_areas"])
             after_fp = workflow_rule_fingerprint(wf)
+            # Whole-node deletion is a structural change, not a rule edit —
+            # a deleted shape's rule tuples have nowhere to appear in
+            # after_fp (the shape itself is gone), which must not be
+            # confused with "this rule was edited/removed on a shape that
+            # still exists." Scope the before-side of the comparison to
+            # shapes that survived this save, so a deleted shape's rules are
+            # simply exempt from the guard below rather than tripping it.
+            after_all_shape_ids = {
+                str(sid) for sid in Shape.objects.filter(
+                    workbench__work_area__workflow=wf
+                ).values_list("id", flat=True)
+            }
+            before_fp_on_surviving_shapes = {t for t in before_fp if t[0] in after_all_shape_ids}
             after_fp_on_existing_shapes = {t for t in after_fp if t[0] in before_shape_ids}
             after_tool_fp = workflow_tool_fingerprint(wf)
-            if before_fp != after_fp_on_existing_shapes:
+            if before_fp_on_surviving_shapes != after_fp_on_existing_shapes:
                 raise drf_serializers.ValidationError({
                     "work_areas": (
                         "This save changes rule content on an existing node "
@@ -144,14 +166,21 @@ class WorkflowGraphWriter:
 
             new_shape_rules = after_fp - after_fp_on_existing_shapes
             tools_changed = before_tool_fp != after_tool_fp
-            if new_shape_rules or tools_changed:
-                if new_shape_rules and tools_changed:
-                    reason = "new_node_rules+tool_change"
-                elif new_shape_rules:
-                    reason = "new_node_rules"
-                else:
-                    reason = "tool_change"
-                snapshot_workflow_version(wf, reason=reason, force=True)
+            # Any shape gone, regardless of whether it ever carried a rule or
+            # tool — a rule-less/decorative node's deletion must bump the
+            # version exactly like a rule-bearing one does, so
+            # run_version_info() sees every structural change, not just ones
+            # with rule/tool content.
+            shapes_deleted = bool(before_all_shape_ids - after_all_shape_ids)
+            if new_shape_rules or tools_changed or shapes_deleted:
+                reasons = []
+                if new_shape_rules:
+                    reasons.append("new_node_rules")
+                if shapes_deleted:
+                    reasons.append("node_deleted")
+                if tools_changed:
+                    reasons.append("tool_change")
+                snapshot_workflow_version(wf, reason="+".join(reasons), force=True)
 
         if payload.get("connections") is not None:
             self._sync_connections(payload["connections"])

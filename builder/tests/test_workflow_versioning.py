@@ -413,16 +413,52 @@ class GraphSaveRuleChangeGuardTests(TestCase):
         extract_bindings_from_properties(self.shape)
 
     def test_new_shape_with_rules_is_exempt(self):
+        # NOTE: this payload keeps self.shape present (rule-less, unchanged)
+        # ALONGSIDE the new shape, unlike an earlier version of this test
+        # which passed only the new shape id to `_payload()` — that silently
+        # omitted self.shape from shapes[], which stale-deletes it as a side
+        # effect and conflates "a new shape's rules are exempt from the
+        # guard" with "an existing shape was also deleted." Isolating them:
+        # a genuinely new shape's rules are exempt from the *guard* (no
+        # ValidationError) but were never exempt from *versioning* — see
+        # services.py's `new_shape_rules or tools_changed or shapes_deleted`
+        # branch, which forces a snapshot for exactly this case, predating
+        # (and unrelated to) this session's node-deletion fix.
+        from builder.models import Shape
         from rest_framework.exceptions import ValidationError
 
         new_shape_id = uuid.uuid4()
         rules = [{"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
                    "condition": "age < 18", "action": "DENY"}]
+        payload = {
+            "work_areas": [{
+                "id": str(self.area.id), "name": "Area", "order": 0,
+                "workbenches": [{
+                    "id": str(self.wb.id), "name": "Node 1", "node_key": "n1",
+                    "kind": "SOP", "order": 0,
+                    "shapes": [
+                        {"id": str(self.shape.id), "definition_slug": "test-rect",
+                         "label": "S", "order": 0,
+                         "properties": {"sop_rules": [], "tool_calls": []}},
+                        {"id": str(new_shape_id), "definition_slug": "test-rect",
+                         "label": "S", "order": 1,
+                         "properties": {"sop_rules": rules, "tool_calls": []}},
+                    ],
+                }],
+            }],
+        }
         try:
-            self.writer_cls(self.wf).save(self._payload(rules, shape_id=new_shape_id))
+            self.writer_cls(self.wf).save(payload)
         except ValidationError:
             self.fail("a brand-new shape's initial rules must not be gated")
-        self.assertEqual(WorkflowVersion.objects.filter(workflow=self.wf).count(), 0)
+
+        self.assertTrue(Shape.objects.filter(id=self.shape.id).exists(),
+                         "the existing shape must survive — this payload never omitted it")
+        snap = WorkflowVersion.objects.filter(workflow=self.wf).order_by("-version_number").first()
+        self.assertIsNotNone(snap, "a new shape's rules must still be versioned (exempt from "
+                                    "review, not from versioning)")
+        self.assertIn("new_node_rules", snap.reason)
+        self.assertNotIn("node_deleted", snap.reason)
 
     def test_adding_a_rule_to_an_existing_shape_is_rejected(self):
         from rest_framework.exceptions import ValidationError
@@ -487,6 +523,189 @@ class GraphSaveRuleChangeGuardTests(TestCase):
         self.writer_cls(self.wf).save(self._payload([rule], label="Renamed"))
         self.shape.refresh_from_db()
         self.assertEqual(self.shape.label, "Renamed")
+
+    def test_editing_an_existing_rule_on_a_surviving_node_is_still_rejected(self):
+        """Reaffirms the guard is narrowed to exempt whole-node deletion, not
+        weakened in general: an in-place rule edit on a shape that's still
+        present in the payload must still 400, exactly as before this fix."""
+        from rest_framework.exceptions import ValidationError
+
+        rule = {"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+                 "condition": "age < 18", "action": "DENY"}
+        self._set_existing_rules([rule])
+
+        edited = {**rule, "condition": "age < 21"}
+        with self.assertRaises(ValidationError):
+            self.writer_cls(self.wf).save(self._payload([edited]))
+
+
+class GraphSaveNodeDeletionTests(TestCase):
+    """builder.services.WorkflowGraphWriter.save() must ALLOW deleting a
+    whole node (Shape) outright — regardless of whether it carries any
+    SOP-derived or custom rule — and must bump Workflow.version + create a
+    new WorkflowVersion snapshot for every such deletion, the same way it
+    already does for a tool-binding change or a new node's rules. The
+    GraphSaveRuleChangeGuardTests class above covers the guard itself (that
+    an in-place rule EDIT on a surviving shape is still rejected); this class
+    covers the deletion path the guard must NOT catch.
+    """
+
+    def setUp(self):
+        from builder.services import WorkflowGraphWriter
+
+        self.sop = _rule_sop()
+        self.wf = _workflow()
+        self.area = WorkArea.objects.create(workflow=self.wf, name="Area", order=0)
+        self.wb = _bench(
+            self.area, node_key="n1", order=0, sop_id=self.sop.id, content_hash="h1",
+        )
+        self.shape = _shape_for(self.wb)
+        self.writer_cls = WorkflowGraphWriter
+
+    def _empty_payload(self) -> dict:
+        """A graph save whose shapes[] omits self.shape entirely — a real
+        whole-node deletion, not an in-place rules[] clear on a surviving
+        shape (that's GraphSaveRuleChangeGuardTests.test_deleting_an_existing_rule_is_rejected)."""
+        return {
+            "work_areas": [{
+                "id": str(self.area.id), "name": "Area", "order": 0,
+                "workbenches": [{
+                    "id": str(self.wb.id), "name": "Node 1", "node_key": "n1",
+                    "kind": "SOP", "order": 0,
+                    "shapes": [],
+                }],
+            }],
+        }
+
+    def _set_existing_rules(self, rules: list[dict]) -> None:
+        from builder.bindings_sync import extract_bindings_from_properties
+
+        self.shape.properties = {"sop_rules": rules, "tool_calls": []}
+        self.shape.save(update_fields=["properties"])
+        extract_bindings_from_properties(self.shape)
+
+    def _baseline_snapshot(self):
+        """A real workflow already has an initial snapshot by the time a user
+        can delete a node from its canvas — establish one so the assertions
+        below exercise the ACTUAL version-bump path, not the deliberately
+        non-incrementing 'very first snapshot ever' branch (see
+        builder.workflow_versioning.snapshot_workflow_version's docstring,
+        point 4)."""
+        return snapshot_workflow_version(self.wf, reason="initial_build")
+
+    def test_delete_rule_less_node_succeeds_and_bumps_version(self):
+        from rest_framework.exceptions import ValidationError
+
+        self._baseline_snapshot()
+        self.wf.refresh_from_db()
+        v0 = self.wf.version
+
+        try:
+            self.writer_cls(self.wf).save(self._empty_payload())
+        except ValidationError:
+            self.fail("deleting a rule-less node must not be gated")
+
+        from builder.models import Shape
+
+        self.wf.refresh_from_db()
+        self.assertGreater(self.wf.version, v0)
+        # The shape is gone, but this is a shape-level delete only — the
+        # Workbench it lived in is untouched (still empty, not stale-deleted).
+        self.assertFalse(Shape.objects.filter(id=self.shape.id).exists())
+        self.assertTrue(Workbench.objects.filter(id=self.wb.id).exists())
+        snap = WorkflowVersion.objects.filter(workflow=self.wf).order_by("-version_number").first()
+        self.assertIsNotNone(snap)
+        self.assertIn("node_deleted", snap.reason)
+
+    def test_delete_node_with_sop_derived_rules_succeeds(self):
+        from rest_framework.exceptions import ValidationError
+
+        rule = {"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+                 "condition": "age < 18", "action": "DENY"}
+        self._set_existing_rules([rule])
+        self._baseline_snapshot()
+        self.wf.refresh_from_db()
+        v0 = self.wf.version
+
+        try:
+            self.writer_cls(self.wf).save(self._empty_payload())
+        except ValidationError as exc:
+            self.fail(f"deleting a node with SOP-derived rules must not 400: {exc}")
+
+        self.wf.refresh_from_db()
+        self.assertGreater(self.wf.version, v0)
+        snap = WorkflowVersion.objects.filter(workflow=self.wf).order_by("-version_number").first()
+        self.assertIn("node_deleted", snap.reason)
+
+    def test_delete_node_with_custom_rules_succeeds(self):
+        from builder.models import Shape
+        from rest_framework.exceptions import ValidationError
+
+        rule = {"key": "custom:aaaa", "sop_id": 0, "is_custom": True,
+                 "condition": "amount > 10000", "action": "REFER"}
+        self._set_existing_rules([rule])
+        self._baseline_snapshot()
+
+        try:
+            self.writer_cls(self.wf).save(self._empty_payload())
+        except ValidationError as exc:
+            self.fail(f"deleting a node with a custom rule must not 400: {exc}")
+
+        self.assertFalse(Shape.objects.filter(id=self.shape.id).exists())
+
+    def test_delete_node_with_sop_and_custom_rules_succeeds(self):
+        from builder.models import Shape
+        from rest_framework.exceptions import ValidationError
+
+        rules = [
+            {"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+             "condition": "age < 18", "action": "DENY"},
+            {"key": "custom:bbbb", "sop_id": 0, "is_custom": True,
+             "condition": "amount > 10000", "action": "REFER"},
+        ]
+        self._set_existing_rules(rules)
+        self._baseline_snapshot()
+
+        try:
+            self.writer_cls(self.wf).save(self._empty_payload())
+        except ValidationError as exc:
+            self.fail(f"deleting a node with SOP-derived + custom rules must not 400: {exc}")
+
+        self.assertFalse(Shape.objects.filter(id=self.shape.id).exists())
+
+    def test_deleted_node_absent_from_new_snapshot(self):
+        rule = {"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+                 "condition": "age < 18", "action": "DENY"}
+        self._set_existing_rules([rule])
+        self._baseline_snapshot()
+
+        self.writer_cls(self.wf).save(self._empty_payload())
+
+        new_snap = WorkflowVersion.objects.filter(workflow=self.wf).order_by("-version_number").first()
+        self.assertFalse(
+            new_snap.rules.filter(shape_id=self.shape.id).exists(),
+            "the new snapshot must not contain the deleted shape's rule",
+        )
+
+    def test_historical_snapshots_unchanged_after_node_deletion(self):
+        rule = {"key": f"step:{self.sop.id}:1:0", "sop_id": self.sop.id,
+                 "condition": "age < 18", "action": "DENY"}
+        self._set_existing_rules([rule])
+        baseline = self._baseline_snapshot()
+        baseline_row = baseline.rules.get(shape_id=self.shape.id)
+        baseline_condition = baseline_row.condition
+        baseline_workbench_rows = list(baseline.slots.all())
+
+        self.writer_cls(self.wf).save(self._empty_payload())
+
+        baseline.refresh_from_db()
+        baseline_row.refresh_from_db()
+        self.assertEqual(baseline_row.condition, baseline_condition)
+        self.assertEqual(
+            [s.workbench_id for s in baseline.slots.all()],
+            [s.workbench_id for s in baseline_workbench_rows],
+        )
+        self.assertTrue(WorkflowVersion.objects.filter(pk=baseline.pk).exists())
 
 
 class CanvasRuleChangeReviewTests(TestCase):
@@ -640,3 +859,83 @@ class CanvasRuleChangeReviewTests(TestCase):
         Shape.objects.filter(pk=self.shape.pk).delete()
 
         self.assertTrue(WorkflowVersionRule.objects.filter(pk=row_id).exists())
+
+    def test_pending_proposal_survives_target_node_deletion(self):
+        """If a node with a pending canvas rule proposal is deleted (via a
+        normal graph save on an unrelated author's session, say), approving
+        that proposal's batch must skip it cleanly (reason=shape_not_found)
+        rather than crash — and a sibling proposal in the SAME changeset,
+        targeting a shape that's still around, must still apply. The
+        proposal row itself is never rewritten or deleted; the changeset's
+        own audit trail (its `skipped` outcome) is the record of what
+        happened."""
+        from builder.canvas_rule_changes import (
+            approve_canvas_change_set,
+            propose_canvas_rule_change,
+        )
+        from builder.services import WorkflowGraphWriter
+        from sop_ingestion.models import RuleChangeKind
+
+        second_shape = _shape_for(self.wb)
+        second_rule_key = f"step:{self.sop.id}:2:0"
+        second_shape.properties = {
+            "sop_rules": [{"key": second_rule_key, "sop_id": self.sop.id,
+                            "condition": "amount > 500", "action": "ALLOW"}],
+            "tool_calls": [],
+        }
+        second_shape.save(update_fields=["properties"])
+        from builder.bindings_sync import extract_bindings_from_properties
+        extract_bindings_from_properties(second_shape)
+
+        proposal1 = self._propose(kind=RuleChangeKind.MODIFIED, fields={"condition": "age < 21"})
+        proposal2 = propose_canvas_rule_change(
+            workflow=self.wf, shape=second_shape, rule_key=second_rule_key,
+            kind=RuleChangeKind.MODIFIED, fields={"condition": "amount > 999"},
+            is_custom=False, author="a@x.com",
+        )
+        self.assertEqual(proposal1.changeset_id, proposal2.changeset_id)
+        change_set = proposal1.changeset
+
+        # Delete self.shape (proposal1's target) via a normal structural
+        # save that keeps second_shape — the everyday "someone deleted a
+        # node that had a pending edit sitting in review" scenario.
+        WorkflowGraphWriter(self.wf).save({
+            "work_areas": [{
+                "id": str(self.area.id), "name": "Area", "order": 0,
+                "workbenches": [{
+                    "id": str(self.wb.id), "name": "Node 1", "node_key": "n1",
+                    "kind": "SOP", "order": 0,
+                    "shapes": [{
+                        "id": str(second_shape.id), "definition_slug": "test-rect",
+                        "label": "S", "order": 0,
+                        "properties": second_shape.properties,
+                    }],
+                }],
+            }],
+        })
+
+        result = approve_canvas_change_set(
+            change_set, proposals=[proposal1, proposal2], reviewer="r@x.com",
+        )
+        skipped_by_id = {s["proposal_id"]: s["reason"] for s in result["skipped"]}
+        applied_ids = {a["proposal_id"] for a in result["applied"]}
+        self.assertEqual(skipped_by_id.get(proposal1.id), "shape_not_found")
+        self.assertIn(proposal2.id, applied_ids)
+
+    def test_propose_rule_change_on_deleted_shape_returns_clean_error(self):
+        """The propose_canvas_rule_change TOCTOU close: proposing against a
+        shape that no longer exists must raise a clean RuleChangeError, never
+        an uncaught Shape.DoesNotExist."""
+        from builder.canvas_rule_changes import propose_canvas_rule_change
+        from builder.models import Shape
+        from sop_ingestion.models import RuleChangeKind
+        from sop_ingestion.services.rule_changes import RuleChangeError
+
+        Shape.objects.filter(pk=self.shape.pk).delete()
+
+        with self.assertRaises(RuleChangeError):
+            propose_canvas_rule_change(
+                workflow=self.wf, shape=self.shape, rule_key=self.rule_key,
+                kind=RuleChangeKind.MODIFIED, fields={"condition": "age < 30"},
+                is_custom=False, author="tester",
+            )

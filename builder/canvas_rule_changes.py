@@ -156,7 +156,17 @@ def propose_canvas_rule_change(
     # sop_ingestion.services.rule_changes.propose_rule_change: a shape fetched
     # before another author's batch was approved carries stale rule content.
     workflow = Workflow.objects.get(pk=workflow.pk)
-    shape = Shape.objects.select_related("workbench").get(pk=shape.pk)
+    try:
+        shape = Shape.objects.select_related("workbench").get(pk=shape.pk)
+    except Shape.DoesNotExist:
+        # Narrow TOCTOU: the view's own get_object_or_404 confirmed the shape
+        # existed moments ago, but another user's structural save deleted it
+        # in between. Surface the same clean, review-flow error every other
+        # proposal rejection uses instead of an uncaught 500.
+        raise RuleChangeError(
+            "This node no longer exists — it may have been deleted by "
+            "another user. Refresh the canvas."
+        )
 
     current_entry = _current_rule_entry(shape, rule_key)
 
